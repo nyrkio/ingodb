@@ -1,0 +1,113 @@
+mod writer;
+mod reader;
+mod bloom;
+mod error;
+
+pub use writer::SSTableWriter;
+pub use reader::SSTableReader;
+pub use bloom::BloomFilter;
+pub use error::SSTableError;
+
+/// SSTable file magic: "ISST"
+pub const SSTABLE_MAGIC: [u8; 4] = *b"ISST";
+
+/// SSTable format version
+pub const SSTABLE_VERSION: u16 = 1;
+
+/// Default data block size (4 KB, aligned for direct I/O)
+pub const DEFAULT_BLOCK_SIZE: usize = 4096;
+
+/// Footer size: index_offset(8) + index_count(4) + bloom_offset(8) + bloom_size(4) + magic(4) + version(2) = 30
+pub const FOOTER_SIZE: usize = 30;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ingodb_blob::{IBlob, Value};
+
+    fn make_entries(n: usize) -> Vec<(ingodb_blob::ContentHash, IBlob)> {
+        let mut entries: Vec<_> = (0..n)
+            .map(|i| {
+                let blob = IBlob::from_pairs(vec![
+                    ("id", Value::U64(i as u64)),
+                    ("name", Value::String(format!("entry-{i}"))),
+                ]);
+                (*blob.hash(), blob)
+            })
+            .collect();
+        entries.sort_by_key(|(h, _)| *h);
+        entries
+    }
+
+    #[test]
+    fn test_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sst");
+
+        let entries = make_entries(100);
+
+        SSTableWriter::new().write(&path, &entries).unwrap();
+        let reader = SSTableReader::open(&path).unwrap();
+
+        // Verify all entries can be looked up
+        for (hash, blob) in &entries {
+            let found = reader.get(hash).unwrap().expect("entry not found");
+            assert_eq!(found.hash(), blob.hash());
+            assert_eq!(found.fields(), blob.fields());
+        }
+
+        // Verify a missing key returns None
+        let missing_hash = [0xFF; 32];
+        assert!(reader.get(&missing_hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_iter_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iter.sst");
+
+        let entries = make_entries(50);
+        SSTableWriter::new().write(&path, &entries).unwrap();
+        let reader = SSTableReader::open(&path).unwrap();
+
+        let all = reader.iter().unwrap();
+        assert_eq!(all.len(), 50);
+
+        // Verify sorted order
+        for i in 1..all.len() {
+            assert!(all[i - 1].0 <= all[i].0);
+        }
+    }
+
+    #[test]
+    fn test_small_block_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small_blocks.sst");
+
+        let entries = make_entries(20);
+
+        // Very small blocks to force multiple blocks
+        SSTableWriter::with_block_size(128).write(&path, &entries).unwrap();
+        let reader = SSTableReader::open(&path).unwrap();
+
+        assert!(reader.block_count() > 1, "expected multiple blocks");
+
+        for (hash, blob) in &entries {
+            let found = reader.get(hash).unwrap().expect("entry not found");
+            assert_eq!(found.hash(), blob.hash());
+        }
+    }
+
+    #[test]
+    fn test_single_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.sst");
+
+        let entries = make_entries(1);
+        SSTableWriter::new().write(&path, &entries).unwrap();
+        let reader = SSTableReader::open(&path).unwrap();
+
+        let found = reader.get(&entries[0].0).unwrap().unwrap();
+        assert_eq!(found.hash(), entries[0].1.hash());
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "ingodb-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ingodb-blob = { path = "../ingodb-blob" }
+thiserror = { workspace = true }

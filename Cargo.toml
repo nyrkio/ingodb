@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ingodb",
+    "crates/ingodb-blob",
+    "crates/ingodb-wal",
+    "crates/ingodb-memtable",
+    "crates/ingodb-sstable",
+    "crates/ingodb-lsm",
+    "crates/ingodb-query",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+blake3 = "1"
+crc32fast = "1"
+lz4_flex = "0.11"
+thiserror = "2"
+bytes = "1"
+crossbeam-skiplist = "0.1"
+parking_lot = "0.12"
+tempfile = "3"

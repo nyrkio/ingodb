@@ -1,0 +1,16 @@
+[package]
+name = "ingodb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ingodb-blob = { path = "../ingodb-blob" }
+ingodb-wal = { path = "../ingodb-wal" }
+ingodb-memtable = { path = "../ingodb-memtable" }
+ingodb-sstable = { path = "../ingodb-sstable" }
+ingodb-lsm = { path = "../ingodb-lsm" }
+ingodb-query = { path = "../ingodb-query" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

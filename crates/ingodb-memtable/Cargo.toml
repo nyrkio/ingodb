@@ -1,0 +1,9 @@
+[package]
+name = "ingodb-memtable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ingodb-blob = { path = "../ingodb-blob" }
+parking_lot = { workspace = true }
