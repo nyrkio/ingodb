@@ -19,6 +19,8 @@ pub struct SSTableReader {
     data: Vec<u8>,
     block_indices: Vec<BlockIndex>,
     bloom: BloomFilter,
+    min_id: DocumentId,
+    max_id: DocumentId,
 }
 
 impl SSTableReader {
@@ -78,12 +80,72 @@ impl SSTableReader {
             });
         }
 
+        if block_indices.is_empty() {
+            return Err(SSTableError::Corrupted("SSTable has no blocks".into()));
+        }
+
+        // max_id = last block's last entry
+        let max_id = block_indices.last().unwrap().last_id;
+
+        // min_id = first entry of first block (decompress minimally)
+        let min_id = Self::extract_first_id(&data, &block_indices[0])?;
+
         Ok(SSTableReader {
             path,
             data,
             block_indices,
             bloom,
+            min_id,
+            max_id,
         })
+    }
+
+    /// Extract the first document ID from a block without full parsing.
+    fn extract_first_id(data: &[u8], block: &BlockIndex) -> Result<DocumentId, SSTableError> {
+        let start = block.offset as usize;
+        let end = start + block.size as usize;
+
+        if end > data.len() {
+            return Err(SSTableError::Corrupted("block out of bounds".into()));
+        }
+
+        let block_data = &data[start..end];
+
+        // Verify CRC
+        let stored_crc = u32::from_le_bytes(block_data[0..4].try_into().unwrap());
+        let compressed = &block_data[4..];
+        let computed_crc = crc32fast::hash(compressed);
+        if stored_crc != computed_crc {
+            return Err(SSTableError::CrcMismatch { offset: block.offset });
+        }
+
+        // Decompress
+        let decompressed = lz4_flex::decompress_size_prepended(compressed)
+            .map_err(|e| SSTableError::Corrupted(format!("LZ4 decompress failed: {e}")))?;
+
+        // First entry starts at offset 4 (after entry_count): [id:16B][blob_len:4B]...
+        if decompressed.len() < 4 + 16 {
+            return Err(SSTableError::Corrupted("block too small for first entry".into()));
+        }
+
+        let mut id_bytes = [0u8; 16];
+        id_bytes.copy_from_slice(&decompressed[4..20]);
+        Ok(DocumentId::from_bytes(id_bytes))
+    }
+
+    /// Smallest document ID in this SSTable.
+    pub fn min_id(&self) -> &DocumentId {
+        &self.min_id
+    }
+
+    /// Largest document ID in this SSTable.
+    pub fn max_id(&self) -> &DocumentId {
+        &self.max_id
+    }
+
+    /// File size in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.data.len() as u64
     }
 
     /// Point lookup: find a blob by its document ID.

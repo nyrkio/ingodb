@@ -116,7 +116,7 @@ impl MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ingodb_blob::Value;
+    use ingodb_blob::{DocumentId, Value};
 
     fn make_blob(n: u64) -> IBlob {
         IBlob::from_pairs(vec![
@@ -203,5 +203,20 @@ mod tests {
         for i in 1..entries.len() {
             assert!(entries[i - 1].0 <= entries[i].0);
         }
+    }
+
+    #[test]
+    fn test_tombstone_replaces_live() {
+        let mt = MemTable::new(1024 * 1024);
+        let id = DocumentId::new();
+
+        let blob = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        mt.insert(blob);
+        assert!(!mt.get(&id).unwrap().is_deleted());
+
+        let tombstone = IBlob::tombstone(id);
+        mt.insert(tombstone);
+        assert_eq!(mt.len(), 1, "tombstone replaces live entry");
+        assert!(mt.get(&id).unwrap().is_deleted());
     }
 }

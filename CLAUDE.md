@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --workspace          # Build all crates
-cargo test --workspace           # Run all 58 tests
+cargo test --workspace           # Run all 79 tests
 cargo test -p ingodb-blob        # Test just the blob format crate
 cargo test -p ingodb-wal         # Test just the WAL crate
 cargo test -p ingodb-memtable    # Test just the memtable crate
@@ -30,13 +30,15 @@ ingodb/                         Top-level API crate (re-exports everything)
 ├── ingodb-wal                  Write-Ahead Log: append-only, CRC32-checksummed, crash-recoverable
 ├── ingodb-memtable             In-memory sorted BTreeMap of IBlobs, size-bounded with flush signaling
 ├── ingodb-sstable              SSTable writer/reader: LZ4-compressed data blocks, bloom filters, block index
-├── ingodb-lsm                  LSM engine: ties WAL + MemTable + SSTables together with compaction
+├── ingodb-lsm                  LSM engine: WAL + MemTable + SSTables, UCS compaction, delete/tombstones
 └── ingodb-query                Liquid AST: enum-based query interface (Get/Scan/Traverse) with filter predicates
 ```
 
-**Data flow**: Application → `LsmEngine::put(IBlob)` → stamp `_version` → WAL append → MemTable insert → (on threshold) flush to SSTable → (on accumulation) size-tiered compaction merges SSTables.
+**Data flow**: Application → `LsmEngine::put(IBlob)` → stamp `_version` → WAL append → MemTable insert → (on threshold) flush to SSTable → (on accumulation) UCS compaction merges SSTables.
 
-**Read path**: MemTable (keyed by `_id`) → SSTables newest-first (bloom filter check before each).
+**Delete flow**: `LsmEngine::delete(&DocumentId)` → write tombstone (IBlob with `is_deleted=true`) → same path as put. Tombstones purged during compaction when output level > max level.
+
+**Read path**: MemTable (keyed by `_id`) → SSTables (L0 first → L1 → ..., within each level newest first, bloom filter check before each). First match is guaranteed current due to level ordering invariant.
 
 ## Key Types
 
@@ -45,6 +47,8 @@ ingodb/                         Top-level API crate (re-exports everything)
 - `Value` — Tagged union: Null, Bool, I64, U64, F64, String, Bytes, Ref(DocumentId), Array, Document (nested)
 - `ContentHash` — `[u8; 32]`, BLAKE3 hash of canonical payload. Used for integrity/dedup, NOT as primary key.
 - `CompactionFilter` trait — Extension point for future adaptive morphing during compaction
+- `UcsCompaction` — Unified Compaction Strategy: level assignment by file size, overlap detection, configurable scaling parameter W (leveled/balanced/tiered)
+- `TombstoneFilter` — Purges tombstones during compaction when safe (output at last level)
 
 ## Architectural Vision
 

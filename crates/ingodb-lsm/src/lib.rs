@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-pub use compaction::{CompactionAction, CompactionFilter, SizeTieredCompaction};
+pub use compaction::{
+    CompactionAction, CompactionFilter, CompactionPick, SizeTieredCompaction, SstMeta,
+    TombstoneFilter, UcsCompaction,
+};
 
 #[derive(Debug, Error)]
 pub enum LsmError {
@@ -37,6 +40,8 @@ pub struct LsmConfig {
     pub block_size: usize,
     /// Compaction trigger: number of SSTables at a size tier before merging (default 4)
     pub compaction_threshold: usize,
+    /// UCS scaling parameter W: <0 leveled, 0 balanced, >0 tiered (default 0)
+    pub scaling_parameter: i32,
 }
 
 impl Default for LsmConfig {
@@ -46,6 +51,7 @@ impl Default for LsmConfig {
             memtable_size: 64 * 1024 * 1024,
             block_size: 4096,
             compaction_threshold: 4,
+            scaling_parameter: 0,
         }
     }
 }
@@ -57,7 +63,7 @@ pub struct LsmEngine {
     memtable: MemTable,
     /// WAL for the active memtable
     wal: Mutex<Wal>,
-    /// SSTables on disk, ordered newest-first
+    /// SSTables on disk, ordered for reads: L0 first → L1 → ..., within each level newest first
     sstables: Mutex<Vec<SSTableReader>>,
     /// Counter for generating SSTable file names
     next_sst_id: AtomicU64,
@@ -121,8 +127,8 @@ impl LsmEngine {
             }
         }
 
-        // Newest first for read path
-        sstables.reverse();
+        let ucs = UcsCompaction::new(config.scaling_parameter, config.memtable_size as u64);
+        sort_sstables_by_level(&mut sstables, &ucs);
 
         Ok(LsmEngine {
             config,
@@ -155,25 +161,52 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Delete a document by writing a tombstone.
+    /// Stamps a server-assigned `_version` on the tombstone.
+    pub fn delete(&self, id: &DocumentId) -> Result<(), LsmError> {
+        let mut tombstone = IBlob::tombstone(*id);
+        tombstone.set_version(DocumentId::new());
+
+        {
+            let mut wal = self.wal.lock();
+            wal.append(&tombstone)?;
+        }
+
+        let should_flush = self.memtable.insert(tombstone);
+
+        if should_flush {
+            self.flush_memtable()?;
+        }
+
+        Ok(())
+    }
+
     /// Look up a document by its stable document ID.
+    /// Returns None if the document doesn't exist or has been deleted.
+    ///
+    /// Read order: memtable → SSTables (L0 first → L1 → ..., within each level newest first).
+    /// The first match is guaranteed to be the current version because:
+    /// (a) data enters at L0 via flush,
+    /// (b) compaction merges within a level and outputs to L(x+1) keeping only the highest _version,
+    /// so higher levels never have newer versions than lower levels.
     pub fn get(&self, id: &DocumentId) -> Result<Option<IBlob>, LsmError> {
         // Check memtable first (fastest, always has latest version for a given _id)
         if let Some(blob) = self.memtable.get(id) {
-            return Ok(Some(blob));
+            return Ok(if blob.is_deleted() { None } else { Some(blob) });
         }
 
-        // Check SSTables (newest first)
+        // Check SSTables (level-ordered: L0 first, within level newest first)
         let sstables = self.sstables.lock();
         for sst in sstables.iter() {
             if let Some(blob) = sst.get(id)? {
-                return Ok(Some(blob));
+                return Ok(if blob.is_deleted() { None } else { Some(blob) });
             }
         }
 
         Ok(None)
     }
 
-    /// Check if a document ID exists in the engine.
+    /// Check if a document ID exists in the engine (not deleted).
     pub fn contains(&self, id: &DocumentId) -> Result<bool, LsmError> {
         Ok(self.get(id)?.is_some())
     }
@@ -194,7 +227,10 @@ impl LsmEngine {
 
         {
             let mut sstables = self.sstables.lock();
-            sstables.insert(0, reader); // newest first
+            sstables.insert(0, reader); // L0, newest — goes to front
+            // Re-sort to maintain level ordering
+            let ucs = self.ucs();
+            sort_sstables_by_level(&mut sstables, &ucs);
         }
 
         // Reset WAL
@@ -212,19 +248,34 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Run size-tiered compaction if needed.
+    /// Run UCS compaction if needed.
     fn maybe_compact(&self) -> Result<(), LsmError> {
-        let compaction = SizeTieredCompaction::new(self.config.compaction_threshold);
+        let ucs = self.ucs();
         let sstables = self.sstables.lock();
 
-        let paths: Vec<PathBuf> = sstables.iter().map(|s| s.path().to_path_buf()).collect();
+        let metas: Vec<SstMeta> = sstables
+            .iter()
+            .enumerate()
+            .map(|(i, s)| SstMeta {
+                path: s.path().to_path_buf(),
+                min_id: *s.min_id(),
+                max_id: *s.max_id(),
+                file_size: s.file_size(),
+                seq: i as u64,
+            })
+            .collect();
         drop(sstables);
 
-        if let Some(to_compact) = compaction.pick_compaction(&paths) {
-            self.run_compaction(&to_compact, None)?;
+        if let Some(pick) = ucs.pick_compaction(&metas) {
+            let mut tombstone_filter = TombstoneFilter::new(pick.output_level, pick.max_level);
+            self.run_compaction(&pick.inputs, Some(&mut tombstone_filter))?;
         }
 
         Ok(())
+    }
+
+    fn ucs(&self) -> UcsCompaction {
+        UcsCompaction::new(self.config.scaling_parameter, self.config.memtable_size as u64)
     }
 
     /// Run compaction on the given SSTable files, optionally applying a filter.
@@ -247,7 +298,7 @@ impl LsmEngine {
         });
         merged.dedup_by_key(|(id, _)| *id);
 
-        // Apply compaction filter
+        // Apply compaction filter (tombstone purge + any user filter)
         if let Some(filter) = filter {
             merged.retain_mut(|(id, blob)| match filter.filter(id, blob) {
                 CompactionAction::Keep => true,
@@ -282,8 +333,10 @@ impl LsmEngine {
             std::fs::remove_file(path).ok();
         }
         sstables.push(new_reader);
-        // Re-sort: newest first (highest ID first)
-        sstables.sort_by(|a, b| b.path().cmp(a.path()));
+
+        // Re-sort by level for correct read ordering
+        let ucs = self.ucs();
+        sort_sstables_by_level(&mut sstables, &ucs);
 
         Ok(())
     }
@@ -305,6 +358,21 @@ impl LsmEngine {
     }
 }
 
+/// Sort SSTables for correct read ordering:
+/// L0 first → L1 → L2 → ..., within each level newest first (by filename/creation order).
+///
+/// This guarantees that for any `_id`, the first match is the current version.
+fn sort_sstables_by_level(sstables: &mut Vec<SSTableReader>, ucs: &UcsCompaction) {
+    sstables.sort_by(|a, b| {
+        let level_a = ucs.level_for_size(a.file_size());
+        let level_b = ucs.level_for_size(b.file_size());
+        level_a.cmp(&level_b).then_with(|| {
+            // Within same level, newest first (higher path = newer)
+            b.path().cmp(a.path())
+        })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +392,7 @@ mod tests {
             memtable_size: 4096, // small for testing
             block_size: 256,
             compaction_threshold: 4,
+            scaling_parameter: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
         (engine, dir)
@@ -379,6 +448,7 @@ mod tests {
             memtable_size: 1024 * 1024, // large enough to not auto-flush
             block_size: 256,
             compaction_threshold: 4,
+            scaling_parameter: 0,
         };
 
         let blob = make_blob(42);
@@ -436,5 +506,90 @@ mod tests {
 
         assert!(v2 > v1, "version should advance on update");
         assert_eq!(found.get("x"), Some(&Value::U64(2)));
+    }
+
+    #[test]
+    fn test_delete_from_memtable() {
+        let (engine, _dir) = test_engine();
+        let blob = make_blob(1);
+        let id = *blob.id();
+
+        engine.put(blob).unwrap();
+        assert!(engine.get(&id).unwrap().is_some());
+
+        engine.delete(&id).unwrap();
+        assert!(engine.get(&id).unwrap().is_none());
+        assert!(!engine.contains(&id).unwrap());
+    }
+
+    #[test]
+    fn test_delete_from_sstable() {
+        let (engine, _dir) = test_engine();
+        let blob = make_blob(1);
+        let id = *blob.id();
+
+        engine.put(blob).unwrap();
+        engine.flush_memtable().unwrap();
+        assert!(engine.get(&id).unwrap().is_some());
+
+        engine.delete(&id).unwrap();
+        assert!(engine.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let (engine, _dir) = test_engine();
+        let id = DocumentId::new();
+
+        engine.delete(&id).unwrap();
+        assert!(engine.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_and_reinsert() {
+        let (engine, _dir) = test_engine();
+        let id = DocumentId::new();
+
+        let blob1 = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        engine.put(blob1).unwrap();
+        engine.delete(&id).unwrap();
+        assert!(engine.get(&id).unwrap().is_none());
+
+        // Re-insert with same _id
+        let blob2 = IBlob::with_id(id, [("x".into(), Value::U64(2))].into());
+        engine.put(blob2).unwrap();
+        let found = engine.get(&id).unwrap().unwrap();
+        assert_eq!(found.get("x"), Some(&Value::U64(2)));
+    }
+
+    #[test]
+    fn test_level_ordering_invariant() {
+        // Verify that after flush + update, we always get the latest version
+        // even when the old version is in a higher-level (larger) SSTable
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024, // large enough to control flush manually
+            block_size: 256,
+            compaction_threshold: 100, // prevent auto-compaction
+            scaling_parameter: 0,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+        let id = DocumentId::new();
+
+        // Write v1, flush to SSTable (will be L0)
+        let blob1 = IBlob::with_id(id, [("v".into(), Value::U64(1))].into());
+        engine.put(blob1).unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Write v2, flush to a second SSTable (also L0, but newer)
+        let blob2 = IBlob::with_id(id, [("v".into(), Value::U64(2))].into());
+        engine.put(blob2).unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Should get v2, not v1
+        let found = engine.get(&id).unwrap().unwrap();
+        assert_eq!(found.get("v"), Some(&Value::U64(2)),
+            "level-aware read should return newest version");
     }
 }

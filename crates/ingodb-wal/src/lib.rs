@@ -152,8 +152,7 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ingodb_blob::Value;
-
+    use ingodb_blob::{DocumentId, Value};
 
     fn make_blob(name: &str) -> IBlob {
         IBlob::from_pairs(vec![
@@ -245,5 +244,26 @@ mod tests {
         let recovered = Wal::recover(&wal_path).unwrap();
         assert_eq!(recovered.len(), 1); // only first survives
         assert_eq!(recovered[0].hash(), blob1.hash());
+    }
+
+    #[test]
+    fn test_tombstone_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("tomb.wal");
+
+        let id = DocumentId::new();
+        let mut tombstone = IBlob::tombstone(id);
+        tombstone.set_version(DocumentId::new());
+
+        {
+            let mut wal = Wal::open(&wal_path).unwrap();
+            wal.append(&tombstone).unwrap();
+            wal.sync().unwrap();
+        }
+
+        let recovered = Wal::recover(&wal_path).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].is_deleted());
+        assert_eq!(recovered[0].id(), &id);
     }
 }

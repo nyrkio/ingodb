@@ -13,17 +13,18 @@ struct IndexEntry {
 }
 
 const INDEX_ENTRY_SIZE: usize = 16; // 8 + 4 + 4
-// v2 header: magic(4) + format_version(2) + document_id(16) + doc_version(16) + content_hash(32) + index_count(4) = 74
-const HEADER_SIZE: usize = 4 + 2 + 16 + 16 + 32 + 4;
+// header: magic(4) + format_version(2) + document_id(16) + doc_version(16) + is_deleted(1) + content_hash(32) + index_count(4) = 75
+const HEADER_SIZE: usize = 4 + 2 + 16 + 16 + 1 + 32 + 4;
 
 /// An IngoDB document: a collection of named fields with stable identity.
 ///
-/// Binary layout (v2):
+/// Binary layout:
 /// ```text
 /// [magic: 4B "INGO"]
 /// [format_version: 2B LE]
 /// [document_id: 16B UUIDv7]
 /// [doc_version: 16B UUIDv7]
+/// [is_deleted: 1B]
 /// [content_hash: 32B BLAKE3]
 /// [index_count: 4B LE]
 /// [index_entries: index_count * 16B]
@@ -34,13 +35,16 @@ const HEADER_SIZE: usize = 4 + 2 + 16 + 16 + 32 + 4;
 ///
 /// `_id` is the stable document identity (persists across updates).
 /// `_version` is server-assigned at write time (advances on each update).
-/// The content hash is computed over the canonical payload only (excludes `_id` and `_version`).
+/// `is_deleted` marks tombstones — the document has been deleted.
+/// The content hash is computed over the canonical payload only (excludes `_id`, `_version`, `is_deleted`).
 #[derive(Debug, Clone)]
 pub struct IBlob {
     /// Stable document identity (UUIDv7)
     id: DocumentId,
     /// Server-assigned write-order version (UUIDv7). Nil until server stamps it.
     version: DocumentId,
+    /// Whether this is a tombstone (deleted document)
+    is_deleted: bool,
     /// BLAKE3 hash of the canonical payload (for integrity/dedup)
     hash: ContentHash,
     /// Fields stored as sorted key-value pairs
@@ -56,6 +60,7 @@ impl IBlob {
         let mut blob = IBlob {
             id: DocumentId::new(),
             version: DocumentId::nil(),
+            is_deleted: false,
             hash: [0; 32],
             fields,
             encoded: None,
@@ -69,12 +74,26 @@ impl IBlob {
         let mut blob = IBlob {
             id,
             version: DocumentId::nil(),
+            is_deleted: false,
             hash: [0; 32],
             fields,
             encoded: None,
         };
         blob.recompute_hash();
         blob
+    }
+
+    /// Create a tombstone for the given document ID.
+    /// Empty fields, zero hash. Marks the document as deleted.
+    pub fn tombstone(id: DocumentId) -> Self {
+        IBlob {
+            id,
+            version: DocumentId::nil(),
+            is_deleted: true,
+            hash: [0; 32],
+            fields: BTreeMap::new(),
+            encoded: None,
+        }
     }
 
     /// Create from a list of (key, value) tuples.
@@ -100,6 +119,11 @@ impl IBlob {
     pub fn set_version(&mut self, v: DocumentId) {
         self.version = v;
         self.encoded = None; // invalidate cached encoding
+    }
+
+    /// Whether this is a tombstone (deleted document).
+    pub fn is_deleted(&self) -> bool {
+        self.is_deleted
     }
 
     /// Content hash of this document's payload (for integrity/dedup).
@@ -190,6 +214,7 @@ impl IBlob {
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         buf.extend_from_slice(self.id.as_bytes());
         buf.extend_from_slice(self.version.as_bytes());
+        buf.push(if self.is_deleted { 1 } else { 0 });
         buf.extend_from_slice(&self.hash);
         buf.extend_from_slice(&index_count.to_le_bytes());
 
@@ -236,13 +261,16 @@ impl IBlob {
         ver_bytes.copy_from_slice(&buf[22..38]);
         let doc_version = DocumentId::from_bytes(ver_bytes);
 
-        // Content hash (offset 38..70)
-        let mut stored_hash = [0u8; 32];
-        stored_hash.copy_from_slice(&buf[38..70]);
+        // is_deleted (offset 38)
+        let is_deleted = buf[38] != 0;
 
-        // Index count (offset 70..74)
+        // Content hash (offset 39..71)
+        let mut stored_hash = [0u8; 32];
+        stored_hash.copy_from_slice(&buf[39..71]);
+
+        // Index count (offset 71..75)
         let index_count =
-            u32::from_le_bytes(buf[70..74].try_into().unwrap()) as usize;
+            u32::from_le_bytes(buf[71..75].try_into().unwrap()) as usize;
 
         let index_end = HEADER_SIZE + index_count * INDEX_ENTRY_SIZE;
         if buf.len() < index_end {
@@ -304,20 +332,24 @@ impl IBlob {
             fields.insert(key, value);
         }
 
-        // Verify hash
         let blob = IBlob {
             id,
             version: doc_version,
+            is_deleted,
             hash: stored_hash,
             fields,
             encoded: None,
         };
-        let expected_hash = *blake3::hash(&blob.encode_payload()).as_bytes();
-        if expected_hash != stored_hash {
-            return Err(BlobError::HashMismatch {
-                expected: hex(&expected_hash),
-                actual: hex(&stored_hash),
-            });
+
+        // Verify hash (skip for tombstones — they have zero hash and empty fields)
+        if !is_deleted {
+            let expected_hash = *blake3::hash(&blob.encode_payload()).as_bytes();
+            if expected_hash != stored_hash {
+                return Err(BlobError::HashMismatch {
+                    expected: hex(&expected_hash),
+                    actual: hex(&stored_hash),
+                });
+            }
         }
 
         Ok(blob)
@@ -334,7 +366,7 @@ impl IBlob {
         }
 
         let index_count =
-            u32::from_le_bytes(buf[70..74].try_into().unwrap()) as usize;
+            u32::from_le_bytes(buf[71..75].try_into().unwrap()) as usize;
         let index_end = HEADER_SIZE + index_count * INDEX_ENTRY_SIZE;
 
         let target_hash = Self::key_hash(field_name);
@@ -418,6 +450,7 @@ mod tests {
         assert_eq!(blob.id(), decoded.id());
         assert_eq!(blob.hash(), decoded.hash());
         assert_eq!(blob.fields(), decoded.fields());
+        assert!(!decoded.is_deleted());
     }
 
     #[test]
@@ -467,6 +500,25 @@ mod tests {
         let encoded = blob.encode();
         let decoded = IBlob::decode(&encoded).unwrap();
         assert_eq!(*decoded.version(), ver);
+    }
+
+    #[test]
+    fn test_tombstone_roundtrip() {
+        let id = DocumentId::new();
+        let mut tomb = IBlob::tombstone(id);
+        assert!(tomb.is_deleted());
+        assert_eq!(tomb.field_count(), 0);
+        assert_eq!(*tomb.hash(), [0u8; 32]);
+
+        // Stamp a version like the engine would
+        tomb.set_version(DocumentId::new());
+
+        let encoded = tomb.encode();
+        let decoded = IBlob::decode(&encoded).unwrap();
+        assert_eq!(decoded.id(), &id);
+        assert!(decoded.is_deleted());
+        assert_eq!(decoded.field_count(), 0);
+        assert_eq!(decoded.version(), tomb.version());
     }
 
     #[test]

@@ -23,6 +23,7 @@ fn test_engine() -> (LsmEngine, tempfile::TempDir) {
         memtable_size: 8192,
         block_size: 512,
         compaction_threshold: 4,
+        scaling_parameter: 0,
     };
     let engine = LsmEngine::open(config).unwrap();
     (engine, dir)
@@ -137,6 +138,7 @@ fn test_survive_restart() {
         memtable_size: 1024 * 1024,
         block_size: 512,
         compaction_threshold: 4,
+        scaling_parameter: 0,
     };
 
     let user = make_user("Persistent", 99);
@@ -167,6 +169,7 @@ fn test_flush_and_recover_from_sstable() {
         memtable_size: 1024 * 1024,
         block_size: 512,
         compaction_threshold: 4,
+        scaling_parameter: 0,
     };
 
     let mut ids = Vec::new();
@@ -268,4 +271,93 @@ fn test_high_throughput_writes() {
         engine.sstable_count() >= 1,
         "expected SSTables after 1000 writes"
     );
+}
+
+#[test]
+fn test_delete_and_get() {
+    let (engine, _dir) = test_engine();
+
+    let user = make_user("ToDelete", 25);
+    let id = *user.id();
+    engine.put(user).unwrap();
+    assert!(engine.get(&id).unwrap().is_some());
+
+    engine.delete(&id).unwrap();
+    assert!(engine.get(&id).unwrap().is_none());
+    assert!(!engine.contains(&id).unwrap());
+}
+
+#[test]
+fn test_delete_survives_flush() {
+    let (engine, _dir) = test_engine();
+
+    let user = make_user("FlushDelete", 30);
+    let id = *user.id();
+    engine.put(user).unwrap();
+    engine.flush_memtable().unwrap();
+
+    engine.delete(&id).unwrap();
+    engine.flush_memtable().unwrap();
+
+    // After both flushes, the tombstone in the newer SSTable should shadow the live entry
+    assert!(engine.get(&id).unwrap().is_none());
+}
+
+#[test]
+fn test_delete_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = LsmConfig {
+        data_dir: dir.path().to_path_buf(),
+        memtable_size: 1024 * 1024,
+        block_size: 512,
+        compaction_threshold: 100,
+        scaling_parameter: 0,
+    };
+
+    let user = make_user("RestartDelete", 40);
+    let id = *user.id();
+
+    {
+        let engine = LsmEngine::open(config.clone()).unwrap();
+        engine.put(user).unwrap();
+        engine.delete(&id).unwrap();
+        engine.sync().unwrap();
+    }
+
+    {
+        let engine = LsmEngine::open(config).unwrap();
+        assert!(engine.get(&id).unwrap().is_none(), "delete survives restart");
+    }
+}
+
+#[test]
+fn test_delete_with_graph_ref_stable() {
+    let (engine, _dir) = test_engine();
+
+    // User and order referencing user by _id
+    let user = make_user("Henrik", 42);
+    let user_id = *user.id();
+    engine.put(user).unwrap();
+
+    let order = make_order(user_id, 100);
+    let order_id = *order.id();
+    engine.put(order).unwrap();
+
+    // Delete user — order's Ref still points to the user_id
+    engine.delete(&user_id).unwrap();
+    assert!(engine.get(&user_id).unwrap().is_none());
+
+    // Order still exists, reference is intact (it's a dangling ref now, but stable)
+    let found_order = engine.get(&order_id).unwrap().unwrap();
+    assert_eq!(found_order.get("user"), Some(&Value::Ref(user_id)));
+
+    // Re-insert user — order's ref resolves again
+    let user2 = IBlob::with_id(user_id, [
+        ("type".into(), Value::String("user".into())),
+        ("name".into(), Value::String("Henrik v2".into())),
+        ("age".into(), Value::U64(43)),
+    ].into());
+    engine.put(user2).unwrap();
+    let found_user = engine.get(&user_id).unwrap().unwrap();
+    assert_eq!(found_user.get("name"), Some(&Value::String("Henrik v2".into())));
 }

@@ -110,4 +110,32 @@ mod tests {
         let found = reader.get(&entries[0].0).unwrap().unwrap();
         assert_eq!(found.id(), entries[0].1.id());
     }
+
+    #[test]
+    fn test_min_max_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("minmax.sst");
+
+        let entries = make_entries(50);
+        SSTableWriter::new().write(&path, &entries).unwrap();
+        let reader = SSTableReader::open(&path).unwrap();
+
+        // Entries are sorted by ID, so first is min and last is max
+        assert_eq!(reader.min_id(), &entries.first().unwrap().0);
+        assert_eq!(reader.max_id(), &entries.last().unwrap().0);
+        assert!(reader.file_size() > 0);
+    }
+
+    #[test]
+    fn test_min_max_single_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("minmax1.sst");
+
+        let entries = make_entries(1);
+        SSTableWriter::new().write(&path, &entries).unwrap();
+        let reader = SSTableReader::open(&path).unwrap();
+
+        assert_eq!(reader.min_id(), reader.max_id());
+        assert_eq!(reader.min_id(), &entries[0].0);
+    }
 }
