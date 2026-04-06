@@ -9,6 +9,7 @@ ingodb-blob = { path = "../ingodb-blob" }
 ingodb-wal = { path = "../ingodb-wal" }
 ingodb-memtable = { path = "../ingodb-memtable" }
 ingodb-sstable = { path = "../ingodb-sstable" }
+ingodb-query = { path = "../ingodb-query" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }

@@ -1,4 +1,4 @@
-use ingodb::{DocumentId, IBlob, LsmConfig, LsmEngine, Value, Filter};
+use ingodb::{DocumentId, IBlob, LsmConfig, LsmEngine, Value, Filter, Query};
 
 fn make_user(name: &str, age: u64) -> IBlob {
     IBlob::from_pairs(vec![
@@ -358,4 +358,87 @@ fn test_delete_with_graph_ref_stable() {
     engine.put(user2).unwrap();
     let found_user = engine.get(&user_id).unwrap().unwrap();
     assert_eq!(found_user.get("name"), Some(&Value::String("Henrik v2".into())));
+}
+
+#[test]
+fn test_execute_get_query() {
+    let (engine, _dir) = test_engine();
+    let user = make_user("Henrik", 42);
+    let id = *user.id();
+    engine.put(user).unwrap();
+
+    let results = engine.execute(&Query::Get { id }).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("name"), Some(&Value::String("Henrik".into())));
+}
+
+#[test]
+fn test_execute_scan_with_filter() {
+    let (engine, _dir) = test_engine();
+    engine.put(make_user("Alice", 25)).unwrap();
+    engine.put(make_user("Bob", 35)).unwrap();
+    engine.put(make_user("Charlie", 45)).unwrap();
+
+    // Find users older than 30
+    let results = engine.execute(&Query::Scan {
+        filter: Some(Filter::Gt { field: "age".into(), value: Value::U64(30) }),
+        project: None,
+        limit: None,
+    }).unwrap();
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        if let Some(Value::U64(age)) = r.get("age") {
+            assert!(*age > 30);
+        }
+    }
+}
+
+#[test]
+fn test_execute_scan_with_projection() {
+    let (engine, _dir) = test_engine();
+    engine.put(make_user("Henrik", 42)).unwrap();
+    engine.put(make_user("Alice", 30)).unwrap();
+
+    let results = engine.execute(&Query::Scan {
+        filter: None,
+        project: Some(vec!["name".into()]),
+        limit: None,
+    }).unwrap();
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        assert!(r.is_projection());
+        assert_eq!(r.field_count(), 1);
+        assert!(r.get("name").is_some());
+        assert!(r.get("age").is_none(), "unprojected field should be absent");
+        assert!(r.get("type").is_none());
+    }
+}
+
+#[test]
+fn test_execute_scan_with_limit() {
+    let (engine, _dir) = test_engine();
+    for i in 0..10 {
+        engine.put(make_user(&format!("User{i}"), i)).unwrap();
+    }
+    let results = engine.execute(&Query::Scan {
+        filter: None,
+        project: None,
+        limit: Some(3),
+    }).unwrap();
+    assert_eq!(results.len(), 3);
+}
+
+#[test]
+fn test_scan_skips_deleted() {
+    let (engine, _dir) = test_engine();
+    let user1 = make_user("Keep", 20);
+    let user2 = make_user("Delete", 30);
+    let delete_id = *user2.id();
+    engine.put(user1).unwrap();
+    engine.put(user2).unwrap();
+    engine.delete(&delete_id).unwrap();
+
+    let results = engine.scan(None, None, None).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("name"), Some(&Value::String("Keep".into())));
 }

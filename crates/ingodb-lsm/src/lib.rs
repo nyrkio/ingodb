@@ -2,6 +2,7 @@ mod compaction;
 
 use ingodb_blob::{DocumentId, IBlob};
 use ingodb_memtable::MemTable;
+use ingodb_query::{Filter, Query};
 use ingodb_sstable::{SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use parking_lot::Mutex;
@@ -27,6 +28,9 @@ pub enum LsmError {
 
     #[error("blob error: {0}")]
     Blob(#[from] ingodb_blob::BlobError),
+
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
 }
 
 /// Configuration for the LSM storage engine.
@@ -356,6 +360,78 @@ impl LsmEngine {
         self.wal.lock().sync()?;
         Ok(())
     }
+
+    /// Full scan: merge all live documents, apply filter/projection/limit.
+    pub fn scan(
+        &self,
+        filter: Option<&Filter>,
+        project: Option<&[String]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<IBlob>, LsmError> {
+        // Collect all entries from memtable + SSTables
+        let mut all: Vec<(DocumentId, IBlob)> = Vec::new();
+
+        // Memtable entries (newest versions)
+        all.extend(self.memtable.iter());
+
+        // SSTable entries
+        {
+            let sstables = self.sstables.lock();
+            for sst in sstables.iter() {
+                all.extend(sst.iter()?);
+            }
+        }
+
+        // Merge: sort by _id, dedup keeping highest _version
+        all.sort_by(|(id_a, blob_a), (id_b, blob_b)| {
+            id_a.cmp(id_b).then_with(|| blob_b.version().cmp(blob_a.version()))
+        });
+        all.dedup_by_key(|(id, _)| *id);
+
+        // Filter out tombstones, apply query filter, projection, and limit
+        let mut results = Vec::new();
+        for (_, blob) in all {
+            if blob.is_deleted() {
+                continue;
+            }
+            if let Some(f) = filter {
+                if !f.matches(&|field| blob.get(field).cloned()) {
+                    continue;
+                }
+            }
+            let result = match project {
+                Some(fields) => blob.project(fields),
+                None => blob,
+            };
+            results.push(result);
+            if let Some(lim) = limit {
+                if results.len() >= lim {
+                    break;
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Execute a Liquid AST query.
+    pub fn execute(&self, query: &Query) -> Result<Vec<IBlob>, LsmError> {
+        match query {
+            Query::Get { id } => {
+                Ok(self.get(id)?.into_iter().collect())
+            }
+            Query::Scan { filter, project, limit } => {
+                self.scan(
+                    filter.as_ref(),
+                    project.as_deref(),
+                    *limit,
+                )
+            }
+            Query::Traverse { .. } => {
+                Err(LsmError::NotImplemented("traverse".into()))
+            }
+        }
+    }
 }
 
 /// Sort SSTables for correct read ordering:
@@ -591,5 +667,97 @@ mod tests {
         let found = engine.get(&id).unwrap().unwrap();
         assert_eq!(found.get("v"), Some(&Value::U64(2)),
             "level-aware read should return newest version");
+    }
+
+    #[test]
+    fn test_scan_all() {
+        let (engine, _dir) = test_engine();
+        for i in 0..5 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        let results = engine.scan(None, None, None).unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn test_scan_with_filter() {
+        let (engine, _dir) = test_engine();
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        let filter = Filter::Gt {
+            field: "n".into(),
+            value: Value::U64(6),
+        };
+        let results = engine.scan(Some(&filter), None, None).unwrap();
+        assert_eq!(results.len(), 3); // n=7,8,9
+        for r in &results {
+            if let Some(Value::U64(n)) = r.get("n") {
+                assert!(*n > 6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_scan_with_limit() {
+        let (engine, _dir) = test_engine();
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        let results = engine.scan(None, None, Some(3)).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_scan_with_projection() {
+        let (engine, _dir) = test_engine();
+        engine.put(make_blob(1)).unwrap();
+
+        let results = engine.scan(None, Some(&["n".into()]), None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_projection());
+        assert_eq!(results[0].field_count(), 1);
+        assert_eq!(results[0].get("n"), Some(&Value::U64(1)));
+        assert!(results[0].get("data").is_none());
+    }
+
+    #[test]
+    fn test_scan_skips_tombstones() {
+        let (engine, _dir) = test_engine();
+        let blob = make_blob(1);
+        let id = *blob.id();
+        engine.put(blob).unwrap();
+        engine.put(make_blob(2)).unwrap();
+
+        engine.delete(&id).unwrap();
+
+        let results = engine.scan(None, None, None).unwrap();
+        assert_eq!(results.len(), 1, "deleted doc not in scan results");
+    }
+
+    #[test]
+    fn test_execute_get() {
+        let (engine, _dir) = test_engine();
+        let blob = make_blob(42);
+        let id = *blob.id();
+        engine.put(blob).unwrap();
+
+        let results = engine.execute(&Query::Get { id }).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("n"), Some(&Value::U64(42)));
+    }
+
+    #[test]
+    fn test_execute_scan() {
+        let (engine, _dir) = test_engine();
+        for i in 0..5 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        let results = engine.execute(&Query::Scan {
+            filter: Some(Filter::Lt { field: "n".into(), value: Value::U64(3) }),
+            project: None,
+            limit: None,
+        }).unwrap();
+        assert_eq!(results.len(), 3); // n=0,1,2
     }
 }
