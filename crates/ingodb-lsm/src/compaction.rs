@@ -1,4 +1,4 @@
-use ingodb_blob::{ContentHash, IBlob};
+use ingodb_blob::{DocumentId, IBlob};
 use std::path::PathBuf;
 
 /// Action to take on a blob during compaction.
@@ -14,7 +14,7 @@ pub enum CompactionAction {
 /// Pluggable filter applied during compaction.
 /// This is the extension point for future adaptive morphing.
 pub trait CompactionFilter {
-    fn filter(&mut self, hash: &ContentHash, blob: &IBlob) -> CompactionAction;
+    fn filter(&mut self, id: &DocumentId, blob: &IBlob) -> CompactionAction;
 }
 
 /// Size-Tiered Compaction Strategy.

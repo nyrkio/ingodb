@@ -1,14 +1,14 @@
 use crate::bloom::BloomFilter;
 use crate::error::SSTableError;
 use crate::{FOOTER_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION};
-use ingodb_blob::{ContentHash, IBlob};
+use ingodb_blob::{DocumentId, IBlob};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Index entry loaded from an SSTable.
 #[derive(Debug, Clone)]
 struct BlockIndex {
-    last_hash: ContentHash,
+    last_id: DocumentId,
     offset: u64,
     size: u32,
 }
@@ -58,8 +58,8 @@ impl SSTableReader {
         let bloom_num_hashes = u32::from_le_bytes(bloom_data[4..8].try_into().unwrap());
         let bloom = BloomFilter::from_bytes(&bloom_data[8..], bloom_num_bits, bloom_num_hashes);
 
-        // Parse block index
-        let index_entry_size = 44; // 32 + 8 + 4
+        // Parse block index — each entry: [id:16][offset:8][size:4] = 28 bytes
+        let index_entry_size = 28;
         if index_offset + index_count * index_entry_size > data.len() {
             return Err(SSTableError::Corrupted("index out of bounds".into()));
         }
@@ -67,12 +67,12 @@ impl SSTableReader {
         let mut block_indices = Vec::with_capacity(index_count);
         for i in 0..index_count {
             let base = index_offset + i * index_entry_size;
-            let mut last_hash = [0u8; 32];
-            last_hash.copy_from_slice(&data[base..base + 32]);
-            let offset = u64::from_le_bytes(data[base + 32..base + 40].try_into().unwrap());
-            let size = u32::from_le_bytes(data[base + 40..base + 44].try_into().unwrap());
+            let mut id_bytes = [0u8; 16];
+            id_bytes.copy_from_slice(&data[base..base + 16]);
+            let offset = u64::from_le_bytes(data[base + 16..base + 24].try_into().unwrap());
+            let size = u32::from_le_bytes(data[base + 24..base + 28].try_into().unwrap());
             block_indices.push(BlockIndex {
-                last_hash,
+                last_id: DocumentId::from_bytes(id_bytes),
                 offset,
                 size,
             });
@@ -86,18 +86,18 @@ impl SSTableReader {
         })
     }
 
-    /// Point lookup: find a blob by its content hash.
-    /// Returns None if the hash is not in this SSTable.
-    pub fn get(&self, hash: &ContentHash) -> Result<Option<IBlob>, SSTableError> {
+    /// Point lookup: find a blob by its document ID.
+    /// Returns None if the ID is not in this SSTable.
+    pub fn get(&self, id: &DocumentId) -> Result<Option<IBlob>, SSTableError> {
         // Check bloom filter first
-        if !self.bloom.may_contain(hash) {
+        if !self.bloom.may_contain(id.as_bytes()) {
             return Ok(None);
         }
 
         // Binary search the block index to find the right block
         let block_idx = match self
             .block_indices
-            .binary_search_by_key(hash, |idx| idx.last_hash)
+            .binary_search_by_key(id, |idx| idx.last_id)
         {
             Ok(i) => i,
             Err(i) => {
@@ -113,14 +113,14 @@ impl SSTableReader {
         let entries = self.read_block(block)?;
 
         // Binary search within the block
-        match entries.binary_search_by_key(hash, |(h, _)| *h) {
+        match entries.binary_search_by_key(id, |(entry_id, _)| *entry_id) {
             Ok(i) => Ok(Some(entries[i].1.clone())),
             Err(_) => Ok(None),
         }
     }
 
-    /// Iterate over all entries in the SSTable in hash-sorted order.
-    pub fn iter(&self) -> Result<Vec<(ContentHash, IBlob)>, SSTableError> {
+    /// Iterate over all entries in the SSTable in ID-sorted order.
+    pub fn iter(&self) -> Result<Vec<(DocumentId, IBlob)>, SSTableError> {
         let mut all_entries = Vec::new();
         for block in &self.block_indices {
             let entries = self.read_block(block)?;
@@ -139,7 +139,7 @@ impl SSTableReader {
         &self.path
     }
 
-    fn read_block(&self, block: &BlockIndex) -> Result<Vec<(ContentHash, IBlob)>, SSTableError> {
+    fn read_block(&self, block: &BlockIndex) -> Result<Vec<(DocumentId, IBlob)>, SSTableError> {
         let start = block.offset as usize;
         let end = start + block.size as usize;
 
@@ -167,29 +167,29 @@ impl SSTableReader {
         let decompressed = lz4_flex::decompress_size_prepended(compressed)
             .map_err(|e| SSTableError::Corrupted(format!("LZ4 decompress failed: {e}")))?;
 
-        // Parse entries
+        // Parse entries: [entry_count:4][id:16][blob_len:4][blob_bytes]...
         let entry_count =
             u32::from_le_bytes(decompressed[0..4].try_into().unwrap()) as usize;
         let mut entries = Vec::with_capacity(entry_count);
         let mut pos = 4;
 
         for _ in 0..entry_count {
-            if pos + 36 > decompressed.len() {
+            if pos + 20 > decompressed.len() {
                 return Err(SSTableError::Corrupted("truncated entry in block".into()));
             }
 
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&decompressed[pos..pos + 32]);
+            let mut id_bytes = [0u8; 16];
+            id_bytes.copy_from_slice(&decompressed[pos..pos + 16]);
             let blob_len =
-                u32::from_le_bytes(decompressed[pos + 32..pos + 36].try_into().unwrap()) as usize;
-            pos += 36;
+                u32::from_le_bytes(decompressed[pos + 16..pos + 20].try_into().unwrap()) as usize;
+            pos += 20;
 
             if pos + blob_len > decompressed.len() {
                 return Err(SSTableError::Corrupted("truncated blob in block".into()));
             }
 
             let blob = IBlob::decode(&decompressed[pos..pos + blob_len])?;
-            entries.push((hash, blob));
+            entries.push((DocumentId::from_bytes(id_bytes), blob));
             pos += blob_len;
         }
 

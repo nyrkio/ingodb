@@ -110,23 +110,37 @@ Each phase produces a working, testable artifact. No phase depends on network or
 
 ---
 
-## Phase 5: Adaptive Morphing (Future)
+## Phase 5: Reactive Optimization
 
-**Goal**: The engine learns and restructures data during compaction.
+**Goal**: The engine tracks real query performance and reactively restructures data.
 
-- Access pattern tracker: count field access frequency per SSTable
-- Semantic shredding: extract hot fields into columnar side-structures during compaction
-- Co-location: physically interleave related documents (by hash reference graph)
-- Compression adaptation: choose LZ4/Zstd/dictionary per level based on data characteristics
+### 5a. Query Statistics Tracker
+- Instrument the read path to record per-query: latency, fields accessed, scan width
+- Maintain lightweight per-field access counters (field name → hit count + cumulative cost)
+- Track hash reference traversal patterns (which edges are followed, how often)
+- All stats kept in-memory, periodically persisted; cheap enough to always be on
+
+### 5b. Reactive Morphing During Compaction
+- Access pattern tracker feeds into compaction decisions:
+  - Semantic shredding: extract hot fields into columnar side-structures
+  - Co-location: physically interleave related documents (by hash reference graph)
+  - Compression adaptation: choose LZ4/Zstd/dictionary per level based on data characteristics
+- Decisions are reactive: "field X was slow to scan → shred it out at next compaction"
 - WASM comparator support for custom sort orders
-- Nyrkiö integration: benchmark before/after each morphing decision
+
+### 5c. Predictive Optimization (second phase)
+- Small predictive engine that anticipates future query patterns from recent history
+- Pre-emptively restructure data ahead of observed trends (e.g., a new field starts
+  getting queried → promote it to an index before it becomes a bottleneck)
+- This is speculative optimization; reactive (5b) is the safety net
 
 ---
 
 ## Phase 6: Infrastructure (Future, needs GitHub + CI)
 
 - gRPC server with Liquid AST protocol (tonic)
-- Benchmarks with criterion, integrated with Nyrkiö
+- Benchmarks with criterion (external benchmarks can be wired to Nyrkiö, but
+  Nyrkiö is not a core dependency of the database itself)
 - CI pipeline
 - Distributed/replication layer (much later)
 

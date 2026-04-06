@@ -1,28 +1,28 @@
-use ingodb_blob::{ContentHash, IBlob};
+use ingodb_blob::{DocumentId, IBlob};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// In-memory sorted table of IBlobs keyed by content hash.
+/// In-memory sorted table of IBlobs keyed by document ID.
 ///
 /// Thread-safe via RwLock. Tracks approximate memory usage
 /// and signals when it should be flushed to an SSTable.
 pub struct MemTable {
-    entries: RwLock<BTreeMap<ContentHash, IBlob>>,
+    entries: RwLock<BTreeMap<DocumentId, IBlob>>,
     /// Approximate bytes used (sum of encoded blob sizes)
     size_bytes: AtomicUsize,
     /// Flush threshold in bytes
     max_size: usize,
 }
 
-/// Iterator over memtable entries in hash-sorted order.
+/// Iterator over memtable entries in ID-sorted order.
 pub struct MemTableIter {
-    entries: Vec<(ContentHash, IBlob)>,
+    entries: Vec<(DocumentId, IBlob)>,
     pos: usize,
 }
 
 impl Iterator for MemTableIter {
-    type Item = (ContentHash, IBlob);
+    type Item = (DocumentId, IBlob);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos < self.entries.len() {
@@ -53,11 +53,11 @@ impl MemTable {
     /// Insert a blob. Returns true if the memtable should be flushed.
     pub fn insert(&self, blob: IBlob) -> bool {
         let encoded_size = blob.encode().len();
-        let hash = *blob.hash();
+        let id = *blob.id();
 
         let mut entries = self.entries.write();
-        if let Some(old) = entries.insert(hash, blob) {
-            // Replacing existing entry — adjust size
+        if let Some(old) = entries.insert(id, blob) {
+            // Replacing existing entry (upsert) — adjust size
             let old_size = old.encode().len();
             self.size_bytes.fetch_sub(old_size, Ordering::Relaxed);
         }
@@ -66,14 +66,14 @@ impl MemTable {
         self.size_bytes.load(Ordering::Relaxed) >= self.max_size
     }
 
-    /// Look up a blob by its content hash.
-    pub fn get(&self, hash: &ContentHash) -> Option<IBlob> {
-        self.entries.read().get(hash).cloned()
+    /// Look up a blob by its document ID.
+    pub fn get(&self, id: &DocumentId) -> Option<IBlob> {
+        self.entries.read().get(id).cloned()
     }
 
-    /// Check if a hash exists in the memtable.
-    pub fn contains(&self, hash: &ContentHash) -> bool {
-        self.entries.read().contains_key(hash)
+    /// Check if a document ID exists in the memtable.
+    pub fn contains(&self, id: &DocumentId) -> bool {
+        self.entries.read().contains_key(id)
     }
 
     /// Number of entries.
@@ -97,8 +97,8 @@ impl MemTable {
     }
 
     /// Drain all entries for flushing to an SSTable.
-    /// Returns entries sorted by content hash.
-    pub fn drain(&self) -> Vec<(ContentHash, IBlob)> {
+    /// Returns entries sorted by document ID.
+    pub fn drain(&self) -> Vec<(DocumentId, IBlob)> {
         let mut entries = self.entries.write();
         let drained: Vec<_> = entries.iter().map(|(k, v)| (*k, v.clone())).collect();
         entries.clear();
@@ -106,7 +106,7 @@ impl MemTable {
         drained
     }
 
-    /// Create an iterator over entries in hash-sorted order.
+    /// Create an iterator over entries in ID-sorted order.
     pub fn iter(&self) -> MemTableIter {
         let entries: Vec<_> = self.entries.read().iter().map(|(k, v)| (*k, v.clone())).collect();
         MemTableIter { entries, pos: 0 }
@@ -118,10 +118,10 @@ mod tests {
     use super::*;
     use ingodb_blob::Value;
 
-    fn make_blob(id: u64) -> IBlob {
+    fn make_blob(n: u64) -> IBlob {
         IBlob::from_pairs(vec![
-            ("id", Value::U64(id)),
-            ("data", Value::String(format!("item-{id}"))),
+            ("n", Value::U64(n)),
+            ("data", Value::String(format!("item-{n}"))),
         ])
     }
 
@@ -129,21 +129,28 @@ mod tests {
     fn test_insert_and_get() {
         let mt = MemTable::new(1024 * 1024);
         let blob = make_blob(1);
-        let hash = *blob.hash();
+        let id = *blob.id();
 
         mt.insert(blob.clone());
-        let retrieved = mt.get(&hash).unwrap();
-        assert_eq!(retrieved.hash(), &hash);
+        let retrieved = mt.get(&id).unwrap();
+        assert_eq!(retrieved.id(), &id);
         assert_eq!(mt.len(), 1);
     }
 
     #[test]
-    fn test_duplicate_insert() {
+    fn test_upsert_same_id() {
         let mt = MemTable::new(1024 * 1024);
-        let blob = make_blob(1);
-        mt.insert(blob.clone());
-        mt.insert(blob.clone()); // same hash, should replace
-        assert_eq!(mt.len(), 1);
+        let id = DocumentId::new();
+
+        let blob1 = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        let blob2 = IBlob::with_id(id, [("x".into(), Value::U64(2))].into());
+
+        mt.insert(blob1);
+        mt.insert(blob2.clone());
+        assert_eq!(mt.len(), 1, "same _id replaces old entry");
+
+        let retrieved = mt.get(&id).unwrap();
+        assert_eq!(retrieved.get("x"), Some(&Value::U64(2)));
     }
 
     #[test]
@@ -159,7 +166,7 @@ mod tests {
         assert!(mt.is_empty());
         assert_eq!(mt.size_bytes(), 0);
 
-        // Verify sorted by hash
+        // Verify sorted by document ID
         for i in 1..drained.len() {
             assert!(drained[i - 1].0 <= drained[i].0);
         }
@@ -167,7 +174,6 @@ mod tests {
 
     #[test]
     fn test_flush_threshold() {
-        // Tiny threshold
         let mt = MemTable::new(1);
         let should = mt.insert(make_blob(1));
         assert!(should);
@@ -178,11 +184,11 @@ mod tests {
     fn test_contains() {
         let mt = MemTable::new(1024 * 1024);
         let blob = make_blob(42);
-        let hash = *blob.hash();
+        let id = *blob.id();
 
-        assert!(!mt.contains(&hash));
+        assert!(!mt.contains(&id));
         mt.insert(blob);
-        assert!(mt.contains(&hash));
+        assert!(mt.contains(&id));
     }
 
     #[test]

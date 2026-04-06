@@ -1,6 +1,6 @@
 mod compaction;
 
-use ingodb_blob::{ContentHash, IBlob};
+use ingodb_blob::{DocumentId, IBlob};
 use ingodb_memtable::MemTable;
 use ingodb_sstable::{SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
@@ -83,7 +83,7 @@ impl LsmEngine {
 
         let memtable = MemTable::new(config.memtable_size);
 
-        // Replay recovered blobs into memtable
+        // Replay recovered blobs into memtable (versions already stamped)
         for blob in recovered {
             memtable.insert(blob);
         }
@@ -134,14 +134,18 @@ impl LsmEngine {
     }
 
     /// Insert a document into the engine.
-    pub fn put(&self, blob: IBlob) -> Result<(), LsmError> {
-        // Write to WAL first for durability
+    /// Stamps a server-assigned `_version` before writing.
+    pub fn put(&self, mut blob: IBlob) -> Result<(), LsmError> {
+        // Server stamps the version — this is the single point of version assignment
+        blob.set_version(DocumentId::new());
+
+        // Write to WAL first for durability (version is now embedded in the blob)
         {
             let mut wal = self.wal.lock();
             wal.append(&blob)?;
         }
 
-        // Insert into memtable
+        // Insert into memtable (keyed by _id; upsert replaces old version)
         let should_flush = self.memtable.insert(blob);
 
         if should_flush {
@@ -151,17 +155,17 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Look up a document by content hash.
-    pub fn get(&self, hash: &ContentHash) -> Result<Option<IBlob>, LsmError> {
-        // Check memtable first (fastest)
-        if let Some(blob) = self.memtable.get(hash) {
+    /// Look up a document by its stable document ID.
+    pub fn get(&self, id: &DocumentId) -> Result<Option<IBlob>, LsmError> {
+        // Check memtable first (fastest, always has latest version for a given _id)
+        if let Some(blob) = self.memtable.get(id) {
             return Ok(Some(blob));
         }
 
         // Check SSTables (newest first)
         let sstables = self.sstables.lock();
         for sst in sstables.iter() {
-            if let Some(blob) = sst.get(hash)? {
+            if let Some(blob) = sst.get(id)? {
                 return Ok(Some(blob));
             }
         }
@@ -169,9 +173,9 @@ impl LsmEngine {
         Ok(None)
     }
 
-    /// Check if a hash exists in the engine.
-    pub fn contains(&self, hash: &ContentHash) -> Result<bool, LsmError> {
-        Ok(self.get(hash)?.is_some())
+    /// Check if a document ID exists in the engine.
+    pub fn contains(&self, id: &DocumentId) -> Result<bool, LsmError> {
+        Ok(self.get(id)?.is_some())
     }
 
     /// Flush the current memtable to a new SSTable.
@@ -224,25 +228,28 @@ impl LsmEngine {
     }
 
     /// Run compaction on the given SSTable files, optionally applying a filter.
+    /// For duplicate `_id`s, the entry with the highest `_version` wins.
     fn run_compaction(
         &self,
         inputs: &[PathBuf],
         filter: Option<&mut dyn CompactionFilter>,
     ) -> Result<(), LsmError> {
         // Merge all input SSTables
-        let mut merged: Vec<(ContentHash, IBlob)> = Vec::new();
+        let mut merged: Vec<(DocumentId, IBlob)> = Vec::new();
         for path in inputs {
             let reader = SSTableReader::open(path)?;
             merged.extend(reader.iter()?);
         }
 
-        // Sort and dedup (keep latest = first occurrence since inputs are newest-first)
-        merged.sort_by_key(|(h, _)| *h);
-        merged.dedup_by_key(|(h, _)| *h);
+        // Sort by _id, then dedup: for same _id, keep the one with highest _version
+        merged.sort_by(|(id_a, blob_a), (id_b, blob_b)| {
+            id_a.cmp(id_b).then_with(|| blob_b.version().cmp(blob_a.version()))
+        });
+        merged.dedup_by_key(|(id, _)| *id);
 
         // Apply compaction filter
         if let Some(filter) = filter {
-            merged.retain_mut(|(hash, blob)| match filter.filter(hash, blob) {
+            merged.retain_mut(|(id, blob)| match filter.filter(id, blob) {
                 CompactionAction::Keep => true,
                 CompactionAction::Drop => false,
                 CompactionAction::Transform(new_blob) => {
@@ -303,10 +310,10 @@ mod tests {
     use super::*;
     use ingodb_blob::Value;
 
-    fn make_blob(id: u64) -> IBlob {
+    fn make_blob(n: u64) -> IBlob {
         IBlob::from_pairs(vec![
-            ("id", Value::U64(id)),
-            ("data", Value::String(format!("document-{id}"))),
+            ("n", Value::U64(n)),
+            ("data", Value::String(format!("document-{n}"))),
         ])
     }
 
@@ -326,18 +333,19 @@ mod tests {
     fn test_put_and_get() {
         let (engine, _dir) = test_engine();
         let blob = make_blob(1);
-        let hash = *blob.hash();
+        let id = *blob.id();
 
         engine.put(blob.clone()).unwrap();
-        let found = engine.get(&hash).unwrap().unwrap();
-        assert_eq!(found.hash(), &hash);
+        let found = engine.get(&id).unwrap().unwrap();
+        assert_eq!(found.id(), &id);
         assert_eq!(found.fields(), blob.fields());
+        assert!(!found.version().is_nil(), "version should be stamped by engine");
     }
 
     #[test]
     fn test_get_missing() {
         let (engine, _dir) = test_engine();
-        let missing = [0xFF; 32];
+        let missing = DocumentId::from_bytes([0xFF; 16]);
         assert!(engine.get(&missing).unwrap().is_none());
     }
 
@@ -346,6 +354,7 @@ mod tests {
         let (engine, _dir) = test_engine();
 
         let blobs: Vec<_> = (0..10).map(|i| make_blob(i)).collect();
+        let ids: Vec<_> = blobs.iter().map(|b| *b.id()).collect();
         for b in &blobs {
             engine.put(b.clone()).unwrap();
         }
@@ -356,9 +365,9 @@ mod tests {
         assert!(engine.sstable_count() >= 1);
 
         // All blobs still retrievable from SSTable
-        for b in &blobs {
-            let found = engine.get(b.hash()).unwrap().unwrap();
-            assert_eq!(found.hash(), b.hash());
+        for (i, id) in ids.iter().enumerate() {
+            let found = engine.get(id).unwrap().unwrap();
+            assert_eq!(found.get("n"), Some(&Value::U64(i as u64)));
         }
     }
 
@@ -373,7 +382,7 @@ mod tests {
         };
 
         let blob = make_blob(42);
-        let hash = *blob.hash();
+        let id = *blob.id();
 
         // Write and sync, then drop (simulating crash)
         {
@@ -385,8 +394,9 @@ mod tests {
         // Reopen — should recover from WAL
         {
             let engine = LsmEngine::open(config).unwrap();
-            let found = engine.get(&hash).unwrap().unwrap();
-            assert_eq!(found.hash(), &hash);
+            let found = engine.get(&id).unwrap().unwrap();
+            assert_eq!(found.id(), &id);
+            assert!(!found.version().is_nil(), "recovered blob should have version");
         }
     }
 
@@ -394,18 +404,37 @@ mod tests {
     fn test_many_writes_trigger_flushes() {
         let (engine, _dir) = test_engine();
 
-        // Write enough to trigger multiple flushes (memtable_size=4096)
+        let mut ids = Vec::new();
         for i in 0..100 {
-            engine.put(make_blob(i)).unwrap();
+            let blob = make_blob(i);
+            ids.push(*blob.id());
+            engine.put(blob).unwrap();
         }
 
         assert!(engine.sstable_count() >= 1, "expected at least one SSTable");
 
         // Verify all documents are retrievable
-        for i in 0..100 {
-            let blob = make_blob(i);
-            let found = engine.get(blob.hash()).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let found = engine.get(id).unwrap();
             assert!(found.is_some(), "blob {i} not found");
         }
+    }
+
+    #[test]
+    fn test_upsert_version_advances() {
+        let (engine, _dir) = test_engine();
+        let id = DocumentId::new();
+
+        let blob1 = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        engine.put(blob1).unwrap();
+        let v1 = *engine.get(&id).unwrap().unwrap().version();
+
+        let blob2 = IBlob::with_id(id, [("x".into(), Value::U64(2))].into());
+        engine.put(blob2).unwrap();
+        let found = engine.get(&id).unwrap().unwrap();
+        let v2 = *found.version();
+
+        assert!(v2 > v1, "version should advance on update");
+        assert_eq!(found.get("x"), Some(&Value::U64(2)));
     }
 }

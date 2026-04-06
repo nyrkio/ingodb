@@ -1,4 +1,4 @@
-use ingodb_blob::{ContentHash, Value};
+use ingodb_blob::{DocumentId, Value};
 
 /// The "Liquid AST" — IngoDB's query interface.
 ///
@@ -6,8 +6,8 @@ use ingodb_blob::{ContentHash, Value};
 /// This is the interface between the application and the storage engine.
 #[derive(Debug, Clone)]
 pub enum Query {
-    /// Point lookup by content hash
-    Get { hash: ContentHash },
+    /// Point lookup by document ID
+    Get { id: DocumentId },
 
     /// Scan with optional filter and projection
     Scan {
@@ -16,9 +16,9 @@ pub enum Query {
         limit: Option<usize>,
     },
 
-    /// Follow hash references from a starting document
+    /// Follow document references from a starting document
     Traverse {
-        start_hash: ContentHash,
+        start_id: DocumentId,
         edge_field: String,
         depth: usize,
     },
@@ -58,7 +58,7 @@ pub struct QueryResult {
 /// A single document in a query result, possibly projected.
 #[derive(Debug, Clone)]
 pub struct DocumentResult {
-    pub hash: ContentHash,
+    pub id: DocumentId,
     pub fields: Vec<(String, Value)>,
 }
 

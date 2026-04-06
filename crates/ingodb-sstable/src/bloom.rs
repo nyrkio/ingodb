@@ -1,6 +1,6 @@
 /// Simple bloom filter for SSTable key lookups.
 ///
-/// Uses k=7 hash functions derived from BLAKE3 for ~1% false positive rate
+/// Uses k=7 hash functions derived from the key bytes for ~1% false positive rate
 /// at 10 bits per key.
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
@@ -34,8 +34,8 @@ impl BloomFilter {
     }
 
     /// Add a key to the filter.
-    pub fn insert(&mut self, key: &[u8; 32]) {
-        let h = u128::from_le_bytes(key[..16].try_into().unwrap());
+    pub fn insert(&mut self, key: &[u8; 16]) {
+        let h = u128::from_le_bytes(*key);
         let h1 = h as u64;
         let h2 = (h >> 64) as u64;
 
@@ -47,8 +47,8 @@ impl BloomFilter {
 
     /// Check if a key might be in the filter.
     /// Returns false only if the key is definitely not present.
-    pub fn may_contain(&self, key: &[u8; 32]) -> bool {
-        let h = u128::from_le_bytes(key[..16].try_into().unwrap());
+    pub fn may_contain(&self, key: &[u8; 16]) -> bool {
+        let h = u128::from_le_bytes(*key);
         let h1 = h as u64;
         let h2 = (h >> 64) as u64;
 
@@ -84,8 +84,8 @@ mod tests {
     #[test]
     fn test_inserted_keys_found() {
         let mut bf = BloomFilter::new(100);
-        let key1 = [0xAA; 32];
-        let key2 = [0xBB; 32];
+        let key1 = [0xAA; 16];
+        let key2 = [0xBB; 16];
 
         bf.insert(&key1);
         bf.insert(&key2);
@@ -101,7 +101,7 @@ mod tests {
 
         // Insert n keys
         for i in 0..n {
-            let mut key = [0u8; 32];
+            let mut key = [0u8; 16];
             key[..8].copy_from_slice(&(i as u64).to_le_bytes());
             bf.insert(&key);
         }
@@ -109,7 +109,7 @@ mod tests {
         // Check n keys that were NOT inserted
         let mut false_positives = 0;
         for i in n..2 * n {
-            let mut key = [0u8; 32];
+            let mut key = [0u8; 16];
             key[..8].copy_from_slice(&(i as u64).to_le_bytes());
             if bf.may_contain(&key) {
                 false_positives += 1;
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip() {
         let mut bf = BloomFilter::new(50);
-        let key = [0xCC; 32];
+        let key = [0xCC; 16];
         bf.insert(&key);
 
         let bf2 = BloomFilter::from_bytes(bf.as_bytes(), bf.num_bits(), bf.num_hashes());

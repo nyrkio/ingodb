@@ -2,11 +2,11 @@
 //!
 //! A self-morphing, AI-native storage engine built on an adaptive LSM tree.
 //!
-//! IngoDB accepts arbitrary documents (blobs), identifies them by BLAKE3
-//! content hash, and stores them in an LSM structure that can evolve its
-//! physical layout over time based on access patterns and benchmarking data.
+//! IngoDB accepts arbitrary documents identified by stable UUIDv7 `_id`s,
+//! and stores them in an LSM structure that can evolve its physical layout
+//! over time based on access patterns and benchmarking data.
 
-pub use ingodb_blob::{self as blob, ContentHash, IBlob, Value};
+pub use ingodb_blob::{self as blob, ContentHash, DocumentId, IBlob, Value};
 pub use ingodb_lsm::{self as lsm, LsmConfig, LsmEngine, LsmError};
 pub use ingodb_memtable::{self as memtable, MemTable};
 pub use ingodb_query::{self as query, Filter, Query, QueryResult};

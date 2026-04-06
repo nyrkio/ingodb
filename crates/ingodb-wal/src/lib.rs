@@ -179,7 +179,9 @@ mod tests {
 
         let recovered = Wal::recover(&wal_path).unwrap();
         assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].id(), blob1.id());
         assert_eq!(recovered[0].hash(), blob1.hash());
+        assert_eq!(recovered[1].id(), blob2.id());
         assert_eq!(recovered[1].hash(), blob2.hash());
     }
 

@@ -1,23 +1,23 @@
 use crate::bloom::BloomFilter;
 use crate::error::SSTableError;
 use crate::{DEFAULT_BLOCK_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION};
-use ingodb_blob::{ContentHash, IBlob};
+use ingodb_blob::{DocumentId, IBlob};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Index entry: points to a data block by the last hash it contains.
+/// Index entry: points to a data block by the last document ID it contains.
 #[derive(Debug, Clone)]
 struct BlockIndex {
-    /// Last (largest) hash in this block
-    last_hash: ContentHash,
+    /// Last (largest) document ID in this block
+    last_id: DocumentId,
     /// Byte offset of the block in the file
     offset: u64,
     /// Compressed size of the block in bytes
     size: u32,
 }
 
-/// Writes an SSTable file from sorted (hash, blob) pairs.
+/// Writes an SSTable file from sorted (id, blob) pairs.
 ///
 /// File layout:
 /// ```text
@@ -26,7 +26,7 @@ struct BlockIndex {
 /// ...
 /// [data block N]
 /// [bloom filter bytes]
-/// [index entries]  — each: [hash:32][offset:8][size:4] = 44 bytes
+/// [index entries]  — each: [id:16][offset:8][size:4] = 28 bytes
 /// [footer: 30B]
 ///   [index_offset: 8B]
 ///   [index_count: 4B]
@@ -39,7 +39,7 @@ struct BlockIndex {
 /// Within each data block (after decompression):
 /// ```text
 /// [entry_count: 4B]
-/// [hash:32B][blob_len:4B][blob_bytes] ...repeated
+/// [id:16B][blob_len:4B][blob_bytes] ...repeated
 /// ```
 pub struct SSTableWriter {
     block_size: usize,
@@ -57,11 +57,11 @@ impl SSTableWriter {
     }
 
     /// Write an SSTable from sorted entries.
-    /// Entries MUST be sorted by content hash.
+    /// Entries MUST be sorted by document ID.
     pub fn write(
         &self,
         path: impl AsRef<Path>,
-        entries: &[(ContentHash, IBlob)],
+        entries: &[(DocumentId, IBlob)],
     ) -> Result<(), SSTableError> {
         if entries.is_empty() {
             return Err(SSTableError::Empty);
@@ -80,11 +80,11 @@ impl SSTableWriter {
         // Reserve space for entry count at start of block
         current_block.extend_from_slice(&0u32.to_le_bytes());
 
-        for (hash, blob) in entries {
-            bloom.insert(hash);
+        for (id, blob) in entries {
+            bloom.insert(id.as_bytes());
 
             let blob_bytes = blob.encode();
-            let entry_size = 32 + 4 + blob_bytes.len();
+            let entry_size = 16 + 4 + blob_bytes.len();
 
             // If adding this entry would exceed block size, flush current block
             if block_entry_count > 0 && current_block.len() + entry_size > self.block_size {
@@ -98,7 +98,7 @@ impl SSTableWriter {
             }
 
             // Write entry into current block buffer
-            current_block.extend_from_slice(hash);
+            current_block.extend_from_slice(id.as_bytes());
             current_block.extend_from_slice(&(blob_bytes.len() as u32).to_le_bytes());
             current_block.extend_from_slice(&blob_bytes);
             block_entry_count += 1;
@@ -124,7 +124,7 @@ impl SSTableWriter {
         let index_offset = bloom_offset + bloom_size as u64;
         let index_count = block_indices.len() as u32;
         for idx in &block_indices {
-            writer.write_all(&idx.last_hash)?;
+            writer.write_all(idx.last_id.as_bytes())?;
             writer.write_all(&idx.offset.to_le_bytes())?;
             writer.write_all(&idx.size.to_le_bytes())?;
         }
@@ -165,12 +165,11 @@ impl SSTableWriter {
 
         let block_size = 4 + compressed.len();
 
-        // Extract last hash from the block for the index
-        // Parse from end of the raw block data
-        let last_hash = self.extract_last_hash(&data, entry_count);
+        // Extract last ID from the block for the index
+        let last_id = self.extract_last_id(&data, entry_count);
 
         block_indices.push(BlockIndex {
-            last_hash,
+            last_id,
             offset: file_offset,
             size: block_size as u32,
         });
@@ -178,17 +177,17 @@ impl SSTableWriter {
         Ok(file_offset + block_size as u64)
     }
 
-    fn extract_last_hash(&self, block_data: &[u8], entry_count: u32) -> ContentHash {
-        // Walk through entries to find the last hash
+    fn extract_last_id(&self, block_data: &[u8], entry_count: u32) -> DocumentId {
+        // Walk through entries to find the last ID
         let mut pos = 4; // skip entry_count
-        let mut last_hash = [0u8; 32];
+        let mut last_id = [0u8; 16];
         for _ in 0..entry_count {
-            last_hash.copy_from_slice(&block_data[pos..pos + 32]);
+            last_id.copy_from_slice(&block_data[pos..pos + 16]);
             let blob_len =
-                u32::from_le_bytes(block_data[pos + 32..pos + 36].try_into().unwrap()) as usize;
-            pos += 36 + blob_len;
+                u32::from_le_bytes(block_data[pos + 16..pos + 20].try_into().unwrap()) as usize;
+            pos += 20 + blob_len;
         }
-        last_hash
+        DocumentId::from_bytes(last_id)
     }
 }
 

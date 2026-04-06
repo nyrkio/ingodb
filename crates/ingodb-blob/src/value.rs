@@ -1,4 +1,4 @@
-use crate::ContentHash;
+use crate::DocumentId;
 
 /// Tagged value types supported by IngoDB.
 ///
@@ -20,8 +20,8 @@ pub enum Value {
     String(String),
     /// Raw bytes (opaque to the engine)
     Bytes(Vec<u8>),
-    /// Reference to another document by content hash
-    Hash(ContentHash),
+    /// Reference to another document by its stable `_id`
+    Ref(DocumentId),
     /// Ordered list of values
     Array(Vec<Value>),
     /// Nested document (sorted key-value pairs)
@@ -36,7 +36,7 @@ const TAG_U64: u8 = 3;
 const TAG_F64: u8 = 4;
 const TAG_STRING: u8 = 5;
 const TAG_BYTES: u8 = 6;
-const TAG_HASH: u8 = 7;
+const TAG_REF: u8 = 7;
 const TAG_ARRAY: u8 = 8;
 const TAG_DOCUMENT: u8 = 9;
 
@@ -71,9 +71,9 @@ impl Value {
                 buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 buf.extend_from_slice(b);
             }
-            Value::Hash(h) => {
-                buf.push(TAG_HASH);
-                buf.extend_from_slice(h);
+            Value::Ref(id) => {
+                buf.push(TAG_REF);
+                buf.extend_from_slice(id.as_bytes());
             }
             Value::Array(arr) => {
                 buf.push(TAG_ARRAY);
@@ -104,10 +104,10 @@ impl Value {
         }
 
         let tag = buf[offset];
-        let mut pos = offset + 1;
+        let pos = offset + 1;
 
         match tag {
-            TAG_NULL => Ok((Value::Null, pos - offset)),
+            TAG_NULL => Ok((Value::Null, 1)),
             TAG_BOOL => {
                 check_len(buf, pos, 1)?;
                 let v = buf[pos] != 0;
@@ -131,7 +131,7 @@ impl Value {
             TAG_STRING => {
                 check_len(buf, pos, 4)?;
                 let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
+                let pos = pos + 4;
                 check_len(buf, pos, len)?;
                 let s = std::str::from_utf8(&buf[pos..pos + len])?.to_string();
                 Ok((Value::String(s), 5 + len))
@@ -139,21 +139,21 @@ impl Value {
             TAG_BYTES => {
                 check_len(buf, pos, 4)?;
                 let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
+                let pos = pos + 4;
                 check_len(buf, pos, len)?;
                 let b = buf[pos..pos + len].to_vec();
                 Ok((Value::Bytes(b), 5 + len))
             }
-            TAG_HASH => {
-                check_len(buf, pos, 32)?;
-                let mut h = [0u8; 32];
-                h.copy_from_slice(&buf[pos..pos + 32]);
-                Ok((Value::Hash(h), 33))
+            TAG_REF => {
+                check_len(buf, pos, 16)?;
+                let mut id_bytes = [0u8; 16];
+                id_bytes.copy_from_slice(&buf[pos..pos + 16]);
+                Ok((Value::Ref(DocumentId::from_bytes(id_bytes)), 17))
             }
             TAG_ARRAY => {
                 check_len(buf, pos, 4)?;
                 let count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
+                let mut pos = pos + 4;
                 let mut arr = Vec::with_capacity(count);
                 let mut total = 5; // tag + count
                 for _ in 0..count {
@@ -167,7 +167,7 @@ impl Value {
             TAG_DOCUMENT => {
                 check_len(buf, pos, 4)?;
                 let count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
+                let mut pos = pos + 4;
                 let mut fields = Vec::with_capacity(count);
                 let mut total = 5; // tag + count
                 for _ in 0..count {
@@ -254,8 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_ref() {
-        roundtrip(&Value::Hash([0xAB; 32]));
+    fn test_ref() {
+        roundtrip(&Value::Ref(DocumentId::from_bytes([0xAB; 16])));
     }
 
     #[test]

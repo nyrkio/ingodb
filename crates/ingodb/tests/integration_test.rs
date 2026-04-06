@@ -1,4 +1,4 @@
-use ingodb::{IBlob, LsmConfig, LsmEngine, Value, Filter};
+use ingodb::{DocumentId, IBlob, LsmConfig, LsmEngine, Value, Filter};
 
 fn make_user(name: &str, age: u64) -> IBlob {
     IBlob::from_pairs(vec![
@@ -8,10 +8,10 @@ fn make_user(name: &str, age: u64) -> IBlob {
     ])
 }
 
-fn make_order(user_hash: ingodb::ContentHash, amount: u64) -> IBlob {
+fn make_order(user_id: DocumentId, amount: u64) -> IBlob {
     IBlob::from_pairs(vec![
         ("type", Value::String("order".into())),
-        ("user", Value::Hash(user_hash)),
+        ("user", Value::Ref(user_id)),
         ("amount", Value::U64(amount)),
     ])
 }
@@ -34,51 +34,99 @@ fn test_document_lifecycle() {
 
     // Insert a user
     let user = make_user("Henrik", 42);
-    let user_hash = *user.hash();
+    let user_id = *user.id();
     engine.put(user).unwrap();
 
-    // Insert orders referencing the user
-    let order1 = make_order(user_hash, 100);
-    let order2 = make_order(user_hash, 250);
-    let order1_hash = *order1.hash();
-    let order2_hash = *order2.hash();
+    // Insert orders referencing the user by stable _id
+    let order1 = make_order(user_id, 100);
+    let order2 = make_order(user_id, 250);
+    let order1_id = *order1.id();
+    let order2_id = *order2.id();
     engine.put(order1).unwrap();
     engine.put(order2).unwrap();
 
     // Retrieve and verify
-    let found_user = engine.get(&user_hash).unwrap().unwrap();
+    let found_user = engine.get(&user_id).unwrap().unwrap();
     assert_eq!(found_user.get("name"), Some(&Value::String("Henrik".into())));
+    assert!(!found_user.version().is_nil(), "version should be stamped");
 
-    let found_order = engine.get(&order1_hash).unwrap().unwrap();
-    assert_eq!(found_order.get("user"), Some(&Value::Hash(user_hash)));
+    let found_order = engine.get(&order1_id).unwrap().unwrap();
+    assert_eq!(found_order.get("user"), Some(&Value::Ref(user_id)));
     assert_eq!(found_order.get("amount"), Some(&Value::U64(100)));
 
-    // Verify hash references work: follow order → user
-    let order2_doc = engine.get(&order2_hash).unwrap().unwrap();
-    if let Some(Value::Hash(ref_hash)) = order2_doc.get("user") {
-        let referenced_user = engine.get(ref_hash).unwrap().unwrap();
+    // Verify references work: follow order → user via stable _id
+    let order2_doc = engine.get(&order2_id).unwrap().unwrap();
+    if let Some(Value::Ref(ref_id)) = order2_doc.get("user") {
+        let referenced_user = engine.get(ref_id).unwrap().unwrap();
         assert_eq!(
             referenced_user.get("name"),
             Some(&Value::String("Henrik".into()))
         );
     } else {
-        panic!("expected Hash reference in order.user field");
+        panic!("expected Ref in order.user field");
     }
 }
 
 #[test]
-fn test_content_addressable_dedup() {
+fn test_same_content_different_ids() {
     let (engine, _dir) = test_engine();
 
+    // Same content produces same content hash but different _ids
     let blob1 = make_user("Duplicate", 10);
     let blob2 = make_user("Duplicate", 10);
-    assert_eq!(blob1.hash(), blob2.hash());
+    assert_eq!(blob1.hash(), blob2.hash(), "same content -> same hash");
+    assert_ne!(blob1.id(), blob2.id(), "different docs -> different _ids");
 
-    engine.put(blob1.clone()).unwrap();
+    let id1 = *blob1.id();
+    let id2 = *blob2.id();
+
+    engine.put(blob1).unwrap();
     engine.put(blob2).unwrap();
 
-    let found = engine.get(blob1.hash()).unwrap().unwrap();
-    assert_eq!(found.get("name"), Some(&Value::String("Duplicate".into())));
+    // Both are independently retrievable
+    let found1 = engine.get(&id1).unwrap().unwrap();
+    let found2 = engine.get(&id2).unwrap().unwrap();
+    assert_eq!(found1.get("name"), Some(&Value::String("Duplicate".into())));
+    assert_eq!(found2.get("name"), Some(&Value::String("Duplicate".into())));
+}
+
+#[test]
+fn test_upsert() {
+    let (engine, _dir) = test_engine();
+
+    let id = DocumentId::new();
+    let blob1 = IBlob::with_id(id, [
+        ("name".into(), Value::String("Henrik".into())),
+        ("age".into(), Value::U64(42)),
+    ].into());
+    engine.put(blob1).unwrap();
+    let v1 = *engine.get(&id).unwrap().unwrap().version();
+
+    // Update: same _id, different content
+    let blob2 = IBlob::with_id(id, [
+        ("name".into(), Value::String("Henrik".into())),
+        ("age".into(), Value::U64(43)),
+    ].into());
+    engine.put(blob2).unwrap();
+
+    let found = engine.get(&id).unwrap().unwrap();
+    assert_eq!(found.get("age"), Some(&Value::U64(43)), "update applied");
+    assert!(found.version() > &v1, "version advanced");
+    assert_eq!(found.id(), &id, "_id unchanged");
+}
+
+#[test]
+fn test_version_server_assigned() {
+    let (engine, _dir) = test_engine();
+
+    let blob = make_user("Test", 1);
+    assert!(blob.version().is_nil(), "version nil before put");
+
+    let id = *blob.id();
+    engine.put(blob).unwrap();
+
+    let found = engine.get(&id).unwrap().unwrap();
+    assert!(!found.version().is_nil(), "version stamped after put");
 }
 
 #[test]
@@ -92,7 +140,7 @@ fn test_survive_restart() {
     };
 
     let user = make_user("Persistent", 99);
-    let hash = *user.hash();
+    let id = *user.id();
 
     {
         let engine = LsmEngine::open(config.clone()).unwrap();
@@ -102,11 +150,12 @@ fn test_survive_restart() {
 
     {
         let engine = LsmEngine::open(config).unwrap();
-        let found = engine.get(&hash).unwrap().unwrap();
+        let found = engine.get(&id).unwrap().unwrap();
         assert_eq!(
             found.get("name"),
             Some(&Value::String("Persistent".into()))
         );
+        assert!(!found.version().is_nil(), "version survives restart");
     }
 }
 
@@ -120,13 +169,13 @@ fn test_flush_and_recover_from_sstable() {
         compaction_threshold: 4,
     };
 
-    let mut hashes = Vec::new();
+    let mut ids = Vec::new();
 
     {
         let engine = LsmEngine::open(config.clone()).unwrap();
         for i in 0..20 {
             let blob = make_user(&format!("User{i}"), i);
-            hashes.push(*blob.hash());
+            ids.push(*blob.id());
             engine.put(blob).unwrap();
         }
         engine.flush_memtable().unwrap();
@@ -134,9 +183,9 @@ fn test_flush_and_recover_from_sstable() {
 
     {
         let engine = LsmEngine::open(config).unwrap();
-        for hash in &hashes {
+        for id in &ids {
             assert!(
-                engine.get(hash).unwrap().is_some(),
+                engine.get(id).unwrap().is_some(),
                 "document not found after restart"
             );
         }
@@ -190,10 +239,10 @@ fn test_large_documents() {
         .map(|(i, k)| (k.as_str(), Value::U64(i as u64)))
         .collect();
     let blob = IBlob::from_pairs(pairs);
-    let hash = *blob.hash();
+    let id = *blob.id();
 
     engine.put(blob).unwrap();
-    let found = engine.get(&hash).unwrap().unwrap();
+    let found = engine.get(&id).unwrap().unwrap();
     assert_eq!(found.field_count(), 100);
 }
 
@@ -201,18 +250,18 @@ fn test_large_documents() {
 fn test_high_throughput_writes() {
     let (engine, _dir) = test_engine();
 
-    let mut hashes = Vec::with_capacity(1000);
+    let mut ids = Vec::with_capacity(1000);
     for i in 0..1000u64 {
         let blob = IBlob::from_pairs(vec![
             ("seq", Value::U64(i)),
             ("payload", Value::Bytes(vec![0xAB; 64])),
         ]);
-        hashes.push(*blob.hash());
+        ids.push(*blob.id());
         engine.put(blob).unwrap();
     }
 
-    for hash in &hashes {
-        assert!(engine.get(hash).unwrap().is_some());
+    for id in &ids {
+        assert!(engine.get(id).unwrap().is_some());
     }
 
     assert!(

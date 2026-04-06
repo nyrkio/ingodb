@@ -12,7 +12,7 @@ pub use error::SSTableError;
 pub const SSTABLE_MAGIC: [u8; 4] = *b"ISST";
 
 /// SSTable format version
-pub const SSTABLE_VERSION: u16 = 1;
+pub const SSTABLE_VERSION: u16 = 2;
 
 /// Default data block size (4 KB, aligned for direct I/O)
 pub const DEFAULT_BLOCK_SIZE: usize = 4096;
@@ -23,19 +23,19 @@ pub const FOOTER_SIZE: usize = 30;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ingodb_blob::{IBlob, Value};
+    use ingodb_blob::{DocumentId, IBlob, Value};
 
-    fn make_entries(n: usize) -> Vec<(ingodb_blob::ContentHash, IBlob)> {
+    fn make_entries(n: usize) -> Vec<(DocumentId, IBlob)> {
         let mut entries: Vec<_> = (0..n)
             .map(|i| {
                 let blob = IBlob::from_pairs(vec![
                     ("id", Value::U64(i as u64)),
                     ("name", Value::String(format!("entry-{i}"))),
                 ]);
-                (*blob.hash(), blob)
+                (*blob.id(), blob)
             })
             .collect();
-        entries.sort_by_key(|(h, _)| *h);
+        entries.sort_by_key(|(id, _)| *id);
         entries
     }
 
@@ -50,15 +50,15 @@ mod tests {
         let reader = SSTableReader::open(&path).unwrap();
 
         // Verify all entries can be looked up
-        for (hash, blob) in &entries {
-            let found = reader.get(hash).unwrap().expect("entry not found");
-            assert_eq!(found.hash(), blob.hash());
+        for (id, blob) in &entries {
+            let found = reader.get(id).unwrap().expect("entry not found");
+            assert_eq!(found.id(), blob.id());
             assert_eq!(found.fields(), blob.fields());
         }
 
         // Verify a missing key returns None
-        let missing_hash = [0xFF; 32];
-        assert!(reader.get(&missing_hash).unwrap().is_none());
+        let missing_id = DocumentId::from_bytes([0xFF; 16]);
+        assert!(reader.get(&missing_id).unwrap().is_none());
     }
 
     #[test]
@@ -92,9 +92,9 @@ mod tests {
 
         assert!(reader.block_count() > 1, "expected multiple blocks");
 
-        for (hash, blob) in &entries {
-            let found = reader.get(hash).unwrap().expect("entry not found");
-            assert_eq!(found.hash(), blob.hash());
+        for (id, blob) in &entries {
+            let found = reader.get(id).unwrap().expect("entry not found");
+            assert_eq!(found.id(), blob.id());
         }
     }
 
@@ -108,6 +108,6 @@ mod tests {
         let reader = SSTableReader::open(&path).unwrap();
 
         let found = reader.get(&entries[0].0).unwrap().unwrap();
-        assert_eq!(found.hash(), entries[0].1.hash());
+        assert_eq!(found.id(), entries[0].1.id());
     }
 }

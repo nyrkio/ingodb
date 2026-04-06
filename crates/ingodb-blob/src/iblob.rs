@@ -1,4 +1,4 @@
-use crate::{BlobError, ContentHash, Value, FORMAT_VERSION, MAGIC};
+use crate::{BlobError, ContentHash, DocumentId, Value, FORMAT_VERSION, MAGIC};
 use std::collections::BTreeMap;
 
 /// Index entry in the I-Blob header: maps a key hash to its location in the payload.
@@ -13,14 +13,17 @@ struct IndexEntry {
 }
 
 const INDEX_ENTRY_SIZE: usize = 16; // 8 + 4 + 4
-const HEADER_SIZE: usize = 4 + 2 + 32 + 4; // magic + version + hash + index_count
+// v2 header: magic(4) + format_version(2) + document_id(16) + doc_version(16) + content_hash(32) + index_count(4) = 74
+const HEADER_SIZE: usize = 4 + 2 + 16 + 16 + 32 + 4;
 
-/// An IngoDB document: a collection of named fields with a content-addressable hash.
+/// An IngoDB document: a collection of named fields with stable identity.
 ///
-/// Binary layout:
+/// Binary layout (v2):
 /// ```text
 /// [magic: 4B "INGO"]
-/// [version: 2B LE]
+/// [format_version: 2B LE]
+/// [document_id: 16B UUIDv7]
+/// [doc_version: 16B UUIDv7]
 /// [content_hash: 32B BLAKE3]
 /// [index_count: 4B LE]
 /// [index_entries: index_count * 16B]
@@ -29,11 +32,16 @@ const HEADER_SIZE: usize = 4 + 2 + 32 + 4; // magic + version + hash + index_cou
 ///   encoded Values concatenated in key-sorted order
 /// ```
 ///
-/// The content hash is computed over the canonical encoding (keys sorted lexicographically).
-/// Identical logical documents always produce the same hash.
+/// `_id` is the stable document identity (persists across updates).
+/// `_version` is server-assigned at write time (advances on each update).
+/// The content hash is computed over the canonical payload only (excludes `_id` and `_version`).
 #[derive(Debug, Clone)]
 pub struct IBlob {
-    /// BLAKE3 hash of the canonical encoding (everything after the hash field)
+    /// Stable document identity (UUIDv7)
+    id: DocumentId,
+    /// Server-assigned write-order version (UUIDv7). Nil until server stamps it.
+    version: DocumentId,
+    /// BLAKE3 hash of the canonical payload (for integrity/dedup)
     hash: ContentHash,
     /// Fields stored as sorted key-value pairs
     fields: BTreeMap<String, Value>,
@@ -43,9 +51,24 @@ pub struct IBlob {
 
 impl IBlob {
     /// Create a new IBlob from key-value pairs.
-    /// Keys are sorted and the content hash is computed.
+    /// Auto-generates a UUIDv7 `_id`. The `_version` is left nil (server sets it at write time).
     pub fn new(fields: BTreeMap<String, Value>) -> Self {
         let mut blob = IBlob {
+            id: DocumentId::new(),
+            version: DocumentId::nil(),
+            hash: [0; 32],
+            fields,
+            encoded: None,
+        };
+        blob.recompute_hash();
+        blob
+    }
+
+    /// Create with a caller-supplied `_id`. The `_version` is left nil.
+    pub fn with_id(id: DocumentId, fields: BTreeMap<String, Value>) -> Self {
+        let mut blob = IBlob {
+            id,
+            version: DocumentId::nil(),
             hash: [0; 32],
             fields,
             encoded: None,
@@ -63,7 +86,23 @@ impl IBlob {
         Self::new(fields)
     }
 
-    /// Content hash of this document.
+    /// Stable document identity.
+    pub fn id(&self) -> &DocumentId {
+        &self.id
+    }
+
+    /// Server-assigned version (nil until written through the engine).
+    pub fn version(&self) -> &DocumentId {
+        &self.version
+    }
+
+    /// Set the version. Called by the LSM engine at write time.
+    pub fn set_version(&mut self, v: DocumentId) {
+        self.version = v;
+        self.encoded = None; // invalidate cached encoding
+    }
+
+    /// Content hash of this document's payload (for integrity/dedup).
     pub fn hash(&self) -> &ContentHash {
         &self.hash
     }
@@ -90,7 +129,6 @@ impl IBlob {
     }
 
     fn recompute_hash(&mut self) {
-        // Encode the canonical payload (keys sorted — BTreeMap guarantees this)
         let payload = self.encode_payload();
         self.hash = *blake3::hash(&payload).as_bytes();
     }
@@ -99,7 +137,6 @@ impl IBlob {
     fn encode_payload(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         for (key, value) in &self.fields {
-            // Encode key length + key + value for hashing purposes
             payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
             payload.extend_from_slice(key.as_bytes());
             value.encode(&mut payload);
@@ -113,7 +150,7 @@ impl IBlob {
             return cached.clone();
         }
 
-        // Encode each field as [key_len:4][key_bytes][value_bytes]
+        // Encode each field
         let mut value_buffers: Vec<(String, u64, Vec<u8>)> = Vec::with_capacity(self.fields.len());
         for (key, value) in &self.fields {
             let kh = Self::key_hash(key);
@@ -151,6 +188,8 @@ impl IBlob {
         // Header
         buf.extend_from_slice(&MAGIC);
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(self.id.as_bytes());
+        buf.extend_from_slice(self.version.as_bytes());
         buf.extend_from_slice(&self.hash);
         buf.extend_from_slice(&index_count.to_le_bytes());
 
@@ -181,19 +220,29 @@ impl IBlob {
             return Err(BlobError::InvalidMagic);
         }
 
-        // Version
+        // Format version
         let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
         if version != FORMAT_VERSION {
             return Err(BlobError::UnsupportedVersion(version));
         }
 
-        // Hash
-        let mut stored_hash = [0u8; 32];
-        stored_hash.copy_from_slice(&buf[6..38]);
+        // Document ID (offset 6..22)
+        let mut id_bytes = [0u8; 16];
+        id_bytes.copy_from_slice(&buf[6..22]);
+        let id = DocumentId::from_bytes(id_bytes);
 
-        // Index count
+        // Document version (offset 22..38)
+        let mut ver_bytes = [0u8; 16];
+        ver_bytes.copy_from_slice(&buf[22..38]);
+        let doc_version = DocumentId::from_bytes(ver_bytes);
+
+        // Content hash (offset 38..70)
+        let mut stored_hash = [0u8; 32];
+        stored_hash.copy_from_slice(&buf[38..70]);
+
+        // Index count (offset 70..74)
         let index_count =
-            u32::from_le_bytes(buf[38..42].try_into().unwrap()) as usize;
+            u32::from_le_bytes(buf[70..74].try_into().unwrap()) as usize;
 
         let index_end = HEADER_SIZE + index_count * INDEX_ENTRY_SIZE;
         if buf.len() < index_end {
@@ -220,17 +269,7 @@ impl IBlob {
         // Payload starts after the index
         let payload = &buf[index_end..];
 
-        // Decode all values — but we need the keys too.
-        // The payload contains the full canonical encoding (key_len + key + value) for hashing,
-        // but the on-disk payload section only has encoded Values.
-        // We need to reconstruct from the index + payload.
-        //
-        // Problem: the index only has key_hash, not the actual key names.
-        // For full decode, we need to store keys in the payload.
-        //
-        // Let's revise: payload stores [key_len:4][key_bytes][value_bytes] per field,
-        // and index entries point to the start of each key_len.
-
+        // Decode fields from payload
         let mut fields = BTreeMap::new();
         for entry in &index_entries {
             let start = entry.offset as usize;
@@ -267,6 +306,8 @@ impl IBlob {
 
         // Verify hash
         let blob = IBlob {
+            id,
+            version: doc_version,
             hash: stored_hash,
             fields,
             encoded: None,
@@ -293,7 +334,7 @@ impl IBlob {
         }
 
         let index_count =
-            u32::from_le_bytes(buf[38..42].try_into().unwrap()) as usize;
+            u32::from_le_bytes(buf[70..74].try_into().unwrap()) as usize;
         let index_end = HEADER_SIZE + index_count * INDEX_ENTRY_SIZE;
 
         let target_hash = Self::key_hash(field_name);
@@ -349,7 +390,7 @@ fn hex(bytes: &[u8]) -> String {
 
 impl PartialEq for IBlob {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
+        self.id == other.id
     }
 }
 
@@ -374,13 +415,14 @@ mod tests {
         let encoded = blob.encode();
         let decoded = IBlob::decode(&encoded).unwrap();
 
+        assert_eq!(blob.id(), decoded.id());
         assert_eq!(blob.hash(), decoded.hash());
         assert_eq!(blob.fields(), decoded.fields());
     }
 
     #[test]
     fn test_content_addressable() {
-        // Same fields in different insertion order should produce same hash
+        // Same fields produce same content hash but different _ids
         let blob1 = IBlob::from_pairs(vec![
             ("z", Value::I64(1)),
             ("a", Value::I64(2)),
@@ -389,7 +431,8 @@ mod tests {
             ("a", Value::I64(2)),
             ("z", Value::I64(1)),
         ]);
-        assert_eq!(blob1.hash(), blob2.hash());
+        assert_eq!(blob1.hash(), blob2.hash(), "same content -> same hash");
+        assert_ne!(blob1.id(), blob2.id(), "different docs -> different ids");
     }
 
     #[test]
@@ -397,6 +440,33 @@ mod tests {
         let blob1 = IBlob::from_pairs(vec![("x", Value::I64(1))]);
         let blob2 = IBlob::from_pairs(vec![("x", Value::I64(2))]);
         assert_ne!(blob1.hash(), blob2.hash());
+    }
+
+    #[test]
+    fn test_explicit_id() {
+        let id = DocumentId::from_bytes([0x42; 16]);
+        let fields: BTreeMap<String, Value> = [("k".into(), Value::U64(1))].into();
+        let blob = IBlob::with_id(id, fields);
+        assert_eq!(*blob.id(), id);
+
+        // Roundtrip preserves the id
+        let encoded = blob.encode();
+        let decoded = IBlob::decode(&encoded).unwrap();
+        assert_eq!(*decoded.id(), id);
+    }
+
+    #[test]
+    fn test_version_roundtrip() {
+        let mut blob = sample_blob();
+        assert!(blob.version().is_nil(), "version starts nil");
+
+        let ver = DocumentId::new();
+        blob.set_version(ver);
+        assert_eq!(*blob.version(), ver);
+
+        let encoded = blob.encode();
+        let decoded = IBlob::decode(&encoded).unwrap();
+        assert_eq!(*decoded.version(), ver);
     }
 
     #[test]
@@ -425,7 +495,10 @@ mod tests {
             ),
             (
                 "refs",
-                Value::Array(vec![Value::Hash([0xAA; 32]), Value::Hash([0xBB; 32])]),
+                Value::Array(vec![
+                    Value::Ref(DocumentId::from_bytes([0xAA; 16])),
+                    Value::Ref(DocumentId::from_bytes([0xBB; 16])),
+                ]),
             ),
         ]);
 
