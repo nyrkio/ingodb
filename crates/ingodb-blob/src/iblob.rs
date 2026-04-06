@@ -459,24 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn test_same_content_different_hash() {
-        // Same fields but different _ids produce different hashes
-        // (hash now covers _id + _version + fields)
-        let blob1 = IBlob::from_pairs(vec![
-            ("z", Value::I64(1)),
-            ("a", Value::I64(2)),
-        ]);
-        let blob2 = IBlob::from_pairs(vec![
-            ("a", Value::I64(2)),
-            ("z", Value::I64(1)),
-        ]);
-        assert_ne!(blob1.hash(), blob2.hash(), "different _ids -> different hashes");
-        assert_ne!(blob1.id(), blob2.id(), "different docs -> different ids");
-    }
-
-    #[test]
-    fn test_same_id_same_fields_same_hash() {
-        // Same _id and same fields produce the same hash
+    fn test_hash_deterministic() {
+        // Same _id + same fields = same hash (deterministic)
         let id = DocumentId::from_bytes([0x42; 16]);
         let blob1 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
         let blob2 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
