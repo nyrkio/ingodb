@@ -36,7 +36,7 @@ const HEADER_SIZE: usize = 4 + 2 + 16 + 16 + 1 + 32 + 4;
 /// `_id` is the stable document identity (persists across updates).
 /// `_version` is server-assigned at write time (advances on each update).
 /// `is_deleted` marks tombstones — the document has been deleted.
-/// The content hash is computed over the canonical payload only (excludes `_id`, `_version`, `is_deleted`).
+/// The content hash covers `_id` + `_version` + `is_deleted` + fields for full integrity protection.
 #[derive(Debug, Clone)]
 pub struct IBlob {
     /// Stable document identity (UUIDv7)
@@ -84,16 +84,18 @@ impl IBlob {
     }
 
     /// Create a tombstone for the given document ID.
-    /// Empty fields, zero hash. Marks the document as deleted.
+    /// Empty fields, but hash covers id + version + is_deleted for integrity.
     pub fn tombstone(id: DocumentId) -> Self {
-        IBlob {
+        let mut blob = IBlob {
             id,
             version: DocumentId::nil(),
             is_deleted: true,
             hash: [0; 32],
             fields: BTreeMap::new(),
             encoded: None,
-        }
+        };
+        blob.recompute_hash();
+        blob
     }
 
     /// Create from a list of (key, value) tuples.
@@ -116,9 +118,11 @@ impl IBlob {
     }
 
     /// Set the version. Called by the LSM engine at write time.
+    /// Recomputes the hash since version is included in the hash.
     pub fn set_version(&mut self, v: DocumentId) {
         self.version = v;
         self.encoded = None; // invalidate cached encoding
+        self.recompute_hash();
     }
 
     /// Whether this is a tombstone (deleted document).
@@ -153,19 +157,22 @@ impl IBlob {
     }
 
     fn recompute_hash(&mut self) {
-        let payload = self.encode_payload();
-        self.hash = *blake3::hash(&payload).as_bytes();
+        self.hash = *blake3::hash(&self.encode_hashable()).as_bytes();
     }
 
-    /// Encode just the payload section (all values in key-sorted order).
-    fn encode_payload(&self) -> Vec<u8> {
-        let mut payload = Vec::new();
+    /// Encode the hashable content: _id + _version + is_deleted + fields.
+    /// This is what the BLAKE3 content hash covers — all identity and payload bytes.
+    fn encode_hashable(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(self.id.as_bytes());
+        buf.extend_from_slice(self.version.as_bytes());
+        buf.push(if self.is_deleted { 1 } else { 0 });
         for (key, value) in &self.fields {
-            payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            payload.extend_from_slice(key.as_bytes());
-            value.encode(&mut payload);
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            value.encode(&mut buf);
         }
-        payload
+        buf
     }
 
     /// Serialize this IBlob to its binary format.
@@ -341,15 +348,13 @@ impl IBlob {
             encoded: None,
         };
 
-        // Verify hash (skip for tombstones — they have zero hash and empty fields)
-        if !is_deleted {
-            let expected_hash = *blake3::hash(&blob.encode_payload()).as_bytes();
-            if expected_hash != stored_hash {
-                return Err(BlobError::HashMismatch {
-                    expected: hex(&expected_hash),
-                    actual: hex(&stored_hash),
-                });
-            }
+        // Verify hash — covers id + version + is_deleted + fields
+        let expected_hash = *blake3::hash(&blob.encode_hashable()).as_bytes();
+        if expected_hash != stored_hash {
+            return Err(BlobError::HashMismatch {
+                expected: hex(&expected_hash),
+                actual: hex(&stored_hash),
+            });
         }
 
         Ok(blob)
@@ -454,8 +459,9 @@ mod tests {
     }
 
     #[test]
-    fn test_content_addressable() {
-        // Same fields produce same content hash but different _ids
+    fn test_same_content_different_hash() {
+        // Same fields but different _ids produce different hashes
+        // (hash now covers _id + _version + fields)
         let blob1 = IBlob::from_pairs(vec![
             ("z", Value::I64(1)),
             ("a", Value::I64(2)),
@@ -464,8 +470,17 @@ mod tests {
             ("a", Value::I64(2)),
             ("z", Value::I64(1)),
         ]);
-        assert_eq!(blob1.hash(), blob2.hash(), "same content -> same hash");
+        assert_ne!(blob1.hash(), blob2.hash(), "different _ids -> different hashes");
         assert_ne!(blob1.id(), blob2.id(), "different docs -> different ids");
+    }
+
+    #[test]
+    fn test_same_id_same_fields_same_hash() {
+        // Same _id and same fields produce the same hash
+        let id = DocumentId::from_bytes([0x42; 16]);
+        let blob1 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
+        let blob2 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
+        assert_eq!(blob1.hash(), blob2.hash());
     }
 
     #[test]
@@ -508,10 +523,12 @@ mod tests {
         let mut tomb = IBlob::tombstone(id);
         assert!(tomb.is_deleted());
         assert_eq!(tomb.field_count(), 0);
-        assert_eq!(*tomb.hash(), [0u8; 32]);
+        assert_ne!(*tomb.hash(), [0u8; 32], "tombstone should have a real hash");
 
-        // Stamp a version like the engine would
+        // Stamp a version like the engine would — hash changes
+        let hash_before = *tomb.hash();
         tomb.set_version(DocumentId::new());
+        assert_ne!(*tomb.hash(), hash_before, "hash should change with version");
 
         let encoded = tomb.encode();
         let decoded = IBlob::decode(&encoded).unwrap();
@@ -519,6 +536,7 @@ mod tests {
         assert!(decoded.is_deleted());
         assert_eq!(decoded.field_count(), 0);
         assert_eq!(decoded.version(), tomb.version());
+        assert_eq!(decoded.hash(), tomb.hash());
     }
 
     #[test]

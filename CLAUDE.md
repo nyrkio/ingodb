@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --workspace          # Build all crates
-cargo test --workspace           # Run all 79 tests
+cargo test --workspace           # Run all 80 tests
 cargo test -p ingodb-blob        # Test just the blob format crate
 cargo test -p ingodb-wal         # Test just the WAL crate
 cargo test -p ingodb-memtable    # Test just the memtable crate
@@ -45,7 +45,7 @@ ingodb/                         Top-level API crate (re-exports everything)
 - `DocumentId` — Newtype around `[u8; 16]`, a UUIDv7. Stable document identity. Client or server can generate. Lexicographically sortable by creation time.
 - `IBlob` — The document. Has `_id` (DocumentId), `_version` (DocumentId, server-assigned at write time), `hash` (ContentHash), and `fields` (BTreeMap<String, Value>). Binary format v2: `[INGO magic:4][version:2][document_id:16][doc_version:16][content_hash:32][index_count:4][index_entries...][payload...]` (74-byte header).
 - `Value` — Tagged union: Null, Bool, I64, U64, F64, String, Bytes, Ref(DocumentId), Array, Document (nested)
-- `ContentHash` — `[u8; 32]`, BLAKE3 hash of canonical payload. Used for integrity/dedup, NOT as primary key.
+- `ContentHash` — `[u8; 32]`, BLAKE3 hash covering `_id` + `_version` + `is_deleted` + fields. Full integrity protection — catches corruption of any byte. NOT used as primary key.
 - `CompactionFilter` trait — Extension point for future adaptive morphing during compaction
 - `UcsCompaction` — Unified Compaction Strategy: level assignment by file size, overlap detection, configurable scaling parameter W (leveled/balanced/tiered)
 - `TombstoneFilter` — Purges tombstones during compaction when safe (output at last level)

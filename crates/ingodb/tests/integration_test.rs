@@ -72,11 +72,11 @@ fn test_document_lifecycle() {
 fn test_same_content_different_ids() {
     let (engine, _dir) = test_engine();
 
-    // Same content produces same content hash but different _ids
+    // Same content but different _ids are independent documents
     let blob1 = make_user("Duplicate", 10);
     let blob2 = make_user("Duplicate", 10);
-    assert_eq!(blob1.hash(), blob2.hash(), "same content -> same hash");
     assert_ne!(blob1.id(), blob2.id(), "different docs -> different _ids");
+    assert_ne!(blob1.hash(), blob2.hash(), "different _ids -> different hashes");
 
     let id1 = *blob1.id();
     let id2 = *blob2.id();
