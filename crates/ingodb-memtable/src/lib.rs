@@ -51,12 +51,12 @@ impl MemTable {
     }
 
     /// Insert a blob. Returns true if the memtable should be flushed.
-    pub fn insert(&self, blob: IBlob) -> bool {
+    pub fn insert(&self, mut blob: IBlob) -> bool {
         let encoded_size = blob.encode().len();
         let id = *blob.id();
 
         let mut entries = self.entries.write();
-        if let Some(old) = entries.insert(id, blob) {
+        if let Some(mut old) = entries.insert(id, blob) {
             // Replacing existing entry (upsert) — adjust size
             let old_size = old.encode().len();
             self.size_bytes.fetch_sub(old_size, Ordering::Relaxed);

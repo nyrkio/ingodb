@@ -1,5 +1,19 @@
 use crate::{BlobError, ContentHash, DocumentId, Value, FORMAT_VERSION, MAGIC};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Global counter for hash computations (for testing efficiency).
+static HASH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Get the current hash computation count.
+pub fn hash_count() -> u64 {
+    HASH_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// Reset the hash computation counter to zero.
+pub fn reset_hash_count() {
+    HASH_COUNT.store(0, AtomicOrdering::Relaxed);
+}
 
 /// Index entry in the I-Blob header: maps a key hash to its location in the payload.
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +51,7 @@ const HEADER_SIZE: usize = 4 + 2 + 16 + 16 + 1 + 32 + 4;
 /// `_version` is server-assigned at write time (advances on each update).
 /// `is_deleted` marks tombstones — the document has been deleted.
 /// The content hash covers `_id` + `_version` + `is_deleted` + fields for full integrity protection.
+/// It is computed once at serialization time (`encode()`) or verified at deserialization (`decode()`).
 #[derive(Debug, Clone)]
 pub struct IBlob {
     /// Stable document identity (UUIDv7)
@@ -45,57 +60,53 @@ pub struct IBlob {
     version: DocumentId,
     /// Whether this is a tombstone (deleted document)
     is_deleted: bool,
-    /// BLAKE3 hash of the canonical payload (for integrity/dedup)
+    /// BLAKE3 hash covering id + version + is_deleted + fields.
+    /// Zero until computed by encode() or decode().
     hash: ContentHash,
     /// Fields stored as sorted key-value pairs
     fields: BTreeMap<String, Value>,
-    /// Cached serialized form (lazily populated)
+    /// Cached serialized form
     encoded: Option<Vec<u8>>,
 }
 
 impl IBlob {
     /// Create a new IBlob from key-value pairs.
     /// Auto-generates a UUIDv7 `_id`. The `_version` is left nil (server sets it at write time).
+    /// Hash is computed later at encode() time.
     pub fn new(fields: BTreeMap<String, Value>) -> Self {
-        let mut blob = IBlob {
+        IBlob {
             id: DocumentId::new(),
             version: DocumentId::nil(),
             is_deleted: false,
             hash: [0; 32],
             fields,
             encoded: None,
-        };
-        blob.recompute_hash();
-        blob
+        }
     }
 
     /// Create with a caller-supplied `_id`. The `_version` is left nil.
     pub fn with_id(id: DocumentId, fields: BTreeMap<String, Value>) -> Self {
-        let mut blob = IBlob {
+        IBlob {
             id,
             version: DocumentId::nil(),
             is_deleted: false,
             hash: [0; 32],
             fields,
             encoded: None,
-        };
-        blob.recompute_hash();
-        blob
+        }
     }
 
     /// Create a tombstone for the given document ID.
-    /// Empty fields, but hash covers id + version + is_deleted for integrity.
+    /// Hash is computed at encode() time, covers id + version + is_deleted.
     pub fn tombstone(id: DocumentId) -> Self {
-        let mut blob = IBlob {
+        IBlob {
             id,
             version: DocumentId::nil(),
             is_deleted: true,
             hash: [0; 32],
             fields: BTreeMap::new(),
             encoded: None,
-        };
-        blob.recompute_hash();
-        blob
+        }
     }
 
     /// Create from a list of (key, value) tuples.
@@ -118,11 +129,10 @@ impl IBlob {
     }
 
     /// Set the version. Called by the LSM engine at write time.
-    /// Recomputes the hash since version is included in the hash.
     pub fn set_version(&mut self, v: DocumentId) {
         self.version = v;
-        self.encoded = None; // invalidate cached encoding
-        self.recompute_hash();
+        self.hash = [0; 32]; // invalidate — version is part of hash
+        self.encoded = None;
     }
 
     /// Whether this is a tombstone (deleted document).
@@ -130,7 +140,8 @@ impl IBlob {
         self.is_deleted
     }
 
-    /// Content hash of this document's payload (for integrity/dedup).
+    /// Content hash covering id + version + is_deleted + fields.
+    /// Valid after encode() or decode(). Zero before first encode().
     pub fn hash(&self) -> &ContentHash {
         &self.hash
     }
@@ -156,12 +167,13 @@ impl IBlob {
         u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
     }
 
-    fn recompute_hash(&mut self) {
+    /// Compute and store the BLAKE3 hash. Increments the global counter.
+    fn compute_hash(&mut self) {
+        HASH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
         self.hash = *blake3::hash(&self.encode_hashable()).as_bytes();
     }
 
     /// Encode the hashable content: _id + _version + is_deleted + fields.
-    /// This is what the BLAKE3 content hash covers — all identity and payload bytes.
     fn encode_hashable(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(self.id.as_bytes());
@@ -176,9 +188,15 @@ impl IBlob {
     }
 
     /// Serialize this IBlob to its binary format.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Computes the hash if not already computed.
+    pub fn encode(&mut self) -> Vec<u8> {
         if let Some(ref cached) = self.encoded {
             return cached.clone();
+        }
+
+        // Compute hash once before writing
+        if self.hash == [0; 32] {
+            self.compute_hash();
         }
 
         // Encode each field
@@ -235,10 +253,12 @@ impl IBlob {
         // Payload
         buf.extend_from_slice(&payload);
 
+        self.encoded = Some(buf.clone());
         buf
     }
 
     /// Decode an IBlob from its binary format.
+    /// Computes the hash to verify integrity.
     pub fn decode(buf: &[u8]) -> Result<Self, BlobError> {
         if buf.len() < HEADER_SIZE {
             return Err(BlobError::BufferTooShort {
@@ -339,20 +359,19 @@ impl IBlob {
             fields.insert(key, value);
         }
 
-        let blob = IBlob {
+        // Verify hash — compute once for integrity check
+        let mut blob = IBlob {
             id,
             version: doc_version,
             is_deleted,
-            hash: stored_hash,
+            hash: [0; 32],
             fields,
             encoded: None,
         };
-
-        // Verify hash — covers id + version + is_deleted + fields
-        let expected_hash = *blake3::hash(&blob.encode_hashable()).as_bytes();
-        if expected_hash != stored_hash {
+        blob.compute_hash();
+        if blob.hash != stored_hash {
             return Err(BlobError::HashMismatch {
-                expected: hex(&expected_hash),
+                expected: hex(&blob.hash),
                 actual: hex(&stored_hash),
             });
         }
@@ -448,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip() {
-        let blob = sample_blob();
+        let mut blob = sample_blob();
         let encoded = blob.encode();
         let decoded = IBlob::decode(&encoded).unwrap();
 
@@ -462,15 +481,19 @@ mod tests {
     fn test_hash_deterministic() {
         // Same _id + same fields = same hash (deterministic)
         let id = DocumentId::from_bytes([0x42; 16]);
-        let blob1 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
-        let blob2 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
+        let mut blob1 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
+        let mut blob2 = IBlob::with_id(id, [("x".into(), Value::I64(1))].into());
+        blob1.encode();
+        blob2.encode();
         assert_eq!(blob1.hash(), blob2.hash());
     }
 
     #[test]
     fn test_different_content_different_hash() {
-        let blob1 = IBlob::from_pairs(vec![("x", Value::I64(1))]);
-        let blob2 = IBlob::from_pairs(vec![("x", Value::I64(2))]);
+        let mut blob1 = IBlob::from_pairs(vec![("x", Value::I64(1))]);
+        let mut blob2 = IBlob::from_pairs(vec![("x", Value::I64(2))]);
+        blob1.encode();
+        blob2.encode();
         assert_ne!(blob1.hash(), blob2.hash());
     }
 
@@ -478,7 +501,7 @@ mod tests {
     fn test_explicit_id() {
         let id = DocumentId::from_bytes([0x42; 16]);
         let fields: BTreeMap<String, Value> = [("k".into(), Value::U64(1))].into();
-        let blob = IBlob::with_id(id, fields);
+        let mut blob = IBlob::with_id(id, fields);
         assert_eq!(*blob.id(), id);
 
         // Roundtrip preserves the id
@@ -507,14 +530,13 @@ mod tests {
         let mut tomb = IBlob::tombstone(id);
         assert!(tomb.is_deleted());
         assert_eq!(tomb.field_count(), 0);
-        assert_ne!(*tomb.hash(), [0u8; 32], "tombstone should have a real hash");
 
-        // Stamp a version like the engine would — hash changes
-        let hash_before = *tomb.hash();
+        // Stamp a version like the engine would
         tomb.set_version(DocumentId::new());
-        assert_ne!(*tomb.hash(), hash_before, "hash should change with version");
 
         let encoded = tomb.encode();
+        assert_ne!(*tomb.hash(), [0u8; 32], "tombstone should have a real hash after encode");
+
         let decoded = IBlob::decode(&encoded).unwrap();
         assert_eq!(decoded.id(), &id);
         assert!(decoded.is_deleted());
@@ -525,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_extract_field() {
-        let blob = sample_blob();
+        let mut blob = sample_blob();
         let encoded = blob.encode();
 
         let name = IBlob::extract_field(&encoded, "name").unwrap();
@@ -539,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_nested_document_blob() {
-        let blob = IBlob::from_pairs(vec![
+        let mut blob = IBlob::from_pairs(vec![
             (
                 "user",
                 Value::Document(vec![
@@ -564,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_empty_blob() {
-        let blob = IBlob::new(BTreeMap::new());
+        let mut blob = IBlob::new(BTreeMap::new());
         let encoded = blob.encode();
         let decoded = IBlob::decode(&encoded).unwrap();
         assert_eq!(decoded.field_count(), 0);
@@ -576,5 +598,39 @@ mod tests {
         let mut encoded = sample_blob().encode();
         encoded[0] = b'X';
         assert!(matches!(IBlob::decode(&encoded), Err(BlobError::InvalidMagic)));
+    }
+
+    #[test]
+    fn test_hash_computed_once_per_encode() {
+        let before = hash_count();
+
+        let mut blob = IBlob::from_pairs(vec![("x", Value::U64(1))]);
+        blob.set_version(DocumentId::new());
+        assert_eq!(hash_count() - before, 0, "no hash before encode");
+
+        blob.encode();
+        assert_eq!(hash_count() - before, 1, "hash computed once by encode");
+
+        blob.encode(); // cached — should not recompute
+        assert_eq!(hash_count() - before, 1, "second encode uses cache");
+    }
+
+    #[test]
+    fn test_hash_computed_once_for_put_path() {
+        // Simulates the engine put() path: construct, set_version, encode (for WAL)
+        let before = hash_count();
+
+        let mut blob = IBlob::from_pairs(vec![
+            ("name", Value::String("test".into())),
+            ("value", Value::U64(42)),
+        ]);
+        // Engine stamps version
+        blob.set_version(DocumentId::new());
+        // WAL calls encode
+        blob.encode();
+        // MemTable may call encode for size estimation
+        blob.encode();
+
+        assert_eq!(hash_count() - before, 1, "hash computed exactly once for put path");
     }
 }

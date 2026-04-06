@@ -195,7 +195,7 @@ fn test_flush_and_recover_from_sstable() {
 
 #[test]
 fn test_zero_copy_field_extraction() {
-    let blob = make_user("ZeroCopy", 77);
+    let mut blob = make_user("ZeroCopy", 77);
     let encoded = blob.encode();
 
     let name = IBlob::extract_field(&encoded, "name").unwrap();

@@ -3,7 +3,7 @@ mod iblob;
 mod error;
 
 pub use value::Value;
-pub use iblob::IBlob;
+pub use iblob::{hash_count, reset_hash_count, IBlob};
 pub use error::BlobError;
 
 /// 32-byte content hash (BLAKE3). Used for integrity verification and deduplication.

@@ -44,9 +44,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let entries = make_entries(100);
+        let mut entries = make_entries(100);
 
-        SSTableWriter::new().write(&path, &entries).unwrap();
+        SSTableWriter::new().write(&path, &mut entries).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         // Verify all entries can be looked up
@@ -66,8 +66,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("iter.sst");
 
-        let entries = make_entries(50);
-        SSTableWriter::new().write(&path, &entries).unwrap();
+        let mut entries = make_entries(50);
+        SSTableWriter::new().write(&path, &mut entries).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         let all = reader.iter().unwrap();
@@ -84,10 +84,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small_blocks.sst");
 
-        let entries = make_entries(20);
+        let mut entries = make_entries(20);
 
         // Very small blocks to force multiple blocks
-        SSTableWriter::with_block_size(128).write(&path, &entries).unwrap();
+        SSTableWriter::with_block_size(128).write(&path, &mut entries).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         assert!(reader.block_count() > 1, "expected multiple blocks");
@@ -103,8 +103,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("single.sst");
 
-        let entries = make_entries(1);
-        SSTableWriter::new().write(&path, &entries).unwrap();
+        let mut entries = make_entries(1);
+        SSTableWriter::new().write(&path, &mut entries).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         let found = reader.get(&entries[0].0).unwrap().unwrap();
@@ -116,8 +116,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("minmax.sst");
 
-        let entries = make_entries(50);
-        SSTableWriter::new().write(&path, &entries).unwrap();
+        let mut entries = make_entries(50);
+        SSTableWriter::new().write(&path, &mut entries).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         // Entries are sorted by ID, so first is min and last is max
@@ -131,8 +131,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("minmax1.sst");
 
-        let entries = make_entries(1);
-        SSTableWriter::new().write(&path, &entries).unwrap();
+        let mut entries = make_entries(1);
+        SSTableWriter::new().write(&path, &mut entries).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         assert_eq!(reader.min_id(), reader.max_id());

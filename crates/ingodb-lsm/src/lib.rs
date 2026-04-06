@@ -148,7 +148,7 @@ impl LsmEngine {
         // Write to WAL first for durability (version is now embedded in the blob)
         {
             let mut wal = self.wal.lock();
-            wal.append(&blob)?;
+            wal.append(&mut blob)?;
         }
 
         // Insert into memtable (keyed by _id; upsert replaces old version)
@@ -169,7 +169,7 @@ impl LsmEngine {
 
         {
             let mut wal = self.wal.lock();
-            wal.append(&tombstone)?;
+            wal.append(&mut tombstone)?;
         }
 
         let should_flush = self.memtable.insert(tombstone);
@@ -213,7 +213,7 @@ impl LsmEngine {
 
     /// Flush the current memtable to a new SSTable.
     pub fn flush_memtable(&self) -> Result<(), LsmError> {
-        let entries = self.memtable.drain();
+        let mut entries = self.memtable.drain();
         if entries.is_empty() {
             return Ok(());
         }
@@ -221,7 +221,7 @@ impl LsmEngine {
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let sst_path = self.config.data_dir.join(format!("{sst_id:012}.sst"));
 
-        SSTableWriter::with_block_size(self.config.block_size).write(&sst_path, &entries)?;
+        SSTableWriter::with_block_size(self.config.block_size).write(&sst_path, &mut entries)?;
 
         let reader = SSTableReader::open(&sst_path)?;
 
@@ -323,7 +323,7 @@ impl LsmEngine {
         // Write merged SSTable
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let output_path = self.config.data_dir.join(format!("{sst_id:012}.sst"));
-        SSTableWriter::with_block_size(self.config.block_size).write(&output_path, &merged)?;
+        SSTableWriter::with_block_size(self.config.block_size).write(&output_path, &mut merged)?;
         let new_reader = SSTableReader::open(&output_path)?;
 
         // Swap old SSTables for new one

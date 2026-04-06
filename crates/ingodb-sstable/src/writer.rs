@@ -61,7 +61,7 @@ impl SSTableWriter {
     pub fn write(
         &self,
         path: impl AsRef<Path>,
-        entries: &[(DocumentId, IBlob)],
+        entries: &mut [(DocumentId, IBlob)],
     ) -> Result<(), SSTableError> {
         if entries.is_empty() {
             return Err(SSTableError::Empty);
@@ -80,7 +80,7 @@ impl SSTableWriter {
         // Reserve space for entry count at start of block
         current_block.extend_from_slice(&0u32.to_le_bytes());
 
-        for (id, blob) in entries {
+        for (id, blob) in entries.iter_mut() {
             bloom.insert(id.as_bytes());
 
             let blob_bytes = blob.encode();

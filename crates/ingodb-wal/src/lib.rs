@@ -56,7 +56,7 @@ impl Wal {
     }
 
     /// Append a blob to the WAL. Returns the byte offset of the record.
-    pub fn append(&mut self, blob: &IBlob) -> Result<u64, WalError> {
+    pub fn append(&mut self, blob: &mut IBlob) -> Result<u64, WalError> {
         let offset = self.size;
         let blob_bytes = blob.encode();
         let length = blob_bytes.len() as u32;
@@ -166,13 +166,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.wal");
 
-        let blob1 = make_blob("first");
-        let blob2 = make_blob("second");
+        let mut blob1 = make_blob("first");
+        let mut blob2 = make_blob("second");
 
         {
             let mut wal = Wal::open(&wal_path).unwrap();
-            wal.append(&blob1).unwrap();
-            wal.append(&blob2).unwrap();
+            wal.append(&mut blob1).unwrap();
+            wal.append(&mut blob2).unwrap();
             wal.sync().unwrap();
         }
 
@@ -197,11 +197,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("trunc.wal");
 
-        let blob1 = make_blob("good");
+        let mut blob1 = make_blob("good");
 
         {
             let mut wal = Wal::open(&wal_path).unwrap();
-            wal.append(&blob1).unwrap();
+            wal.append(&mut blob1).unwrap();
             wal.sync().unwrap();
         }
 
@@ -221,13 +221,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("corrupt.wal");
 
-        let blob1 = make_blob("good");
-        let blob2 = make_blob("bad");
+        let mut blob1 = make_blob("good");
+        let mut blob2 = make_blob("bad");
 
         {
             let mut wal = Wal::open(&wal_path).unwrap();
-            wal.append(&blob1).unwrap();
-            wal.append(&blob2).unwrap();
+            wal.append(&mut blob1).unwrap();
+            wal.append(&mut blob2).unwrap();
             wal.sync().unwrap();
         }
 
@@ -257,7 +257,7 @@ mod tests {
 
         {
             let mut wal = Wal::open(&wal_path).unwrap();
-            wal.append(&tombstone).unwrap();
+            wal.append(&mut tombstone).unwrap();
             wal.sync().unwrap();
         }
 
