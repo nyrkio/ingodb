@@ -67,13 +67,40 @@ from per-document get() back to primary. Optimization TODO.
 
 ---
 
-## 2026-04-07 — UCS Scaling Parameter Comparison
+## 2026-04-07 — 1M Products, UCS Scaling Parameter Comparison
 
-100K products, 16 MB memtable. At this data size, all W values produce
-3 SSTables — the dataset is too small relative to the memtable to
-trigger enough flushes for W to differentiate. Need larger datasets
-or smaller memtables to see W's effect on SSTable count and read/write
-amplification tradeoffs.
+1M products (~382 bytes each, ~382 MB total), 16 MB memtable.
+
+| Metric | W=-4 (leveled) | W=0 (balanced) | W=4 (tiered) |
+|--------|---------------|----------------|--------------|
+| Ingest | 98K docs/sec | 96K docs/sec | 97K docs/sec |
+| Ingest time | 10.2s | 10.4s | 10.3s |
+| SSTables | 23 | 23 | 23 |
+| Point lookup p50 | 123 us | 124 us | 122 us |
+| Point lookup ops/sec | 8.1K | 8.0K | 8.2K |
+| Scan (cold, 100K results) | 2.66s | 2.68s | 2.67s |
+| Scan (warm, index) | 13.1s | 13.3s | 13.0s |
+| 8-thread reads | 51K ops/sec | 51K ops/sec | 52K ops/sec |
+| Snapshot isolation | 100/100 | 100/100 | 100/100 |
+
+**Finding**: All W values produce identical SSTable counts (23) because
+sequential UUIDv7 inserts create non-overlapping SSTables. The UCS
+overlap detection correctly avoids unnecessary merges, but this means
+W has no effect on this workload. Need a workload with key-range overlap
+(updates, random keys) to exercise W's read/write amplification tradeoff.
+
+**Performance note**: Warm index scan (13s) is 5x slower than cold scan
+(2.7s) because the secondary index does per-document get() back to
+primary (100K individual lookups). This is the top optimization target.
+
+**Write slowdown**: Ingest rate drops from 190K to 36K docs/sec over
+the 1M run as more SSTables accumulate and flushes become more expensive.
+
+---
+
+## 2026-04-07 — 100K Products, UCS Scaling Parameter Comparison
+
+100K products, 16 MB memtable. Dataset too small to differentiate W.
 
 | Metric | W=-4 (leveled) | W=0 (balanced) | W=4 (tiered) |
 |--------|---------------|----------------|--------------|
@@ -84,7 +111,7 @@ amplification tradeoffs.
 | Scan (cold) | 198ms | 196ms | 192ms |
 | 8-thread reads | 242K ops/sec | 260K ops/sec | 252K ops/sec |
 
-All values within noise. Larger benchmark needed to stress UCS differences.
+All values within noise.
 
 ---
 
