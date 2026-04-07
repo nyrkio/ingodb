@@ -171,15 +171,9 @@ impl Database {
     }
 
     fn collection_config(base: &LsmConfig, data_dir: &Path, name: &str) -> LsmConfig {
-        LsmConfig {
-            data_dir: data_dir.join(name),
-            memtable_size: base.memtable_size,
-            block_size: base.block_size,
-            compaction_threshold: base.compaction_threshold,
-            scaling_parameter: base.scaling_parameter,
-            sort_spill_threshold: base.sort_spill_threshold,
-            compaction_threads: base.compaction_threads,
-        }
+        let mut c = base.clone();
+        c.data_dir = data_dir.join(name);
+        c
     }
 }
 
@@ -200,6 +194,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let db = Database::open(config).unwrap();
         (db, dir)
@@ -255,6 +250,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
 
         let blob = IBlob::from_pairs(vec![
@@ -307,6 +303,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
 
         let blob = IBlob::from_pairs(vec![("x", Value::U64(42))]);
@@ -340,6 +337,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
 
         {
@@ -412,6 +410,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
 
         let update_id;
@@ -482,6 +481,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5, // low: creates index on first scan
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
 
         fn det_id(i: u64) -> DocumentId {

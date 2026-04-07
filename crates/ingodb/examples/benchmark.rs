@@ -36,6 +36,11 @@ fn main() {
         scaling_parameter: w,
         sort_spill_threshold: 1000,
         compaction_threads: 4,
+        adaptive_w: w == 0, // enable adaptive W when starting from balanced
+        adaptive_w_cooldown_secs: 1, // very short cooldown for benchmarks
+        adaptive_w_max_step: 2,
+        adaptive_w_min: -8,
+        adaptive_w_max: 8,
     };
 
     let mode = match w.cmp(&0) {
@@ -67,6 +72,8 @@ fn main() {
     engine.wait_for_compaction().unwrap();
     println!("  Compaction settled in {:?} → {} SSTables", t.elapsed(), engine.sstable_count());
 
+    println!("  Effective W: {}, target W: {}", engine.effective_w(), engine.target_w());
+
     // Phase 2: Point lookups
     phase_point_lookups(&engine, &ids);
 
@@ -86,6 +93,7 @@ fn main() {
     println!("\n=== Stats ===");
     println!("SSTables on disk: {}", engine.sstable_count());
     println!("Secondary indexes: {}", engine.secondary_index_count());
+    println!("Effective W: {}, target W: {} (started at {})", engine.effective_w(), engine.target_w(), w);
 
     let cs = engine.compaction_stats();
     let runs = cs.runs.load(std::sync::atomic::Ordering::Relaxed);

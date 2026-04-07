@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 
 pub use compaction::{
@@ -58,6 +59,16 @@ pub struct LsmConfig {
     pub sort_spill_threshold: usize,
     /// Number of background compaction threads (default 4)
     pub compaction_threads: usize,
+    /// Enable adaptive W (auto-tune scaling parameter from read/write ratio)
+    pub adaptive_w: bool,
+    /// Minimum seconds between W adjustments (default 900 = 15 minutes)
+    pub adaptive_w_cooldown_secs: u64,
+    /// Maximum W change per adjustment (default 2)
+    pub adaptive_w_max_step: i32,
+    /// Minimum W value (default -8)
+    pub adaptive_w_min: i32,
+    /// Maximum W value (default 8)
+    pub adaptive_w_max: i32,
 }
 
 impl Default for LsmConfig {
@@ -70,6 +81,11 @@ impl Default for LsmConfig {
             scaling_parameter: 0,
             sort_spill_threshold: secondary::SPILL_THRESHOLD,
             compaction_threads: 4,
+            adaptive_w: false,
+            adaptive_w_cooldown_secs: 900, // 15 minutes
+            adaptive_w_max_step: 2,
+            adaptive_w_min: -8,
+            adaptive_w_max: 8,
         }
     }
 }
@@ -148,6 +164,16 @@ pub struct LsmEngine {
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Compaction statistics
     compaction_stats: CompactionStats,
+    /// Current effective W (may differ from config if adaptive_w is on)
+    effective_w: std::sync::atomic::AtomicI32,
+    /// Target W without step limiting (what W would be if we could jump instantly)
+    target_w: std::sync::atomic::AtomicI32,
+    /// Read operation counter (for adaptive W)
+    read_count: AtomicU64,
+    /// Write operation counter (for adaptive W)
+    write_count: AtomicU64,
+    /// Last time W was adjusted
+    last_w_adjustment: Mutex<Instant>,
 }
 
 /// A consistent point-in-time view of the database.
@@ -257,7 +283,8 @@ impl LsmEngine {
             }
         }
 
-        let ucs = UcsCompaction::new(config.scaling_parameter, config.memtable_size as u64);
+        let initial_w = config.scaling_parameter;
+        let ucs = UcsCompaction::new(initial_w, config.memtable_size as u64);
         sort_sstables_by_level(&mut sstables, &ucs);
 
         Ok(LsmEngine {
@@ -280,12 +307,18 @@ impl LsmEngine {
             }),
             compaction_thread: Mutex::new(None),
             compaction_stats: CompactionStats::new(),
+            effective_w: std::sync::atomic::AtomicI32::new(initial_w),
+            target_w: std::sync::atomic::AtomicI32::new(initial_w),
+            read_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+            last_w_adjustment: Mutex::new(Instant::now()),
         })
     }
 
     /// Insert a document into the engine.
     /// Stamps a server-assigned `_version` before writing.
     pub fn put(&self, mut blob: IBlob) -> Result<(), LsmError> {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
         // Server stamps the version — this is the single point of version assignment
         blob.set_version(DocumentId::new());
 
@@ -316,6 +349,7 @@ impl LsmEngine {
     /// Delete a document by writing a tombstone.
     /// Stamps a server-assigned `_version` on the tombstone.
     pub fn delete(&self, id: &DocumentId) -> Result<(), LsmError> {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
         let mut tombstone = IBlob::tombstone(*id);
         tombstone.set_version(DocumentId::new());
 
@@ -350,6 +384,7 @@ impl LsmEngine {
     /// Look up a document at a specific snapshot version.
     /// Returns the highest version <= snapshot for the given _id.
     fn get_at(&self, id: &DocumentId, snapshot: &DocumentId) -> Result<Option<IBlob>, LsmError> {
+        self.read_count.fetch_add(1, Ordering::Relaxed);
         let mut timer = QueryTimer::start(QueryPattern {
             query_type: "get".into(),
             filter_fields: vec![],
@@ -453,6 +488,7 @@ impl LsmEngine {
 
     /// Run UCS compaction if needed.
     fn maybe_compact(&self) -> Result<(), LsmError> {
+        self.maybe_adjust_w();
         let ucs = self.ucs();
         let sstables = self.sstables.read();
 
@@ -555,7 +591,71 @@ impl LsmEngine {
     }
 
     fn ucs(&self) -> UcsCompaction {
-        UcsCompaction::new(self.config.scaling_parameter, self.config.memtable_size as u64)
+        let w = self.effective_w.load(std::sync::atomic::Ordering::Relaxed);
+        UcsCompaction::new(w, self.config.memtable_size as u64)
+    }
+
+    /// Current effective W parameter (may differ from config if adaptive).
+    pub fn effective_w(&self) -> i32 {
+        self.effective_w.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Target W without step limiting (what the workload ratio suggests).
+    pub fn target_w(&self) -> i32 {
+        self.target_w.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Adjust W based on observed read/write ratio.
+    /// Called periodically by the compaction coordinator.
+    fn maybe_adjust_w(&self) {
+        if !self.config.adaptive_w {
+            return;
+        }
+
+        let cooldown = std::time::Duration::from_secs(self.config.adaptive_w_cooldown_secs);
+        let mut last = self.last_w_adjustment.lock();
+        if last.elapsed() < cooldown {
+            return;
+        }
+
+        let reads = self.read_count.swap(0, Ordering::Relaxed);
+        let writes = self.write_count.swap(0, Ordering::Relaxed);
+        let total = reads + writes;
+
+        if total < 10 {
+            return; // not enough data to decide
+        }
+
+        // Read ratio: 0.0 = all writes, 1.0 = all reads
+        let read_ratio = reads as f64 / total as f64;
+
+        // Target W: read-heavy → negative (leveled), write-heavy → positive (tiered)
+        // Linear mapping: ratio 0.0 → max_w, ratio 1.0 → min_w
+        let target_w = (self.config.adaptive_w_max as f64
+            - (self.config.adaptive_w_max - self.config.adaptive_w_min) as f64 * read_ratio)
+            as i32;
+
+        self.target_w.store(target_w, std::sync::atomic::Ordering::Relaxed);
+
+        let current_w = self.effective_w.load(std::sync::atomic::Ordering::Relaxed);
+        let step = self.config.adaptive_w_max_step;
+
+        // Clamp change to ±step
+        let new_w = if target_w > current_w {
+            (current_w + step).min(target_w).min(self.config.adaptive_w_max)
+        } else if target_w < current_w {
+            (current_w - step).max(target_w).max(self.config.adaptive_w_min)
+        } else {
+            current_w
+        };
+
+        if new_w != current_w {
+            self.effective_w.store(new_w, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[ingodb] adaptive W: {} → {} (read_ratio={:.2}, target={}, step-limited)",
+                current_w, new_w, read_ratio, target_w);
+        }
+
+        *last = Instant::now();
     }
 
     /// Run compaction on the given SSTable files, optionally applying a filter.
@@ -710,6 +810,9 @@ impl LsmEngine {
                     }
 
                     signal.running.store(true, Ordering::SeqCst);
+
+                    // Adaptive W: adjust based on recent read/write ratio
+                    engine.maybe_adjust_w();
 
                     // Pick all eligible compaction jobs
                     let ucs = engine.ucs();
@@ -1132,6 +1235,7 @@ impl LsmEngine {
         limit: Option<usize>,
         snapshot: &DocumentId,
     ) -> Result<Vec<IBlob>, LsmError> {
+        self.read_count.fetch_add(1, Ordering::Relaxed);
         let mut timer = QueryTimer::start(QueryPattern {
             query_type: "scan".into(),
             filter_fields: filter.map(extract_filter_fields).unwrap_or_default(),
@@ -1506,6 +1610,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
         (engine, dir)
@@ -1564,6 +1669,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
 
         let blob = make_blob(42);
@@ -1690,6 +1796,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
         let id = DocumentId::new();
@@ -2077,6 +2184,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2115,6 +2223,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2142,6 +2251,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2181,6 +2291,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2240,6 +2351,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2377,6 +2489,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2460,6 +2573,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2530,6 +2644,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 1000,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2565,6 +2680,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2619,6 +2735,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2671,6 +2788,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
 
         let target_id = deterministic_id(0);
@@ -2738,6 +2856,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2783,6 +2902,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
         };
         let engine = LsmEngine::open(config).unwrap();
 
