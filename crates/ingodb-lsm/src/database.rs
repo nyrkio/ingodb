@@ -462,4 +462,104 @@ mod tests {
             assert!(vals.contains(&99), "WAL-recovered doc should be in index after restart");
         }
     }
+
+    #[test]
+    fn test_index_entry_survives_flush_and_restart() {
+        // BUG TEST: After restart, a sorted scan through a secondary index
+        // must find docs that were updated+flushed before the crash.
+        // The index on disk must contain entries for the flushed data.
+        //
+        // To truly test the index path (not full-scan fallback), we set
+        // sort_spill_threshold very high so the post-restart scan doesn't
+        // create a NEW index from a full scan. This forces it to use the
+        // existing index loaded from disk.
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            sort_spill_threshold: 5, // low: creates index on first scan
+            compaction_threads: 1,
+        };
+
+        fn det_id(i: u64) -> DocumentId {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&i.to_be_bytes());
+            let hash = i.wrapping_mul(0x517cc1b727220a95);
+            bytes[8..16].copy_from_slice(&hash.to_be_bytes());
+            DocumentId::from_bytes(bytes)
+        }
+
+        let target_id = det_id(0);
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // Insert 10 docs, flush
+            db.with_collection("products", |engine| {
+                for i in 0..10u64 {
+                    engine.put(IBlob::with_id(det_id(i), [
+                        ("price".into(), Value::F64((i % 100) as f64 + 0.99)),
+                        ("name".into(), Value::String(format!("Product {i}"))),
+                    ].into()))?;
+                }
+                engine.flush_memtable()?;
+                Ok(())
+            }).unwrap();
+
+            // Trigger index creation via sorted scan
+            let sort = [SortField { field: "price".into(), direction: SortDirection::Ascending }];
+            db.with_collection("products", |engine| {
+                engine.scan(None, Some(&sort), None, None)?;
+                Ok(())
+            }).unwrap();
+
+            // Update doc 0: price 0.99 → 999.99
+            db.with_collection("products", |engine| {
+                engine.put(IBlob::with_id(target_id, [
+                    ("price".into(), Value::F64(999.99)),
+                    ("name".into(), Value::String("Expensive".into())),
+                ].into()))?;
+                // Flush — must write secondary index entries atomically
+                engine.flush_memtable()?;
+                Ok(())
+            }).unwrap();
+        }
+
+        // Restart — but with HIGH spill threshold so the scan doesn't create
+        // a new index from full scan results. Forces use of the existing index.
+        let config_high_spill = LsmConfig {
+            sort_spill_threshold: 1_000_000, // won't spill
+            ..config
+        };
+
+        {
+            let db = Database::open(config_high_spill).unwrap();
+
+            // Verify index exists after restart
+            let idx_count = db.with_collection("products", |engine| {
+                Ok(engine.secondary_index_count())
+            }).unwrap();
+            assert!(idx_count >= 1, "index should exist after restart");
+
+            // Sorted scan — should use the existing index from disk
+            let sort = [SortField { field: "price".into(), direction: SortDirection::Ascending }];
+            let results = db.with_collection("products", |engine| {
+                engine.scan(None, Some(&sort), None, None)
+            }).unwrap();
+
+            // ALL 10 docs should be present
+            assert_eq!(results.len(), 10,
+                "all 10 docs should be in sorted scan (got {})", results.len());
+
+            // The updated doc must be found with the new price
+            let target = results.iter().find(|r| *r.id() == target_id);
+            assert!(target.is_some(),
+                "updated doc must appear in sorted scan via index after restart");
+            assert_eq!(target.unwrap().get("price"), Some(&Value::F64(999.99)),
+                "updated doc should have new price after restart");
+        }
+    }
 }
