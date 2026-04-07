@@ -5,3 +5,4 @@ Cargo.lock
 *.sst
 *.wal
 ingodb_data/
+/data/

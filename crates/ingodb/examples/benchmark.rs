@@ -10,6 +10,7 @@
 //! 5. Compaction performance
 
 use ingodb::{DocumentId, Filter, IBlob, LsmConfig, LsmEngine, Query, SortDirection, SortField, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,9 +28,15 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let dir = tempfile::tempdir().unwrap();
+    // Use ./data/ for real disk I/O (not tmpfs)
+    let data_dir = PathBuf::from("data");
+    if data_dir.exists() {
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+    std::fs::create_dir_all(&data_dir).unwrap();
+
     let config = LsmConfig {
-        data_dir: dir.path().to_path_buf(),
+        data_dir: data_dir.clone(),
         memtable_size: 16 * 1024 * 1024, // 16 MB
         block_size: 4096,
         compaction_threshold: 4,
