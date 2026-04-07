@@ -343,20 +343,28 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Compact secondary indexes: merge buffer or full rebuild based on stale ratio.
+    /// Compact secondary indexes: drop unused, merge or rebuild remaining.
     fn maybe_compact_indexes(&self) -> Result<(), LsmError> {
+        let mut indexes = self.secondary_indexes.lock();
+
+        // Drop unused indexes
+        indexes.retain(|idx| {
+            if idx.should_drop() {
+                std::fs::remove_file(&idx.path).ok();
+                false
+            } else {
+                true
+            }
+        });
+
+        // Compact remaining
         let sstables = self.sstables.lock();
         let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
-        // Estimate primary doc count from SSTable entry counts + memtable
         let primary_doc_count = self.memtable.len() as u64
             + sst_refs.iter()
                 .map(|s| s.iter().map(|e| e.len() as u64).unwrap_or(0))
                 .sum::<u64>();
-        drop(sstables);
 
-        let mut indexes = self.secondary_indexes.lock();
-        let sstables = self.sstables.lock();
-        let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
         for index in indexes.iter_mut() {
             let _ = index.compact(&sst_refs, primary_doc_count, self.config.block_size);
         }
