@@ -6,6 +6,29 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-04-08 — 100K Products with Random Updates, UCS W Comparison
+
+100K inserts + 50K random updates. Shows UCS tradeoff with compaction settle time.
+
+| W | Mode | Settle time | Final SSTables | Compact runs | WA | Point lookup p50 | Lookup ops/sec |
+|---|------|------------|---------------|-------------|-----|-----------------|---------------|
+| 9 | Tiered (t=11) | **450ms** | **5** | 0 | 0x | 43.9 us | 23K |
+| 4 | Tiered (t=6) | **455ms** | **5** | 0 | 0x | 44.4 us | 23K |
+| 0 | Balanced (t=2) | **1.72s** | **1** | 2 | 0.82x | 12.9 us | 69K |
+| -4 | Leveled (t=2) | **1.74s** | **1** | 2 | 0.82x | 12.8 us | 68K |
+| -9 | Leveled (t=2) | **1.67s** | **1** | 2 | 0.82x | 12.2 us | 72K |
+
+Key findings:
+- **Tiered (W=4,9)**: 0 compaction runs, settles in ~450ms, but 5 SSTables remain.
+  23K lookup ops/sec (slow — must search 5 SSTables).
+- **Balanced/Leveled (W=0,-4,-9)**: 2 compaction runs, settles in ~1.7s, but only
+  1 SSTable. 69-72K lookup ops/sec (fast — single SSTable).
+- The tradeoff: tiered settles 4x faster but reads 3x slower.
+- Update throughput: ~90K updates/sec for W=0 (compaction running concurrently),
+  ~67K for W=9 (no compaction, pure writes with more index overhead).
+
+---
+
 ## 2026-04-07 — Commit 023999a
 
 Background compaction, RwLock on SSTable list, MVCC snapshot reads.

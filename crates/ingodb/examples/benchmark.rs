@@ -57,13 +57,15 @@ fn main() {
 
     // Phase 1: Bulk ingest
     let ids = phase_bulk_ingest(&engine);
+    let t = Instant::now();
     engine.wait_for_compaction().unwrap();
-    println!("  After compaction settled: {} SSTables", engine.sstable_count());
+    println!("  Compaction settled in {:?} → {} SSTables", t.elapsed(), engine.sstable_count());
 
     // Phase 1b: Random updates (creates overlapping key ranges for compaction)
     phase_random_updates(&engine, &ids);
+    let t = Instant::now();
     engine.wait_for_compaction().unwrap();
-    println!("  After updates + compaction: {} SSTables", engine.sstable_count());
+    println!("  Compaction settled in {:?} → {} SSTables", t.elapsed(), engine.sstable_count());
 
     // Phase 2: Point lookups
     phase_point_lookups(&engine, &ids);
