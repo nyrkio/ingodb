@@ -133,6 +133,119 @@ impl SecondaryIndex {
         self.fields == sort_fields
     }
 
+    /// Total entry count (on-disk SSTable entries + in-memory buffer).
+    pub fn entry_count(&self) -> u64 {
+        let on_disk = self.reader.iter().map(|e| e.len() as u64).unwrap_or(0);
+        let buffer = self.buffer.lock().len() as u64;
+        on_disk + buffer
+    }
+
+    /// Compact the secondary index.
+    ///
+    /// Chooses between simple merge (flush buffer into a new SSTable) or full
+    /// rebuild (re-read primary SSTables) based on the stale entry ratio.
+    ///
+    /// Full rebuild when: `index_entries > primary_docs * ln(primary_docs)`
+    /// This is the crossover where sort(N) becomes cheaper than merge(M).
+    pub fn compact(
+        &mut self,
+        primary_sstables: &[&SSTableReader],
+        primary_doc_count: u64,
+        block_size: usize,
+    ) -> Result<(), LsmError> {
+        let index_entries = self.entry_count();
+
+        if should_full_rebuild(index_entries, primary_doc_count) {
+            self.full_rebuild(primary_sstables, block_size)
+        } else {
+            self.merge_buffer(block_size)
+        }
+    }
+
+    /// Full rebuild: re-read all primary SSTables, project, sort, write clean index.
+    fn full_rebuild(
+        &mut self,
+        primary_sstables: &[&SSTableReader],
+        block_size: usize,
+    ) -> Result<(), LsmError> {
+        let mut all: Vec<IBlob> = Vec::new();
+        for sst in primary_sstables {
+            all.extend(sst.iter()?.into_iter().map(|(_, blob)| blob));
+        }
+
+        all.sort_by(|a, b| a.id().cmp(b.id()).then_with(|| b.version().cmp(a.version())));
+        all.dedup_by(|a, b| a.id() == b.id());
+
+        let mut projected: Vec<IBlob> = all
+            .into_iter()
+            .filter(|blob| !blob.is_deleted())
+            .map(|blob| blob.project(&self.fields))
+            .collect();
+
+        if projected.is_empty() {
+            return Ok(());
+        }
+
+        let extractor = FieldKeyExtractor::new(self.fields.clone());
+        // Write to a temp path, then swap
+        let tmp_path = self.path.with_extension("sst.tmp");
+        SSTableWriter::with_block_size(block_size)
+            .write(&tmp_path, &mut projected, &extractor)?;
+
+        std::fs::rename(&tmp_path, &self.path)?;
+        self.reader = SSTableReader::open(&self.path)?;
+        self.buffer.lock().clear();
+        Ok(())
+    }
+
+    /// Simple merge: flush buffer entries into the existing index SSTable.
+    fn merge_buffer(&mut self, block_size: usize) -> Result<(), LsmError> {
+        let buffer = std::mem::take(&mut *self.buffer.lock());
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
+        // Read existing entries
+        let mut entries: Vec<(Vec<u8>, IBlob)> = self.reader.iter()?;
+
+        // Add buffer entries
+        for (key, blob) in buffer {
+            entries.push((key, blob));
+        }
+
+        // Merge sort by key
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Extract just the blobs (writer will re-extract keys)
+        let mut blobs: Vec<IBlob> = entries.into_iter().map(|(_, blob)| blob).collect();
+
+        if blobs.is_empty() {
+            return Ok(());
+        }
+
+        let extractor = FieldKeyExtractor::new(self.fields.clone());
+        let tmp_path = self.path.with_extension("sst.tmp");
+        SSTableWriter::with_block_size(block_size)
+            .write(&tmp_path, &mut blobs, &extractor)?;
+
+        std::fs::rename(&tmp_path, &self.path)?;
+        self.reader = SSTableReader::open(&self.path)?;
+        Ok(())
+    }
+}
+
+/// Determine if a full index rebuild is cheaper than a simple merge.
+///
+/// Full rebuild is O(N log N) where N = primary docs.
+/// Simple merge is O(M) where M = index entries.
+/// Exact crossover: M = N * ln(N).
+/// We trigger at 0.5 * N * ln(N) to be proactive and avoid bloat.
+pub fn should_full_rebuild(index_entries: u64, primary_docs: u64) -> bool {
+    if primary_docs == 0 {
+        return true;
+    }
+    let n = primary_docs as f64;
+    index_entries as f64 > 0.5 * n * n.ln()
 }
 
 /// Default number of query executions before building an index reactively.
@@ -245,5 +358,82 @@ mod tests {
         // Reopen
         let index = SecondaryIndex::open(vec!["x".into()], &idx_path).unwrap();
         assert_eq!(index.iter_sorted().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_should_full_rebuild_threshold() {
+        // N=1000, ln(1000) ≈ 6.9, 0.5 * 1000 * 6.9 ≈ 3453
+        assert!(!should_full_rebuild(3000, 1000)); // below threshold
+        assert!(should_full_rebuild(4000, 1000));  // above threshold
+
+        // N=0 → always rebuild
+        assert!(should_full_rebuild(1, 0));
+
+        // N=100, 0.5 * 100 * ln(100) ≈ 230
+        assert!(!should_full_rebuild(200, 100));
+        assert!(should_full_rebuild(250, 100));
+    }
+
+    #[test]
+    fn test_merge_buffer_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blobs = vec![
+            IBlob::from_pairs(vec![("x", Value::U64(1))]),
+            IBlob::from_pairs(vec![("x", Value::U64(3))]),
+        ];
+        for b in &mut blobs { b.set_version(DocumentId::new()); }
+        let primary = make_primary_sst(dir.path(), &mut blobs);
+        let idx_path = dir.path().join("idx.sst");
+
+        let mut index = SecondaryIndex::build(
+            &["x".into()], &[&primary], &idx_path, 4096,
+        ).unwrap();
+        assert_eq!(index.entry_count(), 2);
+
+        // Add buffer entry
+        let mut new_blob = IBlob::from_pairs(vec![("x", Value::U64(2))]);
+        new_blob.set_version(DocumentId::new());
+        index.notify_put(&new_blob);
+        assert_eq!(index.entry_count(), 3);
+
+        // Merge compaction (3 < 0.5 * 3 * ln(3) ≈ 1.6, so NOT full rebuild — actually 3 > 1.6 so it IS rebuild)
+        // With only 3 primary docs, threshold is 0.5*3*ln(3) ≈ 1.6, so 3 > 1.6 → full rebuild
+        // Use a large primary_doc_count to force merge path
+        index.compact(&[&primary], 10000, 4096).unwrap();
+
+        // Buffer should be flushed
+        assert_eq!(index.buffer.lock().len(), 0);
+        // After merge, all entries should be in the SSTable
+        assert!(index.entry_count() >= 3);
+    }
+
+    #[test]
+    fn test_full_rebuild_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blobs = vec![
+            IBlob::from_pairs(vec![("x", Value::U64(1))]),
+        ];
+        blobs[0].set_version(DocumentId::new());
+        let primary = make_primary_sst(dir.path(), &mut blobs);
+        let idx_path = dir.path().join("idx.sst");
+
+        let mut index = SecondaryIndex::build(
+            &["x".into()], &[&primary], &idx_path, 4096,
+        ).unwrap();
+
+        // Add many buffer entries to bloat the index (simulating many updates)
+        for i in 0..20u64 {
+            let mut b = IBlob::from_pairs(vec![("x", Value::U64(i))]);
+            b.set_version(DocumentId::new());
+            index.notify_put(&b);
+        }
+        assert_eq!(index.entry_count(), 21); // 1 on-disk + 20 buffer
+
+        // Full rebuild: 21 > 0.5 * 1 * ln(1) = 0 → rebuild
+        index.compact(&[&primary], 1, 4096).unwrap();
+
+        // After rebuild from primary, only 1 entry (the single primary doc)
+        assert_eq!(index.entry_count(), 1);
+        assert_eq!(index.buffer.lock().len(), 0);
     }
 }
