@@ -11,10 +11,11 @@ use ingodb_query::{compare_values, Filter, Query, SortDirection, SortField};
 use ingodb_sstable::{MvccKeyExtractor, SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 pub use compaction::{
@@ -70,6 +71,21 @@ impl Default for LsmConfig {
     }
 }
 
+/// Shared state for background compaction signaling.
+struct CompactionSignal {
+    /// True when compaction work may be available
+    pending: Mutex<bool>,
+    /// Notifies the background thread
+    notify: Condvar,
+    /// True when a compaction is currently running
+    running: AtomicBool,
+    /// Notifies waiters that compaction finished
+    done: Condvar,
+    done_mutex: Mutex<()>,
+    /// Signal background thread to stop
+    stop: AtomicBool,
+}
+
 /// The LSM storage engine. Ties together WAL, MemTable, and SSTables.
 pub struct LsmEngine {
     config: LsmConfig,
@@ -90,6 +106,10 @@ pub struct LsmEngine {
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
     /// Active snapshot versions — compaction preserves versions >= oldest snapshot
     active_snapshots: Mutex<BTreeSet<DocumentId>>,
+    /// Background compaction signaling
+    compaction_signal: Arc<CompactionSignal>,
+    /// Background compaction thread handle
+    compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// A consistent point-in-time view of the database.
@@ -212,6 +232,15 @@ impl LsmEngine {
             secondary_indexes: Mutex::new(Vec::new()),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
+            compaction_signal: Arc::new(CompactionSignal {
+                pending: Mutex::new(false),
+                notify: Condvar::new(),
+                running: AtomicBool::new(false),
+                done: Condvar::new(),
+                done_mutex: Mutex::new(()),
+                stop: AtomicBool::new(false),
+            }),
+            compaction_thread: Mutex::new(None),
         })
     }
 
@@ -350,8 +379,12 @@ impl LsmEngine {
             *self.wal.lock() = Wal::open(&wal_path)?;
         }
 
-        // Check if compaction is needed
-        self.maybe_compact()?;
+        // Trigger compaction
+        if self.compaction_thread.lock().is_some() {
+            self.signal_compaction();
+        } else {
+            self.maybe_compact()?;
+        }
 
         Ok(())
     }
@@ -571,6 +604,67 @@ impl LsmEngine {
     /// Access the query statistics collector.
     pub fn query_stats(&self) -> &QueryStats {
         &self.query_stats
+    }
+
+    /// Start a background compaction thread. Requires the engine to be in an Arc.
+    /// If not called, compaction runs inline during flush (blocking the writer).
+    pub fn start_background_compaction(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        let signal = Arc::clone(&self.compaction_signal);
+
+        let handle = std::thread::Builder::new()
+            .name("ingodb-compaction".into())
+            .spawn(move || {
+                loop {
+                    // Wait for work or stop signal
+                    {
+                        let mut pending = signal.pending.lock();
+                        while !*pending && !signal.stop.load(Ordering::Relaxed) {
+                            signal.notify.wait(&mut pending);
+                        }
+                        if signal.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        *pending = false;
+                    }
+
+                    // Run compaction
+                    signal.running.store(true, Ordering::SeqCst);
+                    let _ = engine.maybe_compact();
+                    signal.running.store(false, Ordering::SeqCst);
+
+                    // Notify waiters that compaction finished
+                    signal.done.notify_all();
+                }
+            })
+            .expect("failed to spawn compaction thread");
+
+        *self.compaction_thread.lock() = Some(handle);
+    }
+
+    /// Signal the background compaction thread to check for work.
+    fn signal_compaction(&self) {
+        let mut pending = self.compaction_signal.pending.lock();
+        *pending = true;
+        self.compaction_signal.notify.notify_one();
+    }
+
+    /// Wait until all pending compaction work is finished.
+    /// Also flushes the memtable if it has data.
+    pub fn wait_for_compaction(&self) -> Result<(), LsmError> {
+        // Flush any remaining memtable data
+        self.flush_memtable()?;
+
+        // If background compaction is active, wait for it
+        if self.compaction_thread.lock().is_some() {
+            let mut guard = self.compaction_signal.done_mutex.lock();
+            while self.compaction_signal.running.load(Ordering::SeqCst)
+                || *self.compaction_signal.pending.lock()
+            {
+                self.compaction_signal.done.wait(&mut guard);
+            }
+        }
+        Ok(())
     }
 
     /// Create a snapshot for consistent point-in-time reads.
@@ -1056,6 +1150,17 @@ impl LsmEngine {
             Query::Traverse { start, from_field, to_field, depth } => {
                 self.traverse(start.as_ref(), from_field, to_field, *depth)
             }
+        }
+    }
+}
+
+impl Drop for LsmEngine {
+    fn drop(&mut self) {
+        // Signal the background compaction thread to stop
+        self.compaction_signal.stop.store(true, Ordering::SeqCst);
+        self.compaction_signal.notify.notify_one();
+        if let Some(handle) = self.compaction_thread.lock().take() {
+            let _ = handle.join();
         }
     }
 }

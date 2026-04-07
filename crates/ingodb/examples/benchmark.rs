@@ -40,9 +40,12 @@ fn main() {
     );
 
     let engine = Arc::new(LsmEngine::open(config).unwrap());
+    engine.start_background_compaction();
 
     // Phase 1: Bulk ingest
     let ids = phase_bulk_ingest(&engine);
+    engine.wait_for_compaction().unwrap();
+    println!("  After compaction settled: {} SSTables", engine.sstable_count());
 
     // Phase 2: Point lookups
     phase_point_lookups(&engine, &ids);
