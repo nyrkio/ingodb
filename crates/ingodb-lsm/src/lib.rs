@@ -141,8 +141,10 @@ impl CompactionStats {
 /// The LSM storage engine. Ties together WAL, MemTable, and SSTables.
 pub struct LsmEngine {
     config: LsmConfig,
-    /// Active memtable receiving writes
-    memtable: MemTable,
+    /// Active memtable receiving writes (swapped out when full)
+    memtable: RwLock<MemTable>,
+    /// Immutable memtables queued for flush (newest first)
+    immutable_memtables: Mutex<Vec<MemTable>>,
     /// WAL for the active memtable
     wal: Mutex<Wal>,
     /// SSTables on disk, ordered for reads: L0 first → L1 → ..., within each level newest first.
@@ -289,7 +291,8 @@ impl LsmEngine {
 
         Ok(LsmEngine {
             config,
-            memtable,
+            memtable: RwLock::new(memtable),
+            immutable_memtables: Mutex::new(Vec::new()),
             wal: Mutex::new(wal),
             sstables: RwLock::new(sstables),
             next_sst_id: AtomicU64::new(max_id + 1),
@@ -336,11 +339,11 @@ impl LsmEngine {
             }
         }
 
-        // Insert into memtable (keyed by _id; upsert replaces old version)
-        let should_flush = self.memtable.insert(blob);
+        // Insert into active memtable
+        let should_flush = self.memtable.read().insert(blob);
 
         if should_flush {
-            self.flush_memtable()?;
+            self.rotate_memtable()?;
         }
 
         Ok(())
@@ -366,10 +369,10 @@ impl LsmEngine {
             }
         }
 
-        let should_flush = self.memtable.insert(tombstone);
+        let should_flush = self.memtable.read().insert(tombstone);
 
         if should_flush {
-            self.flush_memtable()?;
+            self.rotate_memtable()?;
         }
 
         Ok(())
@@ -393,11 +396,23 @@ impl LsmEngine {
         });
         timer.set_docs_scanned(1);
 
-        // Check memtable first — multi-version, returns highest version <= snapshot
-        if let Some(blob) = self.memtable.get(id, snapshot) {
+        // Check active memtable first
+        if let Some(blob) = self.memtable.read().get(id, snapshot) {
             let found = if blob.is_deleted() { None } else { Some(blob) };
             self.query_stats.record(timer.finish(if found.is_some() { 1 } else { 0 }));
             return Ok(found);
+        }
+
+        // Check immutable memtables (newest first)
+        {
+            let immutables = self.immutable_memtables.lock();
+            for mt in immutables.iter().rev() {
+                if let Some(blob) = mt.get(id, snapshot) {
+                    let found = if blob.is_deleted() { None } else { Some(blob) };
+                    self.query_stats.record(timer.finish(if found.is_some() { 1 } else { 0 }));
+                    return Ok(found);
+                }
+            }
         }
 
         // Check SSTables — use snapshot-aware lookup
@@ -424,11 +439,43 @@ impl LsmEngine {
     /// Flush the current memtable to a new SSTable.
     ///
     /// Atomically writes:
+    /// Rotate the active memtable: swap in a fresh one, queue the old for flush.
+    /// Writers are only blocked for the brief swap, not during the flush I/O.
+    fn rotate_memtable(&self) -> Result<(), LsmError> {
+        let old_memtable;
+        {
+            let mut active = self.memtable.write();
+            let new_memtable = MemTable::new(self.config.memtable_size);
+            old_memtable = std::mem::replace(&mut *active, new_memtable);
+        }
+        // Old memtable is now immutable — queue it for flush
+        self.immutable_memtables.lock().push(old_memtable);
+
+        // Signal background flush, or flush inline
+        if self.compaction_thread.lock().is_some() {
+            self.signal_compaction();
+        } else {
+            self.flush_immutable_memtables()?;
+        }
+        Ok(())
+    }
+
+    /// Flush all queued immutable memtables to SSTables.
+    fn flush_immutable_memtables(&self) -> Result<(), LsmError> {
+        loop {
+            let memtable = self.immutable_memtables.lock().pop();
+            let Some(memtable) = memtable else { break };
+            self.flush_single_memtable(memtable)?;
+        }
+        Ok(())
+    }
+
+    /// Flush one memtable to an SSTable + update indexes + reset WAL.
     /// 1. Primary SSTable from memtable data
     /// 2. Secondary index entries for the flushed data (merge buffer to disk)
     /// Only after both succeed: update metadata (SSTable list), reset WAL.
-    pub fn flush_memtable(&self) -> Result<(), LsmError> {
-        let mut blobs = self.memtable.drain();
+    fn flush_single_memtable(&self, memtable: MemTable) -> Result<(), LsmError> {
+        let mut blobs = memtable.drain();
         if blobs.is_empty() {
             return Ok(());
         }
@@ -478,14 +525,17 @@ impl LsmEngine {
             *self.wal.lock() = Wal::open(&wal_path)?;
         }
 
-        // Trigger compaction (primary SSTables only — indexes already flushed above)
-        if self.compaction_thread.lock().is_some() {
-            self.signal_compaction();
-        } else {
+        // Trigger compaction (inline only — background coordinator handles its own)
+        if self.compaction_thread.lock().is_none() {
             self.maybe_compact()?;
         }
 
         Ok(())
+    }
+
+    /// Flush the active memtable (public API for tests and wait_for_compaction).
+    pub fn flush_memtable(&self) -> Result<(), LsmError> {
+        self.rotate_memtable()
     }
 
     /// Run UCS compaction if needed.
@@ -549,7 +599,7 @@ impl LsmEngine {
         // Estimate doc count without iterating all SSTables (which is O(total data))
         let estimated_doc_count = sst_refs.len() as u64
             * (self.config.memtable_size as u64 / 400)
-            + self.memtable.len() as u64;
+            + self.memtable.read().len() as u64;
 
         for (fields, group_indices) in &field_groups {
             if group_indices.len() > 1 {
@@ -771,7 +821,7 @@ impl LsmEngine {
 
     /// Number of entries in the active memtable.
     pub fn memtable_size(&self) -> usize {
-        self.memtable.len()
+        self.memtable.read().len()
     }
 
     /// Force a sync of the WAL to disk.
@@ -824,6 +874,9 @@ impl LsmEngine {
                     }
 
                     signal.running.store(true, Ordering::SeqCst);
+
+                    // Flush any immutable memtables first
+                    let _ = engine.flush_immutable_memtables();
 
                     // Adaptive W: adjust based on recent read/write ratio
                     engine.maybe_adjust_w();
@@ -898,8 +951,11 @@ impl LsmEngine {
     /// Wait until all pending compaction work is finished.
     /// Also flushes the memtable if it has data.
     pub fn wait_for_compaction(&self) -> Result<(), LsmError> {
-        // Flush any remaining memtable data
-        self.flush_memtable()?;
+        // Rotate active memtable if it has data, then flush all immutables
+        if self.memtable.read().len() > 0 {
+            self.rotate_memtable()?;
+        }
+        self.flush_immutable_memtables()?;
 
         // If background compaction is active, wait for it
         if self.compaction_thread.lock().is_some() {
@@ -1017,7 +1073,7 @@ impl LsmEngine {
         }
 
         // Merge with memtable (always fresh, may have docs not in the index)
-        let memtable_docs: Vec<IBlob> = self.memtable.iter()
+        let memtable_docs: Vec<IBlob> = self.memtable.read().iter()
             .map(|(_, blob)| blob)
             .filter(|blob| !blob.is_deleted())
             .filter(|blob| {
@@ -1181,7 +1237,7 @@ impl LsmEngine {
         }
 
         // Also check memtable for docs not in the index
-        for (_, blob) in self.memtable.iter() {
+        for (_, blob) in self.memtable.read().iter() {
             if blob.is_deleted() || blob.version() > snapshot {
                 continue;
             }
@@ -1218,7 +1274,7 @@ impl LsmEngine {
         if indexes.is_empty() {
             return;
         }
-        for (_, blob) in self.memtable.iter() {
+        for (_, blob) in self.memtable.read().iter() {
             for idx in indexes.iter() {
                 if blob.is_deleted() {
                     idx.notify_delete(blob.id());
@@ -1305,8 +1361,11 @@ impl LsmEngine {
         // Collect all IBlobs from memtable + SSTables
         let mut all: Vec<IBlob> = Vec::new();
 
-        // Memtable entries (newest versions)
-        all.extend(self.memtable.iter().map(|(_, blob)| blob));
+        // Memtable entries (active + immutable)
+        all.extend(self.memtable.read().iter().map(|(_, blob)| blob));
+        for mt in self.immutable_memtables.lock().iter() {
+            all.extend(mt.iter().map(|(_, blob)| blob));
+        }
 
         // SSTable entries
         {
@@ -1432,7 +1491,7 @@ impl LsmEngine {
                             if stats.selectivity() <= 0.5 && stats.count >= 2 {
                                 // Build a full-range index sorted by this field
                                 // Re-scan all docs to build a complete index
-                                let all_docs: Vec<IBlob> = self.memtable.iter()
+                                let all_docs: Vec<IBlob> = self.memtable.read().iter()
                                     .map(|(_, b)| b)
                                     .chain(
                                         self.sstables.read().iter()
