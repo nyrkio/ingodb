@@ -67,6 +67,29 @@ from per-document get() back to primary. Optimization TODO.
 
 ---
 
+## 2026-04-07 — 1M Products with Random Updates, UCS W Comparison
+
+1M inserts + 500K random updates. Five W configurations.
+Shows UCS read/write amplification tradeoff.
+
+| W | Mode | f | t | Final SSTables | Compaction reads | Write amp | Point lookup p50 | Lookup ops/sec | 8-thread ops/sec |
+|---|------|---|---|---------------|-----------------|-----------|-----------------|---------------|-----------------|
+| 9 | Tiered | 11 | 11 | **1** | 411 MB | 0.81x | 14.5 us | **61K** | **246K** |
+| 4 | Tiered | 6 | 6 | 2 | 247 MB | 0.87x | 26.9 us | 40K | 157K |
+| 0 | Balanced | 2 | 2 | 2 | 247 MB | 0.87x | 25.8 us | 43K | 163K |
+| -4 | Leveled | 6 | 2 | 2 | 247 MB | 0.87x | 25.4 us | 42K | 160K |
+| -9 | Leveled | 11 | 2 | **1** | 411 MB | 0.81x | 13.7 us | **66K** | **256K** |
+
+Findings:
+- Extreme W values (±9) compact to 1 SSTable via larger merges (411 MB read).
+  Best read performance but most compaction I/O.
+- Middle values (W=0, ±4) land at 2 SSTables with less compaction I/O (247 MB).
+- Both extremes have f=11 (large fanout). W=9 triggers at t=11 (many SSTables
+  before merge), W=-9 triggers at t=2 (aggressive) but with larger level sizes.
+- Write amplification < 1.0 because dedup removes old versions during merge.
+
+---
+
 ## 2026-04-07 — 1M Products with Random Updates (W=0)
 
 1M inserts + 500K random updates. Updates create overlapping key ranges
