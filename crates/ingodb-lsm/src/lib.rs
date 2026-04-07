@@ -89,6 +89,39 @@ struct CompactionSignal {
     stop: AtomicBool,
 }
 
+/// Compaction statistics — tracks what compaction has done.
+pub struct CompactionStats {
+    /// Number of compaction runs completed
+    pub runs: AtomicU64,
+    /// Total input bytes read during compaction
+    pub bytes_read: AtomicU64,
+    /// Total output bytes written during compaction
+    pub bytes_written: AtomicU64,
+    /// Total input SSTables consumed
+    pub sstables_read: AtomicU64,
+    /// Total output SSTables produced
+    pub sstables_written: AtomicU64,
+}
+
+impl CompactionStats {
+    fn new() -> Self {
+        CompactionStats {
+            runs: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            sstables_read: AtomicU64::new(0),
+            sstables_written: AtomicU64::new(0),
+        }
+    }
+
+    /// Write amplification: bytes_written / bytes_read. Higher = more rewriting.
+    pub fn write_amplification(&self) -> f64 {
+        let r = self.bytes_read.load(Ordering::Relaxed);
+        let w = self.bytes_written.load(Ordering::Relaxed);
+        if r == 0 { 0.0 } else { w as f64 / r as f64 }
+    }
+}
+
 /// The LSM storage engine. Ties together WAL, MemTable, and SSTables.
 pub struct LsmEngine {
     config: LsmConfig,
@@ -113,6 +146,8 @@ pub struct LsmEngine {
     compaction_signal: Arc<CompactionSignal>,
     /// Background compaction thread handle
     compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Compaction statistics
+    compaction_stats: CompactionStats,
 }
 
 /// A consistent point-in-time view of the database.
@@ -244,6 +279,7 @@ impl LsmEngine {
                 stop: AtomicBool::new(false),
             }),
             compaction_thread: Mutex::new(None),
+            compaction_stats: CompactionStats::new(),
         })
     }
 
@@ -506,10 +542,14 @@ impl LsmEngine {
         inputs: &[PathBuf],
         filter: Option<&mut dyn CompactionFilter>,
     ) -> Result<(), LsmError> {
+        let num_inputs = inputs.len() as u64;
+        let mut input_bytes = 0u64;
+
         // Merge all input SSTables
         let mut merged: Vec<IBlob> = Vec::new();
         for path in inputs {
             let reader = SSTableReader::open(path)?;
+            input_bytes += reader.file_size();
             let entries = reader.iter()?;
             merged.extend(entries.into_iter().map(|(_, blob)| blob));
         }
@@ -572,6 +612,14 @@ impl LsmEngine {
         SSTableWriter::with_block_size(self.config.block_size)
             .write(&output_path, &mut merged, &MvccKeyExtractor)?;
         let new_reader = SSTableReader::open(&output_path)?;
+        let output_bytes = new_reader.file_size();
+
+        // Record compaction stats
+        self.compaction_stats.runs.fetch_add(1, Ordering::Relaxed);
+        self.compaction_stats.bytes_read.fetch_add(input_bytes, Ordering::Relaxed);
+        self.compaction_stats.bytes_written.fetch_add(output_bytes, Ordering::Relaxed);
+        self.compaction_stats.sstables_read.fetch_add(num_inputs, Ordering::Relaxed);
+        self.compaction_stats.sstables_written.fetch_add(1, Ordering::Relaxed);
 
         // Swap old SSTables for new one
         let mut sstables = self.sstables.write();
@@ -607,6 +655,11 @@ impl LsmEngine {
     /// Access the query statistics collector.
     pub fn query_stats(&self) -> &QueryStats {
         &self.query_stats
+    }
+
+    /// Access compaction statistics.
+    pub fn compaction_stats(&self) -> &CompactionStats {
+        &self.compaction_stats
     }
 
     /// Start background compaction threads. Requires the engine to be in an Arc.

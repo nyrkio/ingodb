@@ -85,6 +85,20 @@ fn main() {
     println!("SSTables on disk: {}", engine.sstable_count());
     println!("Secondary indexes: {}", engine.secondary_index_count());
 
+    let cs = engine.compaction_stats();
+    let runs = cs.runs.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_r = cs.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_w = cs.bytes_written.load(std::sync::atomic::Ordering::Relaxed);
+    let ssts_r = cs.sstables_read.load(std::sync::atomic::Ordering::Relaxed);
+    let ssts_w = cs.sstables_written.load(std::sync::atomic::Ordering::Relaxed);
+    println!("\nCompaction:");
+    println!("  Runs: {}", runs);
+    println!("  SSTables read: {}, written: {}", ssts_r, ssts_w);
+    println!("  Bytes read: {:.1} MB, written: {:.1} MB",
+        bytes_r as f64 / 1024.0 / 1024.0,
+        bytes_w as f64 / 1024.0 / 1024.0);
+    println!("  Write amplification: {:.2}x", cs.write_amplification());
+
     let stats = engine.query_stats();
     let patterns = stats.top_by_count(5);
     println!("\nTop query patterns:");
