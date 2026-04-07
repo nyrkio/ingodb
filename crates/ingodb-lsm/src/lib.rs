@@ -1000,13 +1000,21 @@ impl LsmEngine {
         limit: Option<usize>,
         snapshot: &DocumentId,
     ) -> Option<Result<Vec<IBlob>, LsmError>> {
-        // Extract the filter field — only simple single-field filters for now
-        let field = match filter {
-            Filter::Eq { field, .. }
-            | Filter::Gt { field, .. }
-            | Filter::Lt { field, .. }
-            | Filter::Range { field, .. } => field.clone(),
-            _ => return None, // compound/exists/not — can't use single-field index
+        // Extract range boundaries from the filter for binary search on the index
+        let (field, start_val, end_val) = match filter {
+            Filter::Eq { field, value } => {
+                (field.clone(), Some(value.clone()), Some(value.clone()))
+            }
+            Filter::Gt { field, value } => {
+                (field.clone(), Some(value.clone()), None) // open upper bound
+            }
+            Filter::Lt { field, value } => {
+                (field.clone(), None, Some(value.clone())) // open lower bound
+            }
+            Filter::Range { field, low, high } => {
+                (field.clone(), Some(low.clone()), Some(high.clone()))
+            }
+            _ => return None,
         };
 
         // Check if we have an index on this field
@@ -1016,22 +1024,22 @@ impl LsmEngine {
         })?;
         index.mark_used();
 
-        // Iterate the index and filter by the predicate
-        let sorted_entries = match index.iter_sorted() {
+        // Range scan on the index — O(log N + R) instead of O(N)
+        let range_entries = match index.range_scan(
+            start_val.as_ref(),
+            end_val.as_ref(),
+        ) {
             Ok(entries) => entries,
             Err(e) => return Some(Err(e)),
         };
         drop(indexes);
 
+
         let mut results = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for (id, projected) in sorted_entries {
+        for (id, projected) in range_entries {
             if projected.is_deleted() {
-                continue;
-            }
-            // Check if the index entry's field value matches the filter
-            if !filter.matches(&|f| projected.get_field(f)) {
                 continue;
             }
             // Fetch the full document from primary

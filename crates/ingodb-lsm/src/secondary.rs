@@ -1,6 +1,6 @@
-use ingodb_blob::{DocumentId, IBlob};
+use ingodb_blob::{DocumentId, IBlob, Value};
 use ingodb_query::Filter;
-use ingodb_sstable::{FieldKeyExtractor, KeyExtractor, SSTableReader, SSTableWriter};
+use ingodb_sstable::{encode_comparable_value, FieldKeyExtractor, KeyExtractor, SSTableReader, SSTableWriter};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -186,6 +186,40 @@ impl SecondaryIndex {
             .into_iter()
             .map(|(_, blob)| (*blob.id(), blob))
             .collect())
+    }
+
+    /// Range scan the index: return entries where the indexed field value
+    /// falls between start_value and end_value (inclusive).
+    /// Uses binary search on the SSTable — O(log N + R) instead of O(N).
+    pub fn range_scan(
+        &self,
+        start_value: Option<&Value>,
+        end_value: Option<&Value>,
+    ) -> Result<Vec<(DocumentId, IBlob)>, LsmError> {
+        let start_key = start_value
+            .map(encode_comparable_value)
+            .unwrap_or_else(|| vec![0x00]); // min possible key
+        let end_key = end_value
+            .map(encode_comparable_value)
+            .unwrap_or_else(|| vec![0xFF; 32]); // max possible key
+
+        // SSTable range scan — binary search to start, scan to end
+        let sst_entries = self.reader.range_scan(&start_key, &end_key)?;
+
+        // Also include matching buffer entries
+        let buffer = self.buffer.lock();
+        let mut all: Vec<(Vec<u8>, IBlob)> = sst_entries;
+        for (key, blob) in buffer.iter() {
+            if key.as_slice() >= start_key.as_slice() && key.as_slice() <= end_key.as_slice() {
+                all.push((key.clone(), blob.clone()));
+            }
+        }
+        drop(buffer);
+
+        // Sort merged results
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(all.into_iter().map(|(_, blob)| (*blob.id(), blob)).collect())
     }
 
     /// Check if this index covers the given sort fields AND the query filter.

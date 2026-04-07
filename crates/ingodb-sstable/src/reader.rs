@@ -296,6 +296,61 @@ impl SSTableReader {
         Ok(all_entries)
     }
 
+    /// Range scan: return all entries with keys in [start_key, end_key].
+    /// Both bounds are inclusive. Keys are compared lexicographically.
+    pub fn range_scan(&self, start_key: &[u8], end_key: &[u8]) -> Result<Vec<(Vec<u8>, IBlob)>, SSTableError> {
+        // Find the first block that could contain start_key.
+        // Binary search finds a block with last_key >= start_key, but entries
+        // with the same key could span multiple blocks. Walk backward to find
+        // the earliest block that could contain start_key.
+        let mut first_block = match self
+            .block_indices
+            .binary_search_by(|idx| idx.last_key.as_slice().cmp(start_key))
+        {
+            Ok(i) => i,
+            Err(i) => {
+                if i >= self.block_indices.len() {
+                    return Ok(Vec::new());
+                }
+                i
+            }
+        };
+        // Walk backward: previous blocks might also contain entries >= start_key
+        while first_block > 0 {
+            if self.block_indices[first_block - 1].last_key.as_slice() >= start_key {
+                first_block -= 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut results = Vec::new();
+        for block_idx in first_block..self.block_indices.len() {
+            let block = &self.block_indices[block_idx];
+            let entries = self.read_block(block)?;
+
+            let mut found_any_in_block = false;
+            for (k, blob) in entries {
+                if k.as_slice() < start_key {
+                    continue;
+                }
+                if k.as_slice() > end_key {
+                    return Ok(results); // past end of range — done
+                }
+                results.push((k, blob));
+                found_any_in_block = true;
+            }
+
+            // If we read a full block past the start but found nothing in range,
+            // and the block's last_key > end_key, no need to continue
+            if !found_any_in_block && block.last_key.as_slice() > end_key {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Number of data blocks in this SSTable.
     pub fn block_count(&self) -> usize {
         self.block_indices.len()
