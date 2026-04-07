@@ -585,15 +585,17 @@ fn test_query_stats_low_selectivity_detection() {
     }
 
     // Query that scans 100 docs but returns only ~10 (category = "cat0")
-    for _ in 0..5 {
+    // After 2 scans with low selectivity, a reactive index is created.
+    // Check stats after just 2 scans (before index changes the stats).
+    for _ in 0..2 {
         engine.scan(
             Some(&Filter::Eq { field: "category".into(), value: Value::String("cat0".into()) }),
             None, None, None,
         ).unwrap();
     }
 
-    // Detect index candidates
-    let candidates = engine.query_stats().low_selectivity(0.15, 3);
+    // Detect index candidates — selectivity=0.1 (10 returned / 100 scanned)
+    let candidates = engine.query_stats().low_selectivity(0.15, 2);
     assert!(!candidates.is_empty(), "should detect low-selectivity pattern");
     assert!(candidates[0].0.filter_fields.contains(&"category".into()));
 }

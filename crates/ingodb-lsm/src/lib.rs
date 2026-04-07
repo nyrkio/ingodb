@@ -1286,6 +1286,58 @@ impl LsmEngine {
         let docs_returned = results.len() as u64;
         self.query_stats.record(timer.finish(docs_returned));
 
+        // Reactive: build filter index if warranted
+        if sort.is_none() && results.len() > self.config.sort_spill_threshold {
+            if let Some(filter) = filter {
+                // Extract the filter field for a simple single-field filter
+                let field = match filter {
+                    Filter::Eq { field, .. }
+                    | Filter::Gt { field, .. }
+                    | Filter::Lt { field, .. }
+                    | Filter::Range { field, .. } => Some(field.clone()),
+                    _ => None,
+                };
+                if let Some(field) = field {
+                    // Check if an index already exists for this field
+                    let has_index = self.secondary_indexes.lock().iter().any(|idx| {
+                        idx.fields.len() == 1 && idx.fields[0] == field
+                    });
+                    if !has_index {
+                        // Check stats: build only if low selectivity and repeated
+                        let pattern = QueryPattern {
+                            query_type: "scan".into(),
+                            filter_fields: vec![field.clone()],
+                            sort_fields: vec![],
+                            join_edge: None,
+                        };
+                        if let Some(stats) = self.query_stats.get_pattern(&pattern) {
+                            if stats.selectivity() <= 0.5 && stats.count >= 2 {
+                                // Build a full-range index sorted by this field
+                                // Re-scan all docs to build a complete index
+                                let all_docs: Vec<IBlob> = self.memtable.iter()
+                                    .map(|(_, b)| b)
+                                    .chain(
+                                        self.sstables.read().iter()
+                                            .flat_map(|sst| sst.iter().unwrap_or_default().into_iter().map(|(_, b)| b))
+                                    )
+                                    .collect();
+                                let mut deduped = all_docs;
+                                deduped.sort_by(|a, b| a.id().cmp(b.id()).then_with(|| b.version().cmp(a.version())));
+                                deduped.dedup_by(|a, b| a.id() == b.id());
+                                deduped.retain(|b| !b.is_deleted());
+
+                                let _ = self.spill_to_partial_index(
+                                    &[field],
+                                    None, // full range
+                                    &mut deduped,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(results)
     }
 
@@ -2716,5 +2768,51 @@ mod tests {
         for r in &results {
             assert_eq!(r.get("category"), Some(&Value::String("electronics".into())));
         }
+    }
+
+    #[test]
+    fn test_filter_index_created_reactively() {
+        // A filter-only query repeated with low selectivity should
+        // trigger reactive index creation — no sort needed.
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            sort_spill_threshold: 5,
+            compaction_threads: 1,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Insert 20 docs: 10 electronics, 10 books
+        for i in 0..20u64 {
+            let cat = if i % 2 == 0 { "electronics" } else { "books" };
+            engine.put(IBlob::from_pairs(vec![
+                ("category", Value::String(cat.into())),
+                ("n", Value::U64(i)),
+            ])).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        assert_eq!(engine.secondary_index_count(), 0, "no index initially");
+
+        // First filter scan — records stats but doesn't build index (count=1)
+        let filter = Filter::Eq {
+            field: "category".into(),
+            value: Value::String("electronics".into()),
+        };
+        engine.scan(Some(&filter), None, None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 0, "no index after first scan");
+
+        // Second filter scan — stats show count=2, selectivity=0.5 → build index
+        let results = engine.scan(Some(&filter), None, None, None).unwrap();
+        assert_eq!(results.len(), 10);
+        assert_eq!(engine.secondary_index_count(), 1, "index created reactively after 2 scans");
+
+        // Third scan should use the index
+        let results = engine.scan(Some(&filter), None, None, None).unwrap();
+        assert_eq!(results.len(), 10, "filter scan via index returns correct results");
     }
 }
