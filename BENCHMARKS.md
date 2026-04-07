@@ -67,7 +67,35 @@ from per-document get() back to primary. Optimization TODO.
 
 ---
 
-## 2026-04-07 — 1M Products, UCS Scaling Parameter Comparison
+## 2026-04-07 — 1M Products with Random Updates (W=0)
+
+1M inserts + 500K random updates. Updates create overlapping key ranges
+that trigger UCS compaction. This is a realistic CRUD workload.
+
+| Phase | Metric | Value |
+|-------|--------|-------|
+| Ingest | 1M docs | 22 SSTables |
+| Updates | 500K random | 34 SSTables → compacted to **2** |
+| Point lookup | p50 latency | 26.7 us |
+| Point lookup | single-thread | 39K ops/sec |
+| Scan cold | 100K results | 3.74s |
+| Scan warm (index) | 100K results | 2.59s (**1.4x speedup**) |
+| 8-thread reads | | 268K ops/sec |
+| Mixed read/write | | 765K ops/sec |
+| Snapshot isolation | | 100/100 correct |
+
+Key finding: random updates trigger compaction, reducing 34 SSTables
+to 2. This dramatically improves read performance vs the insert-only
+workload (23 SSTables). The secondary index now provides a real 1.4x
+speedup (vs 0.2x regression in insert-only).
+
+W=4, W=0, W=-4 all produce same result (2 SSTables). The W parameter
+affects write amplification (number of compaction rounds) but we don't
+measure that yet.
+
+---
+
+## 2026-04-07 — 1M Products, UCS Scaling Parameter Comparison (insert-only)
 
 1M products (~382 bytes each, ~382 MB total), 16 MB memtable.
 

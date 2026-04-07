@@ -60,6 +60,11 @@ fn main() {
     engine.wait_for_compaction().unwrap();
     println!("  After compaction settled: {} SSTables", engine.sstable_count());
 
+    // Phase 1b: Random updates (creates overlapping key ranges for compaction)
+    phase_random_updates(&engine, &ids);
+    engine.wait_for_compaction().unwrap();
+    println!("  After updates + compaction: {} SSTables", engine.sstable_count());
+
     // Phase 2: Point lookups
     phase_point_lookups(&engine, &ids);
 
@@ -107,19 +112,34 @@ fn main() {
     }
 }
 
+/// Create a deterministic DocumentId from a counter.
+/// Not a real UUIDv7, but deterministic and reproducible for benchmarks.
+fn deterministic_id(i: u64) -> DocumentId {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&i.to_be_bytes());
+    // Fill remaining bytes with a hash of i for uniqueness
+    let hash = i.wrapping_mul(0x517cc1b727220a95);
+    bytes[8..16].copy_from_slice(&hash.to_be_bytes());
+    DocumentId::from_bytes(bytes)
+}
+
 fn make_product(i: u64) -> IBlob {
+    make_product_with_id(deterministic_id(i), i)
+}
+
+fn make_product_with_id(id: DocumentId, i: u64) -> IBlob {
     let category = CATEGORIES[(i % CATEGORIES.len() as u64) as usize];
     let price = (i % 1000) as f64 + 0.99;
     let rating = (i % 50) as f64 / 10.0;
-    IBlob::from_pairs(vec![
-        ("type", Value::String("product".into())),
-        ("name", Value::String(format!("Product #{i}"))),
-        ("category", Value::String(category.into())),
-        ("price", Value::F64(price)),
-        ("rating", Value::F64(rating)),
-        ("stock", Value::U64(i % 500)),
-        ("description", Value::String(format!("Description for product {i} in {category}"))),
-    ])
+    IBlob::with_id(id, [
+        ("type".into(), Value::String("product".into())),
+        ("name".into(), Value::String(format!("Product #{i}"))),
+        ("category".into(), Value::String(category.into())),
+        ("price".into(), Value::F64(price)),
+        ("rating".into(), Value::F64(rating)),
+        ("stock".into(), Value::U64(i % 500)),
+        ("description".into(), Value::String(format!("Description for product {i} in {category}"))),
+    ].into())
 }
 
 fn phase_bulk_ingest(engine: &Arc<LsmEngine>) -> Vec<DocumentId> {
@@ -148,6 +168,31 @@ fn phase_bulk_ingest(engine: &Arc<LsmEngine>) -> Vec<DocumentId> {
     println!("  SSTables after ingest: {}", engine.sstable_count());
 
     ids
+}
+
+fn phase_random_updates(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
+    let num_updates = NUM_PRODUCTS / 2; // update 50% of docs
+    println!("\n--- Phase 1b: Random Updates ({} updates to existing docs) ---", num_updates);
+
+    let start = Instant::now();
+    for i in 0..num_updates {
+        // Pseudo-random selection: update a uniformly distributed existing doc
+        let idx = ((i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) % ids.len() as u64) as usize;
+        let id = ids[idx];
+        let updated = make_product_with_id(id, i + NUM_PRODUCTS); // different field values, same _id
+        engine.put(updated).unwrap();
+
+        if (i + 1) % 10_000 == 0 {
+            let elapsed = start.elapsed();
+            let rate = (i + 1) as f64 / elapsed.as_secs_f64();
+            eprint!("\r  {}/{} ({:.0} updates/sec)", i + 1, num_updates, rate);
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let rate = num_updates as f64 / elapsed.as_secs_f64();
+    println!("\r  {} updates in {:.2?} ({:.0} updates/sec)", num_updates, elapsed, rate);
+    println!("  SSTables after updates: {}", engine.sstable_count());
 }
 
 fn phase_point_lookups(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
