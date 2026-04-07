@@ -43,21 +43,27 @@ Each phase produces a working, testable artifact. No phase depends on network or
 
 ## Remaining Phases
 
-### Phase 5b: Advanced Reactive Morphing
+### Phase 5b: MVCC — Snapshot Reads
+- Read from a stable snapshot: `_version <= snapshot_version` at scan start
+- `get()` and `scan()` filter by snapshot version
+- Old versions retained until no snapshot references them (GC)
+- Enables consistent scan results during concurrent writes
+
+### Phase 5c: Advanced Reactive Morphing
 - **Semantic shredding**: extract hot fields into columnar side-structures during compaction
 - **Co-location**: physically interleave related documents (by traversal graph) during compaction
 - **Compression adaptation**: choose LZ4/Zstd/dictionary per level based on data characteristics
 
-### Phase 5c: Predictive Optimization
+### Phase 5d: Predictive Optimization
 - Small predictive engine that anticipates future query patterns from recent history
 - Pre-emptively restructure data ahead of observed trends
 
-### Phase 6: Custom Comparators
+### Phase 6: Custom Comparators / Sort Orders
 - **WASM comparator support**: user-defined sort orders via WebAssembly functions
 - The `KeyExtractor` trait is ready — custom implementations can plug in
 - Comparator functions stored as metadata in the system collection
 
-### Phase 7: Infrastructure
+### Phase 7: Infrastructure (Future)
 - gRPC server with Liquid AST protocol (tonic)
 - Benchmarks with criterion (external benchmarks can be wired to Nyrkiö)
 - CI pipeline
