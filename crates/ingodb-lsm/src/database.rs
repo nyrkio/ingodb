@@ -80,6 +80,11 @@ impl Database {
             }
         }
 
+        // Replay WAL-recovered memtable entries into secondary indexes
+        for engine in collections.values() {
+            engine.replay_memtable_to_indexes();
+        }
+
         Ok(Database {
             data_dir,
             config,
@@ -388,6 +393,67 @@ mod tests {
                 engine.scan(None, Some(&sort), None, None)
             }).unwrap();
             assert_eq!(results.len(), 10);
+        }
+    }
+
+    #[test]
+    fn test_index_buffer_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            sort_spill_threshold: 5,
+        };
+
+        let update_id;
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // Insert docs and flush to create primary SSTables
+            db.with_collection("data", |engine| {
+                for i in 0..10u64 {
+                    engine.put(IBlob::from_pairs(vec![("val", Value::U64(i))]))?;
+                }
+                engine.flush_memtable()?;
+                Ok(())
+            }).unwrap();
+
+            // Trigger index creation via sorted scan
+            let sort = [SortField { field: "val".into(), direction: SortDirection::Ascending }];
+            db.with_collection("data", |engine| {
+                engine.scan(None, Some(&sort), None, None)?;
+                Ok(())
+            }).unwrap();
+
+            // Now update a doc (this writes to index buffer)
+            update_id = DocumentId::new();
+            db.with_collection("data", |engine| {
+                engine.put(IBlob::with_id(update_id, [("val".into(), Value::U64(99))].into()))?;
+                engine.sync()?;
+                Ok(())
+            }).unwrap();
+
+            // Don't flush — the update is only in WAL + memtable + index buffer
+        }
+
+        // Restart — WAL recovery should replay into index buffers
+        {
+            let db = Database::open(config).unwrap();
+
+            // The updated doc should appear in sorted scan via the index
+            let sort = [SortField { field: "val".into(), direction: SortDirection::Ascending }];
+            let results = db.with_collection("data", |engine| {
+                engine.scan(None, Some(&sort), None, None)
+            }).unwrap();
+
+            let vals: Vec<u64> = results.iter()
+                .filter_map(|b| match b.get("val") { Some(Value::U64(n)) => Some(*n), _ => None })
+                .collect();
+            assert!(vals.contains(&99), "WAL-recovered doc should be in index after restart");
         }
     }
 }

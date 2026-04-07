@@ -343,7 +343,7 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Compact secondary indexes: drop unused, merge or rebuild remaining.
+    /// Compact secondary indexes: drop unused, merge partial ranges, rebuild.
     fn maybe_compact_indexes(&self) -> Result<(), LsmError> {
         let mut indexes = self.secondary_indexes.lock();
 
@@ -357,7 +357,14 @@ impl LsmEngine {
             }
         });
 
-        // Compact remaining
+        // Merge multiple partial ranges for the same sort fields
+        // Find field sets with >1 index and merge them
+        let mut field_groups: std::collections::HashMap<Vec<String>, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, idx) in indexes.iter().enumerate() {
+            field_groups.entry(idx.fields.clone()).or_default().push(i);
+        }
+
         let sstables = self.sstables.lock();
         let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
         let primary_doc_count = self.memtable.len() as u64
@@ -365,6 +372,43 @@ impl LsmEngine {
                 .map(|s| s.iter().map(|e| e.len() as u64).unwrap_or(0))
                 .sum::<u64>();
 
+        for (fields, group_indices) in &field_groups {
+            if group_indices.len() > 1 {
+                // Multiple partial indexes for the same fields — merge them
+                // Combine all entries, dedup, write as one index with combined range
+                let mut all_entries: Vec<IBlob> = Vec::new();
+                for &i in group_indices {
+                    if let Ok(entries) = indexes[i].iter_sorted() {
+                        all_entries.extend(entries.into_iter().map(|(_, blob)| blob));
+                    }
+                }
+
+                if !all_entries.is_empty() {
+                    let idx_name = fields.join("_");
+                    let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+                    let merged_path = self.config.data_dir.join(format!("idx_{idx_name}_{sst_id:012}.sst"));
+
+                    if let Ok(merged) = secondary::SecondaryIndex::build_partial(
+                        fields,
+                        None, // merged range becomes full rebuild from entries
+                        &mut all_entries,
+                        &merged_path,
+                        self.config.block_size,
+                    ) {
+                        // Remove old indexes (reverse order to keep indices valid)
+                        let mut to_remove: Vec<usize> = group_indices.clone();
+                        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+                        for i in to_remove {
+                            let old = indexes.remove(i);
+                            std::fs::remove_file(&old.path).ok();
+                        }
+                        indexes.push(merged);
+                    }
+                }
+            }
+        }
+
+        // Compact individual indexes (merge buffer or full rebuild)
         for index in indexes.iter_mut() {
             let _ = index.compact(&sst_refs, primary_doc_count, self.config.block_size);
         }
@@ -617,7 +661,7 @@ impl LsmEngine {
 
         let index = secondary::SecondaryIndex::build_partial(
             sort_fields,
-            range,
+            range.clone(),
             sorted_results,
             &idx_path,
             self.config.block_size,
@@ -629,9 +673,12 @@ impl LsmEngine {
             is_full_range: index.range.is_none(),
         };
 
-        // Replace any existing index for the same sort fields
+        // Add alongside existing indexes for the same fields (compaction will merge)
+        // Only replace if the exact same range already exists
         let mut indexes = self.secondary_indexes.lock();
-        if let Some(pos) = indexes.iter().position(|idx| idx.matches_sort(sort_fields)) {
+        if let Some(pos) = indexes.iter().position(|idx| {
+            idx.matches_sort(sort_fields) && idx.range == range
+        }) {
             let old = indexes.remove(pos);
             std::fs::remove_file(&old.path).ok();
         }
@@ -659,6 +706,25 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Replay memtable entries into secondary indexes.
+    /// Called by Database::open() after loading indexes, so that WAL-recovered
+    /// documents that were written after the last index compaction get re-buffered.
+    pub fn replay_memtable_to_indexes(&self) {
+        let indexes = self.secondary_indexes.lock();
+        if indexes.is_empty() {
+            return;
+        }
+        for (_, blob) in self.memtable.iter() {
+            for idx in indexes.iter() {
+                if blob.is_deleted() {
+                    idx.notify_delete(blob.id());
+                } else {
+                    idx.notify_put(&blob);
+                }
+            }
+        }
+    }
+
     /// Full scan: merge all live documents, apply filter/sort/projection/limit.
     pub fn scan(
         &self,
@@ -674,22 +740,27 @@ impl LsmEngine {
             join_edge: None,
         });
 
-        // Try secondary index for sorted scans (ascending only for now)
+        // Try secondary index for sorted scans
         if let Some(sort_fields) = sort {
-            let ascending_fields: Vec<String> = sort_fields.iter()
-                .filter(|sf| sf.direction == SortDirection::Ascending)
-                .map(|sf| sf.field.clone())
-                .collect();
-            if ascending_fields.len() == sort_fields.len() {
-                // All ascending — check for matching index
-                if let Some(result) = self.scan_with_secondary_index(&ascending_fields, filter, limit) {
+            let field_names: Vec<String> = sort_fields.iter().map(|sf| sf.field.clone()).collect();
+            let all_ascending = sort_fields.iter().all(|sf| sf.direction == SortDirection::Ascending);
+            let all_descending = sort_fields.iter().all(|sf| sf.direction == SortDirection::Descending);
+
+            if all_ascending || all_descending {
+                if let Some(result) = self.scan_with_secondary_index(&field_names, filter, limit) {
                     let mut results = result?;
-                    // Apply projection
+                    if all_descending {
+                        results.reverse();
+                        // Re-apply limit after reverse (index scan may have applied limit from the wrong end)
+                        if let Some(lim) = limit {
+                            results.truncate(lim);
+                        }
+                    }
                     if let Some(fields) = project {
                         results = results.into_iter().map(|blob| blob.project(fields)).collect();
                     }
                     let docs_returned = results.len() as u64;
-                    timer.set_docs_scanned(docs_returned); // index scan only touches returned docs
+                    timer.set_docs_scanned(docs_returned);
                     self.query_stats.record(timer.finish(docs_returned));
                     return Ok(results);
                 }
@@ -760,20 +831,23 @@ impl LsmEngine {
             });
         }
 
-        // Spill sorted results to disk as a partial index if above threshold
+        // Spill sorted results to disk as a partial index if above threshold.
+        // Index is always stored in ascending order (descending reads reverse it).
         if let Some(sort_fields) = sort {
-            let ascending_fields: Vec<String> = sort_fields.iter()
-                .filter(|sf| sf.direction == SortDirection::Ascending)
-                .map(|sf| sf.field.clone())
-                .collect();
-            if ascending_fields.len() == sort_fields.len()
+            let field_names: Vec<String> = sort_fields.iter().map(|sf| sf.field.clone()).collect();
+            let all_same_direction = sort_fields.iter().all(|sf| sf.direction == sort_fields[0].direction);
+            if all_same_direction
                 && results.len() > self.config.sort_spill_threshold
             {
-                // Build partial index from the sorted results, replacing any existing one
+                // For descending, reverse results back to ascending before spilling
+                let mut to_spill = results.clone();
+                if sort_fields[0].direction == SortDirection::Descending {
+                    to_spill.reverse();
+                }
                 let _ = self.spill_to_partial_index(
-                    &ascending_fields,
+                    &field_names,
                     filter.cloned(),
-                    &mut results,
+                    &mut to_spill,
                 );
             }
         }
@@ -1722,5 +1796,80 @@ mod tests {
         let filter = Filter::Lt { field: "n".into(), value: Value::U64(10) };
         engine.scan(Some(&filter), Some(&sort), None, None).unwrap();
         assert_eq!(engine.secondary_index_count(), 1, "should replace, not accumulate");
+    }
+
+    #[test]
+    fn test_descending_sort_uses_index() {
+        let (engine, _dir) = test_engine();
+
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // First, ascending scan to create the index
+        let asc_sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+        engine.scan(None, Some(&asc_sort), None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 1);
+
+        // Now descending scan should reuse the same index (reversed)
+        let desc_sort = [SortField { field: "n".into(), direction: SortDirection::Descending }];
+        let results = engine.scan(None, Some(&desc_sort), None, None).unwrap();
+        let ns: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(ns, vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+
+        // Should still be just 1 index (not 2)
+        assert_eq!(engine.secondary_index_count(), 1);
+    }
+
+    #[test]
+    fn test_descending_sort_spills_and_creates_index() {
+        let (engine, _dir) = test_engine();
+
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Descending scan should spill to disk and create an ascending index
+        let desc_sort = [SortField { field: "n".into(), direction: SortDirection::Descending }];
+        let results = engine.scan(None, Some(&desc_sort), None, None).unwrap();
+        let ns: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(ns, vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+        assert_eq!(engine.secondary_index_count(), 1, "descending scan should create ascending index");
+    }
+
+    #[test]
+    fn test_partial_ranges_accumulated() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            sort_spill_threshold: 5,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        for i in 0..20 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Two different filtered scans produce two partial indexes
+        let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+
+        let filter1 = Filter::Lt { field: "n".into(), value: Value::U64(10) };
+        engine.scan(Some(&filter1), Some(&sort), None, None).unwrap();
+
+        let filter2 = Filter::Gt { field: "n".into(), value: Value::U64(5) };
+        engine.scan(Some(&filter2), Some(&sort), None, None).unwrap();
+
+        assert_eq!(engine.secondary_index_count(), 2, "two different ranges should accumulate");
     }
 }
