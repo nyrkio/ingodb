@@ -129,6 +129,47 @@ impl UcsCompaction {
 
         None
     }
+
+    /// Pick ALL eligible compaction groups across all levels.
+    /// Returns multiple independent compaction jobs that can run in parallel.
+    pub fn pick_all_compactions(&self, sstables: &[SstMeta]) -> Vec<CompactionPick> {
+        if sstables.is_empty() {
+            return Vec::new();
+        }
+
+        let t = self.threshold();
+
+        let leveled: Vec<(u32, &SstMeta)> = sstables
+            .iter()
+            .map(|s| (self.level_for_size(s.file_size), s))
+            .collect();
+
+        let max_level = leveled.iter().map(|(l, _)| *l).max().unwrap_or(0);
+
+        let mut levels: std::collections::BTreeMap<u32, Vec<&SstMeta>> =
+            std::collections::BTreeMap::new();
+        for (level, meta) in &leveled {
+            levels.entry(*level).or_default().push(*meta);
+        }
+
+        let mut picks = Vec::new();
+        for (&level, ssts) in &levels {
+            // Find ALL non-overlapping groups at this level that meet threshold
+            let mut remaining: Vec<&SstMeta> = ssts.clone();
+            while let Some(group) = find_overlap_group(&remaining, t) {
+                let group_paths: std::collections::HashSet<PathBuf> =
+                    group.iter().map(|s| s.path.clone()).collect();
+                picks.push(CompactionPick {
+                    inputs: group.iter().map(|s| s.path.clone()).collect(),
+                    output_level: level + 1,
+                    max_level,
+                });
+                // Remove the picked group from remaining
+                remaining.retain(|s| !group_paths.contains(&s.path));
+            }
+        }
+        picks
+    }
 }
 
 /// Result of a compaction pick.

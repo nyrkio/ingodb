@@ -35,6 +35,7 @@ fn main() {
         compaction_threshold: 4,
         scaling_parameter: w,
         sort_spill_threshold: 1000,
+        compaction_threads: 4,
     };
 
     let mode = match w.cmp(&0) {

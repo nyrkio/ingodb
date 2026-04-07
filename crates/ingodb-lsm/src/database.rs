@@ -178,6 +178,7 @@ impl Database {
             compaction_threshold: base.compaction_threshold,
             scaling_parameter: base.scaling_parameter,
             sort_spill_threshold: base.sort_spill_threshold,
+            compaction_threads: base.compaction_threads,
         }
     }
 }
@@ -198,6 +199,7 @@ mod tests {
             compaction_threshold: 4,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let db = Database::open(config).unwrap();
         (db, dir)
@@ -252,6 +254,7 @@ mod tests {
             compaction_threshold: 4,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
 
         let blob = IBlob::from_pairs(vec![
@@ -303,6 +306,7 @@ mod tests {
             compaction_threshold: 4,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
 
         let blob = IBlob::from_pairs(vec![("x", Value::U64(42))]);
@@ -335,6 +339,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
 
         {
@@ -406,6 +411,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
 
         let update_id;

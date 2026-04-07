@@ -56,6 +56,8 @@ pub struct LsmConfig {
     pub scaling_parameter: i32,
     /// Minimum result count before sort spills to disk as a partial index (default 1000)
     pub sort_spill_threshold: usize,
+    /// Number of background compaction threads (default 4)
+    pub compaction_threads: usize,
 }
 
 impl Default for LsmConfig {
@@ -67,6 +69,7 @@ impl Default for LsmConfig {
             compaction_threshold: 4,
             scaling_parameter: 0,
             sort_spill_threshold: secondary::SPILL_THRESHOLD,
+            compaction_threads: 4,
         }
     }
 }
@@ -606,14 +609,16 @@ impl LsmEngine {
         &self.query_stats
     }
 
-    /// Start a background compaction thread. Requires the engine to be in an Arc.
+    /// Start background compaction threads. Requires the engine to be in an Arc.
     /// If not called, compaction runs inline during flush (blocking the writer).
     pub fn start_background_compaction(self: &Arc<Self>) {
         let engine = Arc::clone(self);
         let signal = Arc::clone(&self.compaction_signal);
+        let num_threads = self.config.compaction_threads;
 
+        // Coordinator thread: wakes up, picks all compaction jobs, dispatches to workers
         let handle = std::thread::Builder::new()
-            .name("ingodb-compaction".into())
+            .name("ingodb-compaction-coordinator".into())
             .spawn(move || {
                 loop {
                     // Wait for work or stop signal
@@ -628,16 +633,64 @@ impl LsmEngine {
                         *pending = false;
                     }
 
-                    // Run compaction
                     signal.running.store(true, Ordering::SeqCst);
-                    let _ = engine.maybe_compact();
-                    signal.running.store(false, Ordering::SeqCst);
 
-                    // Notify waiters that compaction finished
+                    // Pick all eligible compaction jobs
+                    let ucs = engine.ucs();
+                    let sstables = engine.sstables.read();
+                    let metas: Vec<SstMeta> = sstables
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| SstMeta {
+                            path: s.path().to_path_buf(),
+                            min_id: s.min_id(),
+                            max_id: s.max_id(),
+                            file_size: s.file_size(),
+                            seq: i as u64,
+                        })
+                        .collect();
+                    drop(sstables);
+
+                    let picks = ucs.pick_all_compactions(&metas);
+
+                    if picks.is_empty() {
+                        // No compaction work — also compact indexes
+                        let _ = engine.maybe_compact_indexes();
+                    } else {
+                        // Dispatch compaction jobs to worker threads
+                        let mut handles = Vec::new();
+                        for pick in picks.into_iter().take(num_threads) {
+                            let engine = Arc::clone(&engine);
+                            handles.push(std::thread::Builder::new()
+                                .name("ingodb-compaction-worker".into())
+                                .spawn(move || {
+                                    let has_snapshots = engine.oldest_snapshot().is_some();
+                                    let mut tombstone_filter = TombstoneFilter::new(
+                                        pick.output_level, pick.max_level, has_snapshots,
+                                    );
+                                    let _ = engine.run_compaction(
+                                        &pick.inputs, Some(&mut tombstone_filter),
+                                    );
+                                })
+                                .expect("failed to spawn compaction worker"));
+                        }
+                        // Wait for all workers to finish
+                        for h in handles {
+                            let _ = h.join();
+                        }
+                        // Compact secondary indexes after primary compaction
+                        let _ = engine.maybe_compact_indexes();
+
+                        // Signal again in case more work was created by compaction output
+                        let mut pending = signal.pending.lock();
+                        *pending = true;
+                    }
+
+                    signal.running.store(false, Ordering::SeqCst);
                     signal.done.notify_all();
                 }
             })
-            .expect("failed to spawn compaction thread");
+            .expect("failed to spawn compaction coordinator");
 
         *self.compaction_thread.lock() = Some(handle);
     }
@@ -1201,6 +1254,7 @@ mod tests {
             compaction_threshold: 4,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
         (engine, dir)
@@ -1258,6 +1312,7 @@ mod tests {
             compaction_threshold: 4,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
 
         let blob = make_blob(42);
@@ -1383,6 +1438,7 @@ mod tests {
             compaction_threshold: 100, // prevent auto-compaction
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
         let id = DocumentId::new();
@@ -1769,6 +1825,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -1806,6 +1863,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -1832,6 +1890,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -1870,6 +1929,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -1928,6 +1988,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2064,6 +2125,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2146,6 +2208,7 @@ mod tests {
             compaction_threshold: 100,
             scaling_parameter: 0,
             sort_spill_threshold: 5,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2215,6 +2278,7 @@ mod tests {
             compaction_threshold: 2, // low threshold to trigger compaction
             scaling_parameter: 0,
             sort_spill_threshold: 1000,
+            compaction_threads: 1,
         };
         let engine = LsmEngine::open(config).unwrap();
 

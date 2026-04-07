@@ -25,6 +25,7 @@ fn test_engine() -> (LsmEngine, tempfile::TempDir) {
         compaction_threshold: 4,
         scaling_parameter: 0,
         sort_spill_threshold: 5,
+            compaction_threads: 1,
     };
     let engine = LsmEngine::open(config).unwrap();
     (engine, dir)
@@ -139,6 +140,7 @@ fn test_survive_restart() {
         compaction_threshold: 4,
         scaling_parameter: 0,
         sort_spill_threshold: 5,
+            compaction_threads: 1,
     };
 
     let user = make_user("Persistent", 99);
@@ -171,6 +173,7 @@ fn test_flush_and_recover_from_sstable() {
         compaction_threshold: 4,
         scaling_parameter: 0,
         sort_spill_threshold: 5,
+            compaction_threads: 1,
     };
 
     let mut ids = Vec::new();
@@ -314,6 +317,7 @@ fn test_delete_survives_restart() {
         compaction_threshold: 100,
         scaling_parameter: 0,
         sort_spill_threshold: 5,
+            compaction_threads: 1,
     };
 
     let user = make_user("RestartDelete", 40);
