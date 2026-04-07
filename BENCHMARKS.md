@@ -6,6 +6,32 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-04-08 — 1M Products, Adaptive W (starting W=0)
+
+1M inserts + 1M random updates + 20K lookups + scans + 2M pure reads.
+Adaptive W enabled, cooldown=1s, max step=±2.
+
+```
+Phase          W    target   read_ratio   SSTables
+────────────────────────────────────────────────────
+Ingest         0→8    8      0.00          22
+Updates        8      8      0.00           4
+Lookups        8      8      —              4
+Scans          8→2   -8      0.40→1.00      4
+Mixed          2     -8      —              4
+Concurrent     2→0   -7      0.95           3
+Pure reads     0→-8  -8      1.00           2
+```
+
+The engine started balanced (W=0), shifted to full tiered (W=8) during
+the write-heavy phase, then gradually shifted back to full leveled (W=-8)
+during the read-heavy phase. 5 compaction runs total, 623 MB read,
+481 MB written (WA=0.77x).
+
+Final state: W=-8 (fully leveled), 2 SSTables, 57K point lookup ops/sec.
+
+---
+
 ## 2026-04-08 — 1M Products with Random Updates, UCS W Comparison
 
 1M inserts + 500K random updates. Compaction settle time and read performance.

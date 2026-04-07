@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NUM_PRODUCTS: u64 = 100_000;
-const NUM_LOOKUPS: u64 = 10_000;
+const NUM_LOOKUPS: u64 = 20_000;
 const NUM_SCAN_QUERIES: u64 = 50;
 const CATEGORIES: &[&str] = &[
     "electronics", "books", "clothing", "home", "sports",
@@ -60,34 +60,41 @@ fn main() {
     let engine = Arc::new(LsmEngine::open(config).unwrap());
     engine.start_background_compaction();
 
-    // Phase 1: Bulk ingest
+    let report_w = |label: &str, engine: &LsmEngine| {
+        println!("  [{label}] W: effective={}, target={}, SSTables={}",
+            engine.effective_w(), engine.target_w(), engine.sstable_count());
+    };
+
+    // Phase 1: Bulk ingest (write-heavy)
     let ids = phase_bulk_ingest(&engine);
-    let t = Instant::now();
-    engine.wait_for_compaction().unwrap();
-    println!("  Compaction settled in {:?} → {} SSTables", t.elapsed(), engine.sstable_count());
+    report_w("after ingest", &engine);
 
-    // Phase 1b: Random updates (creates overlapping key ranges for compaction)
+    // Phase 1b: Random updates — 2x the docs (write-heavy)
     phase_random_updates(&engine, &ids);
-    let t = Instant::now();
-    engine.wait_for_compaction().unwrap();
-    println!("  Compaction settled in {:?} → {} SSTables", t.elapsed(), engine.sstable_count());
+    report_w("after updates", &engine);
 
-    println!("  Effective W: {}, target W: {}", engine.effective_w(), engine.target_w());
-
-    // Phase 2: Point lookups
+    // Phase 2: Point lookups — 2x (read-heavy)
     phase_point_lookups(&engine, &ids);
+    report_w("after lookups", &engine);
 
-    // Phase 3: Scan + sort queries
+    // Phase 3: Scan + sort queries (read-heavy)
     phase_scan_queries(&engine);
+    report_w("after scans", &engine);
 
     // Phase 4: Snapshot reads
     phase_snapshot_reads(&engine, &ids);
 
     // Phase 5: Mixed read/write
     phase_mixed_workload(&engine);
+    report_w("after mixed", &engine);
 
     // Phase 6: Concurrent reads
     phase_concurrent_reads(&engine, &ids);
+    report_w("after concurrent", &engine);
+
+    // Phase 7: Pure read phase — sustained reads, no writes
+    phase_pure_reads(&engine, &ids);
+    report_w("after pure reads", &engine);
 
     // Summary
     println!("\n=== Stats ===");
@@ -195,7 +202,7 @@ fn phase_bulk_ingest(engine: &Arc<LsmEngine>) -> Vec<DocumentId> {
 }
 
 fn phase_random_updates(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
-    let num_updates = NUM_PRODUCTS / 2; // update 50% of docs
+    let num_updates = NUM_PRODUCTS; // update 100% of docs
     println!("\n--- Phase 1b: Random Updates ({} updates to existing docs) ---", num_updates);
 
     let start = Instant::now();
@@ -505,4 +512,23 @@ fn phase_concurrent_reads(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
     let rate = total_ops as f64 / elapsed.as_secs_f64();
     println!("    {} total ops ({} reads, {} writes) in {:?} → {:.0} ops/sec",
         total_ops, total_reads, total_writes, elapsed, rate);
+}
+
+fn phase_pure_reads(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
+    let num_reads = NUM_PRODUCTS * 2;
+    println!("\n--- Phase 7: Pure Reads ({} sequential gets, zero writes) ---", num_reads);
+
+    let start = Instant::now();
+    let mut found = 0u64;
+
+    for i in 0..num_reads {
+        let idx = ((i * 7919 + 2027) % ids.len() as u64) as usize;
+        if engine.get(&ids[idx]).unwrap().is_some() {
+            found += 1;
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let rate = num_reads as f64 / elapsed.as_secs_f64();
+    println!("  {}/{} found, {:.0} ops/sec in {:?}", found, num_reads, rate, elapsed);
 }
