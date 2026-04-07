@@ -632,8 +632,8 @@ mod tests {
             (
                 "refs",
                 Value::Array(vec![
-                    Value::Ref(DocumentId::from_bytes([0xAA; 16])),
-                    Value::Ref(DocumentId::from_bytes([0xBB; 16])),
+                    Value::Uuid(DocumentId::from_bytes([0xAA; 16])),
+                    Value::Uuid(DocumentId::from_bytes([0xBB; 16])),
                 ]),
             ),
         ]);

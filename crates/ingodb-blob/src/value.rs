@@ -20,8 +20,8 @@ pub enum Value {
     String(String),
     /// Raw bytes (opaque to the engine)
     Bytes(Vec<u8>),
-    /// Reference to another document by its stable `_id`
-    Ref(DocumentId),
+    /// UUID value (16 bytes). Often used to store document IDs as field values.
+    Uuid(DocumentId),
     /// Ordered list of values
     Array(Vec<Value>),
     /// Nested document (sorted key-value pairs)
@@ -36,7 +36,7 @@ const TAG_U64: u8 = 3;
 const TAG_F64: u8 = 4;
 const TAG_STRING: u8 = 5;
 const TAG_BYTES: u8 = 6;
-const TAG_REF: u8 = 7;
+const TAG_UUID: u8 = 7;
 const TAG_ARRAY: u8 = 8;
 const TAG_DOCUMENT: u8 = 9;
 
@@ -71,8 +71,8 @@ impl Value {
                 buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 buf.extend_from_slice(b);
             }
-            Value::Ref(id) => {
-                buf.push(TAG_REF);
+            Value::Uuid(id) => {
+                buf.push(TAG_UUID);
                 buf.extend_from_slice(id.as_bytes());
             }
             Value::Array(arr) => {
@@ -144,11 +144,11 @@ impl Value {
                 let b = buf[pos..pos + len].to_vec();
                 Ok((Value::Bytes(b), 5 + len))
             }
-            TAG_REF => {
+            TAG_UUID => {
                 check_len(buf, pos, 16)?;
                 let mut id_bytes = [0u8; 16];
                 id_bytes.copy_from_slice(&buf[pos..pos + 16]);
-                Ok((Value::Ref(DocumentId::from_bytes(id_bytes)), 17))
+                Ok((Value::Uuid(DocumentId::from_bytes(id_bytes)), 17))
             }
             TAG_ARRAY => {
                 check_len(buf, pos, 4)?;
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_ref() {
-        roundtrip(&Value::Ref(DocumentId::from_bytes([0xAB; 16])));
+        roundtrip(&Value::Uuid(DocumentId::from_bytes([0xAB; 16])));
     }
 
     #[test]

@@ -44,7 +44,7 @@ ingodb/                         Top-level API crate (re-exports everything)
 
 - `DocumentId` — Newtype around `[u8; 16]`, a UUIDv7. Stable document identity. Client or server can generate. Lexicographically sortable by creation time.
 - `IBlob` — The document. Has `_id` (DocumentId), `_version` (DocumentId, server-assigned at write time), `hash` (ContentHash), and `fields` (BTreeMap<String, Value>). Binary format v2: `[INGO magic:4][version:2][document_id:16][doc_version:16][content_hash:32][index_count:4][index_entries...][payload...]` (74-byte header).
-- `Value` — Tagged union: Null, Bool, I64, U64, F64, String, Bytes, Ref(DocumentId), Array, Document (nested)
+- `Value` — Tagged union: Null, Bool, I64, U64, F64, String, Bytes, Uuid(DocumentId), Array, Document (nested)
 - `ContentHash` — `[u8; 32]`, BLAKE3 hash covering `_id` + `_version` + `is_deleted` + fields. Full integrity protection — catches corruption of any byte. NOT used as primary key.
 - `CompactionFilter` trait — Extension point for future adaptive morphing during compaction
 - `UcsCompaction` — Unified Compaction Strategy: level assignment by file size, overlap detection, configurable scaling parameter W (leveled/balanced/tiered)
@@ -59,7 +59,7 @@ IngoDB is a **self-morphing LSM-tree storage engine** that adapts its physical d
 - **Object-native ingestion**: Accept arbitrary documents — no schema required at write time. Each document has a stable UUIDv7 `_id` and a server-assigned `_version` for write ordering. BLAKE3 content hash is kept for integrity/dedup.
 - **I-Blob format**: Lazy-parsable with offset index for zero-copy single-field extraction.
 - **Adaptive LSM compaction (UCS-inspired)**: Future work based on Cassandra's Universal Compaction Strategy. During compaction, the engine will morph data layout per level (raw blobs → shredded columns → columnar cold storage).
-- **Graph references via `_id`**: Relationships are `Value::Ref(DocumentId)` embedded in documents. References are stable across updates. Future: engine co-locates related documents during compaction.
+- **Graph traversal as join**: Relationships are not stored as special pointer types. Any field value can become a graph edge at query time via traverse-as-join. The engine observes join patterns and optimizes (indexes, co-location) reactively.
 - **Liquid AST query interface**: Queries are Rust enum ASTs, not SQL strings.
 
 ### Key Design Principles

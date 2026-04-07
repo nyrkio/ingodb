@@ -11,7 +11,7 @@ fn make_user(name: &str, age: u64) -> IBlob {
 fn make_order(user_id: DocumentId, amount: u64) -> IBlob {
     IBlob::from_pairs(vec![
         ("type", Value::String("order".into())),
-        ("user", Value::Ref(user_id)),
+        ("user", Value::Uuid(user_id)),
         ("amount", Value::U64(amount)),
     ])
 }
@@ -52,12 +52,12 @@ fn test_document_lifecycle() {
     assert!(!found_user.version().is_nil(), "version should be stamped");
 
     let found_order = engine.get(&order1_id).unwrap().unwrap();
-    assert_eq!(found_order.get("user"), Some(&Value::Ref(user_id)));
+    assert_eq!(found_order.get("user"), Some(&Value::Uuid(user_id)));
     assert_eq!(found_order.get("amount"), Some(&Value::U64(100)));
 
     // Verify references work: follow order → user via stable _id
     let order2_doc = engine.get(&order2_id).unwrap().unwrap();
-    if let Some(Value::Ref(ref_id)) = order2_doc.get("user") {
+    if let Some(Value::Uuid(ref_id)) = order2_doc.get("user") {
         let referenced_user = engine.get(ref_id).unwrap().unwrap();
         assert_eq!(
             referenced_user.get("name"),
@@ -347,7 +347,7 @@ fn test_delete_with_graph_ref_stable() {
 
     // Order still exists, reference is intact (it's a dangling ref now, but stable)
     let found_order = engine.get(&order_id).unwrap().unwrap();
-    assert_eq!(found_order.get("user"), Some(&Value::Ref(user_id)));
+    assert_eq!(found_order.get("user"), Some(&Value::Uuid(user_id)));
 
     // Re-insert user — order's ref resolves again
     let user2 = IBlob::with_id(user_id, [
