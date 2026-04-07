@@ -6,7 +6,45 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
-## 2026-04-08 — 1M Products, Adaptive W (starting W=0)
+## 2026-04-08 — 1M Products, Adaptive W unlimited step (starting W=0)
+
+Same workload as below but with max_step=16 (effectively unlimited).
+W jumps immediately to the target value.
+
+```
+Phase          W    target   SSTables   Settle time
+──────────────────────────────────────────────────────
+Ingest         0→8    8       23        5.1s
+Updates        8      8        5        9.5s
+Lookups        8      8        5        ~0s
+Scans          8→-8  -8        2        ~0s
+Mixed         -8→-3  -3        2        12.5s
+Concurrent    -3→-8  -8        3        9.1s
+Pure reads    -8     -8        3        0.8s
+```
+
+### Performance Metrics
+
+| Phase | Metric | Value |
+|-------|--------|-------|
+| Ingest | 1M docs | starts 210K/sec, degrades as SSTables grow |
+| Updates | 1M random (W=8, tiered) | settle 9.5s, 5 SSTables |
+| Point lookups | 20K gets (5 SSTables, W=8) | 40K ops/sec, p50=17µs, p95=40µs |
+| Scan cold | after W→-8 jump, 2 SSTables | 7.2s (100K results) |
+| Scan warm (index) | | 5.2s (**1.4x speedup**) |
+| 8-thread concurrent | | 411K ops/sec |
+| Pure reads | 2M gets (3 SSTables, W=-8) | 50K ops/sec |
+| Mixed 80/20 | W adjusted to -3 | 742K ops/sec |
+
+Key observation: the unlimited step causes W to oscillate more aggressively.
+The mixed phase (80% reads, 20% writes) settles at W=-3, which triggers
+12.5s of compaction. With step=±2, this transition is smoother.
+
+Total: 5 compaction runs, 719 MB read, 556 MB written, WA=0.77x.
+
+---
+
+## 2026-04-08 — 1M Products, Adaptive W step=±2 (starting W=0)
 
 1M inserts + 1M random updates + 20K lookups + scans + 2M pure reads.
 Adaptive W enabled, cooldown=1s, max step=±2.

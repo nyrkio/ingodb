@@ -38,7 +38,7 @@ fn main() {
         compaction_threads: 4,
         adaptive_w: w == 0, // enable adaptive W when starting from balanced
         adaptive_w_cooldown_secs: 1, // very short cooldown for benchmarks
-        adaptive_w_max_step: 2,
+        adaptive_w_max_step: 16, // effectively unlimited — jump to target immediately
         adaptive_w_min: -8,
         adaptive_w_max: 8,
     };
@@ -67,18 +67,30 @@ fn main() {
 
     // Phase 1: Bulk ingest (write-heavy)
     let ids = phase_bulk_ingest(&engine);
+    let t = Instant::now();
+    engine.wait_for_compaction().unwrap();
+    println!("  Compaction settled in {:?}", t.elapsed());
     report_w("after ingest", &engine);
 
     // Phase 1b: Random updates — 2x the docs (write-heavy)
     phase_random_updates(&engine, &ids);
+    let t = Instant::now();
+    engine.wait_for_compaction().unwrap();
+    println!("  Compaction settled in {:?}", t.elapsed());
     report_w("after updates", &engine);
 
     // Phase 2: Point lookups — 2x (read-heavy)
     phase_point_lookups(&engine, &ids);
+    let t = Instant::now();
+    engine.wait_for_compaction().unwrap();
+    println!("  Compaction settled in {:?}", t.elapsed());
     report_w("after lookups", &engine);
 
     // Phase 3: Scan + sort queries (read-heavy)
     phase_scan_queries(&engine);
+    let t = Instant::now();
+    engine.wait_for_compaction().unwrap();
+    println!("  Compaction settled in {:?}", t.elapsed());
     report_w("after scans", &engine);
 
     // Phase 4: Snapshot reads
@@ -86,14 +98,23 @@ fn main() {
 
     // Phase 5: Mixed read/write
     phase_mixed_workload(&engine);
+    let t = Instant::now();
+    engine.wait_for_compaction().unwrap();
+    println!("  Compaction settled in {:?}", t.elapsed());
     report_w("after mixed", &engine);
 
     // Phase 6: Concurrent reads
     phase_concurrent_reads(&engine, &ids);
+    let t = Instant::now();
+    engine.wait_for_compaction().unwrap();
+    println!("  Compaction settled in {:?}", t.elapsed());
     report_w("after concurrent", &engine);
 
     // Phase 7: Pure read phase — sustained reads, no writes
     phase_pure_reads(&engine, &ids);
+    let t = Instant::now();
+    engine.wait_for_compaction().unwrap();
+    println!("  Compaction settled in {:?}", t.elapsed());
     report_w("after pure reads", &engine);
 
     // Summary
