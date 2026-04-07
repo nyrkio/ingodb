@@ -5,22 +5,26 @@ use ingodb_blob::{DocumentId, IBlob};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Index entry loaded from an SSTable.
+/// Block index entry with variable-length key.
 #[derive(Debug, Clone)]
 struct BlockIndex {
-    last_id: DocumentId,
+    last_key: Vec<u8>,
     offset: u64,
     size: u32,
 }
 
 /// Reads and queries an SSTable file.
+///
+/// Keys are variable-length byte sequences. For primary SSTables the key
+/// is the 16-byte DocumentId. For secondary indexes the key is the
+/// comparable encoding of field values.
 pub struct SSTableReader {
     path: PathBuf,
     data: Vec<u8>,
     block_indices: Vec<BlockIndex>,
     bloom: BloomFilter,
-    min_id: DocumentId,
-    max_id: DocumentId,
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
 }
 
 impl SSTableReader {
@@ -60,48 +64,49 @@ impl SSTableReader {
         let bloom_num_hashes = u32::from_le_bytes(bloom_data[4..8].try_into().unwrap());
         let bloom = BloomFilter::from_bytes(&bloom_data[8..], bloom_num_bits, bloom_num_hashes);
 
-        // Parse block index — each entry: [id:16][offset:8][size:4] = 28 bytes
-        let index_entry_size = 28;
-        if index_offset + index_count * index_entry_size > data.len() {
-            return Err(SSTableError::Corrupted("index out of bounds".into()));
-        }
-
+        // Parse block index — variable-length entries: [key_len:2][key_bytes][offset:8][size:4]
         let mut block_indices = Vec::with_capacity(index_count);
-        for i in 0..index_count {
-            let base = index_offset + i * index_entry_size;
-            let mut id_bytes = [0u8; 16];
-            id_bytes.copy_from_slice(&data[base..base + 16]);
-            let offset = u64::from_le_bytes(data[base + 16..base + 24].try_into().unwrap());
-            let size = u32::from_le_bytes(data[base + 24..base + 28].try_into().unwrap());
-            block_indices.push(BlockIndex {
-                last_id: DocumentId::from_bytes(id_bytes),
-                offset,
-                size,
-            });
+        let mut pos = index_offset;
+        for _ in 0..index_count {
+            if pos + 2 > footer_start {
+                return Err(SSTableError::Corrupted("index entry truncated".into()));
+            }
+            let key_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if pos + key_len + 12 > footer_start {
+                return Err(SSTableError::Corrupted("index entry truncated".into()));
+            }
+            let last_key = data[pos..pos + key_len].to_vec();
+            pos += key_len;
+            let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            block_indices.push(BlockIndex { last_key, offset, size });
         }
 
         if block_indices.is_empty() {
             return Err(SSTableError::Corrupted("SSTable has no blocks".into()));
         }
 
-        // max_id = last block's last entry
-        let max_id = block_indices.last().unwrap().last_id;
+        // max_key = last block's last key
+        let max_key = block_indices.last().unwrap().last_key.clone();
 
-        // min_id = first entry of first block (decompress minimally)
-        let min_id = Self::extract_first_id(&data, &block_indices[0])?;
+        // min_key = first key of first block
+        let min_key = Self::extract_first_key(&data, &block_indices[0])?;
 
         Ok(SSTableReader {
             path,
             data,
             block_indices,
             bloom,
-            min_id,
-            max_id,
+            min_key,
+            max_key,
         })
     }
 
-    /// Extract the first document ID from a block without full parsing.
-    fn extract_first_id(data: &[u8], block: &BlockIndex) -> Result<DocumentId, SSTableError> {
+    /// Extract the first key from a block without full parsing.
+    fn extract_first_key(data: &[u8], block: &BlockIndex) -> Result<Vec<u8>, SSTableError> {
         let start = block.offset as usize;
         let end = start + block.size as usize;
 
@@ -110,8 +115,6 @@ impl SSTableReader {
         }
 
         let block_data = &data[start..end];
-
-        // Verify CRC
         let stored_crc = u32::from_le_bytes(block_data[0..4].try_into().unwrap());
         let compressed = &block_data[4..];
         let computed_crc = crc32fast::hash(compressed);
@@ -119,28 +122,50 @@ impl SSTableReader {
             return Err(SSTableError::CrcMismatch { offset: block.offset });
         }
 
-        // Decompress
         let decompressed = lz4_flex::decompress_size_prepended(compressed)
             .map_err(|e| SSTableError::Corrupted(format!("LZ4 decompress failed: {e}")))?;
 
-        // First entry starts at offset 4 (after entry_count): [id:16B][blob_len:4B]...
-        if decompressed.len() < 4 + 16 {
-            return Err(SSTableError::Corrupted("block too small for first entry".into()));
+        // First entry: [entry_count:4][key_len:2][key_bytes]...
+        if decompressed.len() < 6 {
+            return Err(SSTableError::Corrupted("block too small".into()));
         }
-
-        let mut id_bytes = [0u8; 16];
-        id_bytes.copy_from_slice(&decompressed[4..20]);
-        Ok(DocumentId::from_bytes(id_bytes))
+        let key_len = u16::from_le_bytes(decompressed[4..6].try_into().unwrap()) as usize;
+        if decompressed.len() < 6 + key_len {
+            return Err(SSTableError::Corrupted("first key truncated".into()));
+        }
+        Ok(decompressed[6..6 + key_len].to_vec())
     }
 
-    /// Smallest document ID in this SSTable.
-    pub fn min_id(&self) -> &DocumentId {
-        &self.min_id
+    /// Smallest key in this SSTable.
+    pub fn min_key(&self) -> &[u8] {
+        &self.min_key
     }
 
-    /// Largest document ID in this SSTable.
-    pub fn max_id(&self) -> &DocumentId {
-        &self.max_id
+    /// Largest key in this SSTable.
+    pub fn max_key(&self) -> &[u8] {
+        &self.max_key
+    }
+
+    /// Convenience: min key as DocumentId (for primary SSTables).
+    pub fn min_id(&self) -> DocumentId {
+        if self.min_key.len() == 16 {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&self.min_key);
+            DocumentId::from_bytes(bytes)
+        } else {
+            DocumentId::nil()
+        }
+    }
+
+    /// Convenience: max key as DocumentId (for primary SSTables).
+    pub fn max_id(&self) -> DocumentId {
+        if self.max_key.len() == 16 {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&self.max_key);
+            DocumentId::from_bytes(bytes)
+        } else {
+            DocumentId::nil()
+        }
     }
 
     /// File size in bytes.
@@ -148,18 +173,16 @@ impl SSTableReader {
         self.data.len() as u64
     }
 
-    /// Point lookup: find a blob by its document ID.
-    /// Returns None if the ID is not in this SSTable.
-    pub fn get(&self, id: &DocumentId) -> Result<Option<IBlob>, SSTableError> {
-        // Check bloom filter first
-        if !self.bloom.may_contain(id.as_bytes()) {
+    /// Point lookup by key bytes.
+    pub fn get(&self, key: &[u8]) -> Result<Option<IBlob>, SSTableError> {
+        if !self.bloom.may_contain(key) {
             return Ok(None);
         }
 
-        // Binary search the block index to find the right block
+        // Binary search block index
         let block_idx = match self
             .block_indices
-            .binary_search_by_key(id, |idx| idx.last_id)
+            .binary_search_by(|idx| idx.last_key.as_slice().cmp(key))
         {
             Ok(i) => i,
             Err(i) => {
@@ -170,19 +193,23 @@ impl SSTableReader {
             }
         };
 
-        // Read and decompress the block
         let block = &self.block_indices[block_idx];
         let entries = self.read_block(block)?;
 
-        // Binary search within the block
-        match entries.binary_search_by_key(id, |(entry_id, _)| *entry_id) {
+        match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
             Ok(i) => Ok(Some(entries[i].1.clone())),
             Err(_) => Ok(None),
         }
     }
 
-    /// Iterate over all entries in the SSTable in ID-sorted order.
-    pub fn iter(&self) -> Result<Vec<(DocumentId, IBlob)>, SSTableError> {
+    /// Convenience: point lookup by DocumentId (for primary SSTables).
+    pub fn get_by_id(&self, id: &DocumentId) -> Result<Option<IBlob>, SSTableError> {
+        self.get(id.as_bytes())
+    }
+
+    /// Iterate over all entries in key-sorted order.
+    /// Returns (key_bytes, IBlob) pairs.
+    pub fn iter(&self) -> Result<Vec<(Vec<u8>, IBlob)>, SSTableError> {
         let mut all_entries = Vec::new();
         for block in &self.block_indices {
             let entries = self.read_block(block)?;
@@ -201,7 +228,7 @@ impl SSTableReader {
         &self.path
     }
 
-    fn read_block(&self, block: &BlockIndex) -> Result<Vec<(DocumentId, IBlob)>, SSTableError> {
+    fn read_block(&self, block: &BlockIndex) -> Result<Vec<(Vec<u8>, IBlob)>, SSTableError> {
         let start = block.offset as usize;
         let end = start + block.size as usize;
 
@@ -229,29 +256,38 @@ impl SSTableReader {
         let decompressed = lz4_flex::decompress_size_prepended(compressed)
             .map_err(|e| SSTableError::Corrupted(format!("LZ4 decompress failed: {e}")))?;
 
-        // Parse entries: [entry_count:4][id:16][blob_len:4][blob_bytes]...
+        // Parse entries: [entry_count:4][key_len:2][key_bytes][blob_len:4][blob_bytes]...
         let entry_count =
             u32::from_le_bytes(decompressed[0..4].try_into().unwrap()) as usize;
         let mut entries = Vec::with_capacity(entry_count);
         let mut pos = 4;
 
         for _ in 0..entry_count {
-            if pos + 20 > decompressed.len() {
-                return Err(SSTableError::Corrupted("truncated entry in block".into()));
+            if pos + 2 > decompressed.len() {
+                return Err(SSTableError::Corrupted("truncated key_len in block".into()));
             }
+            let key_len = u16::from_le_bytes(decompressed[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
 
-            let mut id_bytes = [0u8; 16];
-            id_bytes.copy_from_slice(&decompressed[pos..pos + 16]);
+            if pos + key_len > decompressed.len() {
+                return Err(SSTableError::Corrupted("truncated key in block".into()));
+            }
+            let key = decompressed[pos..pos + key_len].to_vec();
+            pos += key_len;
+
+            if pos + 4 > decompressed.len() {
+                return Err(SSTableError::Corrupted("truncated blob_len in block".into()));
+            }
             let blob_len =
-                u32::from_le_bytes(decompressed[pos + 16..pos + 20].try_into().unwrap()) as usize;
-            pos += 20;
+                u32::from_le_bytes(decompressed[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
 
             if pos + blob_len > decompressed.len() {
                 return Err(SSTableError::Corrupted("truncated blob in block".into()));
             }
 
             let blob = IBlob::decode(&decompressed[pos..pos + blob_len])?;
-            entries.push((DocumentId::from_bytes(id_bytes), blob));
+            entries.push((key, blob));
             pos += blob_len;
         }
 

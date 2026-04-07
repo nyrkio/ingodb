@@ -1,23 +1,13 @@
 use crate::bloom::BloomFilter;
 use crate::error::SSTableError;
+use crate::keys::KeyExtractor;
 use crate::{DEFAULT_BLOCK_SIZE, SSTABLE_MAGIC, SSTABLE_VERSION};
-use ingodb_blob::{DocumentId, IBlob};
+use ingodb_blob::IBlob;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Index entry: points to a data block by the last document ID it contains.
-#[derive(Debug, Clone)]
-struct BlockIndex {
-    /// Last (largest) document ID in this block
-    last_id: DocumentId,
-    /// Byte offset of the block in the file
-    offset: u64,
-    /// Compressed size of the block in bytes
-    size: u32,
-}
-
-/// Writes an SSTable file from sorted (id, blob) pairs.
+/// Writes an SSTable file from IBlobs, sorted by the provided KeyExtractor.
 ///
 /// File layout:
 /// ```text
@@ -26,7 +16,7 @@ struct BlockIndex {
 /// ...
 /// [data block N]
 /// [bloom filter bytes]
-/// [index entries]  — each: [id:16][offset:8][size:4] = 28 bytes
+/// [index entries]  — each: [key_len:2][key_bytes][offset:8][size:4]
 /// [footer: 30B]
 ///   [index_offset: 8B]
 ///   [index_count: 4B]
@@ -39,7 +29,7 @@ struct BlockIndex {
 /// Within each data block (after decompression):
 /// ```text
 /// [entry_count: 4B]
-/// [id:16B][blob_len:4B][blob_bytes] ...repeated
+/// [key_len:2B][key_bytes][blob_len:4B][blob_bytes] ...repeated
 /// ```
 pub struct SSTableWriter {
     block_size: usize,
@@ -56,40 +46,50 @@ impl SSTableWriter {
         SSTableWriter { block_size }
     }
 
-    /// Write an SSTable from sorted entries.
-    /// Entries MUST be sorted by document ID.
+    /// Write an SSTable. Entries are sorted by the KeyExtractor.
     pub fn write(
         &self,
         path: impl AsRef<Path>,
-        entries: &mut [(DocumentId, IBlob)],
+        blobs: &mut [IBlob],
+        key_extractor: &dyn KeyExtractor,
     ) -> Result<(), SSTableError> {
-        if entries.is_empty() {
+        if blobs.is_empty() {
             return Err(SSTableError::Empty);
         }
 
+        // Extract keys, sort by them
+        let mut keyed: Vec<(Vec<u8>, usize)> = blobs
+            .iter()
+            .enumerate()
+            .map(|(i, blob)| (key_extractor.extract_key(blob), i))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        let mut block_indices: Vec<BlockIndex> = Vec::new();
-        let mut bloom = BloomFilter::new(entries.len());
+        let mut block_index_entries: Vec<(Vec<u8>, u64, u32)> = Vec::new(); // (last_key, offset, size)
+        let mut bloom = BloomFilter::new(blobs.len());
 
         // Build data blocks
         let mut current_block = Vec::new();
         let mut block_entry_count = 0u32;
         let mut file_offset = 0u64;
+        let mut last_key_in_block = Vec::new();
 
         // Reserve space for entry count at start of block
         current_block.extend_from_slice(&0u32.to_le_bytes());
 
-        for (id, blob) in entries.iter_mut() {
-            bloom.insert(id.as_bytes());
+        for (key, idx) in &keyed {
+            bloom.insert(key);
 
-            let blob_bytes = blob.encode();
-            let entry_size = 16 + 4 + blob_bytes.len();
+            let blob_bytes = blobs[*idx].encode();
+            let entry_size = 2 + key.len() + 4 + blob_bytes.len();
 
             // If adding this entry would exceed block size, flush current block
             if block_entry_count > 0 && current_block.len() + entry_size > self.block_size {
-                file_offset =
-                    self.flush_block(&mut writer, &current_block, block_entry_count, file_offset, &mut block_indices)?;
+                let (offset, size) = self.flush_block(&mut writer, &current_block, block_entry_count, file_offset)?;
+                block_index_entries.push((last_key_in_block.clone(), offset, size));
+                file_offset = offset + size as u64;
 
                 // Reset block
                 current_block.clear();
@@ -97,36 +97,40 @@ impl SSTableWriter {
                 block_entry_count = 0;
             }
 
-            // Write entry into current block buffer
-            current_block.extend_from_slice(id.as_bytes());
+            // Write entry: [key_len:2][key_bytes][blob_len:4][blob_bytes]
+            current_block.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            current_block.extend_from_slice(key);
             current_block.extend_from_slice(&(blob_bytes.len() as u32).to_le_bytes());
             current_block.extend_from_slice(&blob_bytes);
+            last_key_in_block = key.clone();
             block_entry_count += 1;
         }
 
         // Flush final block
         if block_entry_count > 0 {
-            self.flush_block(&mut writer, &current_block, block_entry_count, file_offset, &mut block_indices)?;
+            let (offset, size) = self.flush_block(&mut writer, &current_block, block_entry_count, file_offset)?;
+            block_index_entries.push((last_key_in_block, offset, size));
         }
 
         // Write bloom filter
-        let bloom_offset = block_indices
+        let bloom_offset = block_index_entries
             .last()
-            .map(|b| b.offset + b.size as u64)
+            .map(|(_, o, s)| *o + *s as u64)
             .unwrap_or(0);
         let bloom_bytes = bloom.as_bytes();
-        let bloom_size = bloom_bytes.len() as u32 + 4 + 4; // data + num_bits + num_hashes
+        let bloom_size = bloom_bytes.len() as u32 + 4 + 4;
         writer.write_all(&(bloom.num_bits() as u32).to_le_bytes())?;
         writer.write_all(&bloom.num_hashes().to_le_bytes())?;
         writer.write_all(bloom_bytes)?;
 
-        // Write index entries
+        // Write index entries: [key_len:2][key_bytes][offset:8][size:4]
         let index_offset = bloom_offset + bloom_size as u64;
-        let index_count = block_indices.len() as u32;
-        for idx in &block_indices {
-            writer.write_all(idx.last_id.as_bytes())?;
-            writer.write_all(&idx.offset.to_le_bytes())?;
-            writer.write_all(&idx.size.to_le_bytes())?;
+        let index_count = block_index_entries.len() as u32;
+        for (key, offset, size) in &block_index_entries {
+            writer.write_all(&(key.len() as u16).to_le_bytes())?;
+            writer.write_all(key)?;
+            writer.write_all(&offset.to_le_bytes())?;
+            writer.write_all(&size.to_le_bytes())?;
         }
 
         // Write footer
@@ -147,8 +151,7 @@ impl SSTableWriter {
         block_data: &[u8],
         entry_count: u32,
         file_offset: u64,
-        block_indices: &mut Vec<BlockIndex>,
-    ) -> Result<u64, SSTableError> {
+    ) -> Result<(u64, u32), SSTableError> {
         // Patch entry count at the start of block data
         let mut data = block_data.to_vec();
         data[..4].copy_from_slice(&entry_count.to_le_bytes());
@@ -163,31 +166,8 @@ impl SSTableWriter {
         writer.write_all(&crc.to_le_bytes())?;
         writer.write_all(&compressed)?;
 
-        let block_size = 4 + compressed.len();
-
-        // Extract last ID from the block for the index
-        let last_id = self.extract_last_id(&data, entry_count);
-
-        block_indices.push(BlockIndex {
-            last_id,
-            offset: file_offset,
-            size: block_size as u32,
-        });
-
-        Ok(file_offset + block_size as u64)
-    }
-
-    fn extract_last_id(&self, block_data: &[u8], entry_count: u32) -> DocumentId {
-        // Walk through entries to find the last ID
-        let mut pos = 4; // skip entry_count
-        let mut last_id = [0u8; 16];
-        for _ in 0..entry_count {
-            last_id.copy_from_slice(&block_data[pos..pos + 16]);
-            let blob_len =
-                u32::from_le_bytes(block_data[pos + 16..pos + 20].try_into().unwrap()) as usize;
-            pos += 20 + blob_len;
-        }
-        DocumentId::from_bytes(last_id)
+        let block_size = (4 + compressed.len()) as u32;
+        Ok((file_offset, block_size))
     }
 }
 

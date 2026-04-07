@@ -1,7 +1,8 @@
 /// Simple bloom filter for SSTable key lookups.
 ///
-/// Uses k=7 hash functions derived from the key bytes for ~1% false positive rate
-/// at 10 bits per key.
+/// Uses k=7 hash functions for ~1% false positive rate at 10 bits per key.
+/// Accepts variable-length key bytes — hashes them via BLAKE3 truncation
+/// to derive the bloom filter bit positions.
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
     bits: Vec<u8>,
@@ -33,11 +34,19 @@ impl BloomFilter {
         }
     }
 
+    /// Derive two 64-bit hash values from arbitrary key bytes.
+    /// Uses BLAKE3 to hash variable-length keys down to 16 bytes.
+    fn hash_key(key: &[u8]) -> (u64, u64) {
+        let h = blake3::hash(key);
+        let bytes = h.as_bytes();
+        let h1 = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let h2 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        (h1, h2)
+    }
+
     /// Add a key to the filter.
-    pub fn insert(&mut self, key: &[u8; 16]) {
-        let h = u128::from_le_bytes(*key);
-        let h1 = h as u64;
-        let h2 = (h >> 64) as u64;
+    pub fn insert(&mut self, key: &[u8]) {
+        let (h1, h2) = Self::hash_key(key);
 
         for i in 0..self.num_hashes {
             let bit_pos = (h1.wrapping_add(h2.wrapping_mul(i as u64))) as usize % self.num_bits;
@@ -47,10 +56,8 @@ impl BloomFilter {
 
     /// Check if a key might be in the filter.
     /// Returns false only if the key is definitely not present.
-    pub fn may_contain(&self, key: &[u8; 16]) -> bool {
-        let h = u128::from_le_bytes(*key);
-        let h1 = h as u64;
-        let h2 = (h >> 64) as u64;
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        let (h1, h2) = Self::hash_key(key);
 
         for i in 0..self.num_hashes {
             let bit_pos = (h1.wrapping_add(h2.wrapping_mul(i as u64))) as usize % self.num_bits;
@@ -95,23 +102,32 @@ mod tests {
     }
 
     #[test]
+    fn test_variable_length_keys() {
+        let mut bf = BloomFilter::new(100);
+        bf.insert(b"short");
+        bf.insert(b"a much longer key value that exceeds 16 bytes");
+
+        assert!(bf.may_contain(b"short"));
+        assert!(bf.may_contain(b"a much longer key value that exceeds 16 bytes"));
+        assert!(!bf.may_contain(b"not inserted"));
+    }
+
+    #[test]
     fn test_false_positive_rate() {
         let n = 1000;
         let mut bf = BloomFilter::new(n);
 
         // Insert n keys
         for i in 0..n {
-            let mut key = [0u8; 16];
-            key[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            bf.insert(&key);
+            let key = format!("key-{i:06}");
+            bf.insert(key.as_bytes());
         }
 
         // Check n keys that were NOT inserted
         let mut false_positives = 0;
         for i in n..2 * n {
-            let mut key = [0u8; 16];
-            key[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            if bf.may_contain(&key) {
+            let key = format!("key-{i:06}");
+            if bf.may_contain(key.as_bytes()) {
                 false_positives += 1;
             }
         }

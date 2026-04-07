@@ -4,7 +4,7 @@ pub mod stats;
 use ingodb_blob::{DocumentId, IBlob, Value};
 use ingodb_memtable::MemTable;
 use ingodb_query::{compare_values, Filter, Query, SortDirection, SortField};
-use ingodb_sstable::{SSTableReader, SSTableWriter};
+use ingodb_sstable::{IdKeyExtractor, SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
 use parking_lot::Mutex;
@@ -217,7 +217,7 @@ impl LsmEngine {
         // Check SSTables (level-ordered: L0 first, within level newest first)
         let sstables = self.sstables.lock();
         for sst in sstables.iter() {
-            if let Some(blob) = sst.get(id)? {
+            if let Some(blob) = sst.get_by_id(id)? {
                 let found = if blob.is_deleted() { None } else { Some(blob) };
                 drop(sstables);
                 self.query_stats.record(timer.finish(if found.is_some() { 1 } else { 0 }));
@@ -237,7 +237,7 @@ impl LsmEngine {
 
     /// Flush the current memtable to a new SSTable.
     pub fn flush_memtable(&self) -> Result<(), LsmError> {
-        let mut entries = self.memtable.drain();
+        let entries = self.memtable.drain();
         if entries.is_empty() {
             return Ok(());
         }
@@ -245,7 +245,9 @@ impl LsmEngine {
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let sst_path = self.config.data_dir.join(format!("{sst_id:012}.sst"));
 
-        SSTableWriter::with_block_size(self.config.block_size).write(&sst_path, &mut entries)?;
+        let mut blobs: Vec<IBlob> = entries.into_iter().map(|(_, blob)| blob).collect();
+        SSTableWriter::with_block_size(self.config.block_size)
+            .write(&sst_path, &mut blobs, &IdKeyExtractor)?;
 
         let reader = SSTableReader::open(&sst_path)?;
 
@@ -282,8 +284,8 @@ impl LsmEngine {
             .enumerate()
             .map(|(i, s)| SstMeta {
                 path: s.path().to_path_buf(),
-                min_id: *s.min_id(),
-                max_id: *s.max_id(),
+                min_id: s.min_id(),
+                max_id: s.max_id(),
                 file_size: s.file_size(),
                 seq: i as u64,
             })
@@ -310,21 +312,22 @@ impl LsmEngine {
         filter: Option<&mut dyn CompactionFilter>,
     ) -> Result<(), LsmError> {
         // Merge all input SSTables
-        let mut merged: Vec<(DocumentId, IBlob)> = Vec::new();
+        let mut merged: Vec<IBlob> = Vec::new();
         for path in inputs {
             let reader = SSTableReader::open(path)?;
-            merged.extend(reader.iter()?);
+            let entries = reader.iter()?;
+            merged.extend(entries.into_iter().map(|(_, blob)| blob));
         }
 
         // Sort by _id, then dedup: for same _id, keep the one with highest _version
-        merged.sort_by(|(id_a, blob_a), (id_b, blob_b)| {
-            id_a.cmp(id_b).then_with(|| blob_b.version().cmp(blob_a.version()))
+        merged.sort_by(|a, b| {
+            a.id().cmp(b.id()).then_with(|| b.version().cmp(a.version()))
         });
-        merged.dedup_by_key(|(id, _)| *id);
+        merged.dedup_by(|a, b| a.id() == b.id());
 
         // Apply compaction filter (tombstone purge + any user filter)
         if let Some(filter) = filter {
-            merged.retain_mut(|(id, blob)| match filter.filter(id, blob) {
+            merged.retain_mut(|blob| match filter.filter(blob.id(), blob) {
                 CompactionAction::Keep => true,
                 CompactionAction::Drop => false,
                 CompactionAction::Transform(new_blob) => {
@@ -347,7 +350,8 @@ impl LsmEngine {
         // Write merged SSTable
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let output_path = self.config.data_dir.join(format!("{sst_id:012}.sst"));
-        SSTableWriter::with_block_size(self.config.block_size).write(&output_path, &mut merged)?;
+        SSTableWriter::with_block_size(self.config.block_size)
+            .write(&output_path, &mut merged, &IdKeyExtractor)?;
         let new_reader = SSTableReader::open(&output_path)?;
 
         // Swap old SSTables for new one
@@ -401,33 +405,33 @@ impl LsmEngine {
             join_edge: None,
         });
 
-        // Collect all entries from memtable + SSTables
-        let mut all: Vec<(DocumentId, IBlob)> = Vec::new();
+        // Collect all IBlobs from memtable + SSTables
+        let mut all: Vec<IBlob> = Vec::new();
 
         // Memtable entries (newest versions)
-        all.extend(self.memtable.iter());
+        all.extend(self.memtable.iter().map(|(_, blob)| blob));
 
         // SSTable entries
         {
             let sstables = self.sstables.lock();
             for sst in sstables.iter() {
-                all.extend(sst.iter()?);
+                all.extend(sst.iter()?.into_iter().map(|(_, blob)| blob));
             }
         }
 
         // Merge: sort by _id, dedup keeping highest _version
-        all.sort_by(|(id_a, _blob_a), (id_b, _blob_b)| {
-            id_a.cmp(id_b).then_with(|| _blob_b.version().cmp(_blob_a.version()))
+        all.sort_by(|a, b| {
+            a.id().cmp(b.id()).then_with(|| b.version().cmp(a.version()))
         });
-        all.dedup_by_key(|(id, _)| *id);
+        all.dedup_by(|a, b| a.id() == b.id());
 
         // Count live documents (docs scanned = after dedup, excluding tombstones)
-        let docs_scanned = all.iter().filter(|(_, b)| !b.is_deleted()).count() as u64;
+        let docs_scanned = all.iter().filter(|b| !b.is_deleted()).count() as u64;
         timer.set_docs_scanned(docs_scanned);
 
         // Filter out tombstones and apply query filter
         let mut results: Vec<IBlob> = Vec::new();
-        for (_, blob) in all {
+        for blob in all {
             if blob.is_deleted() {
                 continue;
             }

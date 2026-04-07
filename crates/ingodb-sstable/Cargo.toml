@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ingodb-blob = { path = "../ingodb-blob" }
+blake3 = { workspace = true }
 lz4_flex = { workspace = true }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }

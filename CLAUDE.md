@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --workspace          # Build all crates
-cargo test --workspace           # Run all 120 tests
+cargo test --workspace           # Run all 128 tests
 cargo test -p ingodb-blob        # Test just the blob format crate
 cargo test -p ingodb-wal         # Test just the WAL crate
 cargo test -p ingodb-memtable    # Test just the memtable crate

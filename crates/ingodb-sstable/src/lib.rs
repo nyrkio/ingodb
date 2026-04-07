@@ -2,11 +2,13 @@ mod writer;
 mod reader;
 mod bloom;
 mod error;
+mod keys;
 
 pub use writer::SSTableWriter;
 pub use reader::SSTableReader;
 pub use bloom::BloomFilter;
 pub use error::SSTableError;
+pub use keys::{encode_comparable_value, IdKeyExtractor, FieldKeyExtractor, KeyExtractor};
 
 /// SSTable file magic: "ISST"
 pub const SSTABLE_MAGIC: [u8; 4] = *b"ISST";
@@ -25,18 +27,15 @@ mod tests {
     use super::*;
     use ingodb_blob::{DocumentId, IBlob, Value};
 
-    fn make_entries(n: usize) -> Vec<(DocumentId, IBlob)> {
-        let mut entries: Vec<_> = (0..n)
+    fn make_entries(n: usize) -> Vec<IBlob> {
+        (0..n)
             .map(|i| {
-                let blob = IBlob::from_pairs(vec![
+                IBlob::from_pairs(vec![
                     ("id", Value::U64(i as u64)),
                     ("name", Value::String(format!("entry-{i}"))),
-                ]);
-                (*blob.id(), blob)
+                ])
             })
-            .collect();
-        entries.sort_by_key(|(id, _)| *id);
-        entries
+            .collect()
     }
 
     #[test]
@@ -44,21 +43,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let mut entries = make_entries(100);
+        let mut blobs = make_entries(100);
+        let extractor = IdKeyExtractor;
 
-        SSTableWriter::new().write(&path, &mut entries).unwrap();
+        SSTableWriter::new().write(&path, &mut blobs, &extractor).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
-        // Verify all entries can be looked up
-        for (id, blob) in &entries {
-            let found = reader.get(id).unwrap().expect("entry not found");
+        // Verify all entries can be looked up by _id
+        for blob in &blobs {
+            let key = extractor.extract_key(blob);
+            let found = reader.get(&key).unwrap().expect("entry not found");
             assert_eq!(found.id(), blob.id());
             assert_eq!(found.fields(), blob.fields());
         }
 
         // Verify a missing key returns None
-        let missing_id = DocumentId::from_bytes([0xFF; 16]);
-        assert!(reader.get(&missing_id).unwrap().is_none());
+        let missing_key = IdKeyExtractor.extract_key(&IBlob::from_pairs(vec![("x", Value::Null)]));
+        assert!(reader.get(&missing_key).unwrap().is_none());
     }
 
     #[test]
@@ -66,14 +67,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("iter.sst");
 
-        let mut entries = make_entries(50);
-        SSTableWriter::new().write(&path, &mut entries).unwrap();
+        let mut blobs = make_entries(50);
+        SSTableWriter::new().write(&path, &mut blobs, &IdKeyExtractor).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         let all = reader.iter().unwrap();
         assert_eq!(all.len(), 50);
 
-        // Verify sorted order
+        // Verify sorted order by key
         for i in 1..all.len() {
             assert!(all[i - 1].0 <= all[i].0);
         }
@@ -84,16 +85,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small_blocks.sst");
 
-        let mut entries = make_entries(20);
+        let mut blobs = make_entries(20);
 
-        // Very small blocks to force multiple blocks
-        SSTableWriter::with_block_size(128).write(&path, &mut entries).unwrap();
+        SSTableWriter::with_block_size(128).write(&path, &mut blobs, &IdKeyExtractor).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
         assert!(reader.block_count() > 1, "expected multiple blocks");
 
-        for (id, blob) in &entries {
-            let found = reader.get(id).unwrap().expect("entry not found");
+        for blob in &blobs {
+            let key = IdKeyExtractor.extract_key(blob);
+            let found = reader.get(&key).unwrap().expect("entry not found");
             assert_eq!(found.id(), blob.id());
         }
     }
@@ -103,27 +104,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("single.sst");
 
-        let mut entries = make_entries(1);
-        SSTableWriter::new().write(&path, &mut entries).unwrap();
+        let mut blobs = make_entries(1);
+        SSTableWriter::new().write(&path, &mut blobs, &IdKeyExtractor).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
-        let found = reader.get(&entries[0].0).unwrap().unwrap();
-        assert_eq!(found.id(), entries[0].1.id());
+        let key = IdKeyExtractor.extract_key(&blobs[0]);
+        let found = reader.get(&key).unwrap().unwrap();
+        assert_eq!(found.id(), blobs[0].id());
     }
 
     #[test]
-    fn test_min_max_id() {
+    fn test_min_max_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("minmax.sst");
 
-        let mut entries = make_entries(50);
-        SSTableWriter::new().write(&path, &mut entries).unwrap();
+        let mut blobs = make_entries(50);
+        SSTableWriter::new().write(&path, &mut blobs, &IdKeyExtractor).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
-        // Entries are sorted by ID, so first is min and last is max
-        assert_eq!(reader.min_id(), &entries.first().unwrap().0);
-        assert_eq!(reader.max_id(), &entries.last().unwrap().0);
-        assert!(reader.file_size() > 0);
+        let all = reader.iter().unwrap();
+        assert_eq!(reader.min_key(), all.first().unwrap().0.as_slice());
+        assert_eq!(reader.max_key(), all.last().unwrap().0.as_slice());
     }
 
     #[test]
@@ -131,11 +132,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("minmax1.sst");
 
-        let mut entries = make_entries(1);
-        SSTableWriter::new().write(&path, &mut entries).unwrap();
+        let mut blobs = make_entries(1);
+        SSTableWriter::new().write(&path, &mut blobs, &IdKeyExtractor).unwrap();
         let reader = SSTableReader::open(&path).unwrap();
 
-        assert_eq!(reader.min_id(), reader.max_id());
-        assert_eq!(reader.min_id(), &entries[0].0);
+        assert_eq!(reader.min_key(), reader.max_key());
+    }
+
+    #[test]
+    fn test_field_key_extractor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("field_sort.sst");
+
+        let mut blobs = vec![
+            IBlob::from_pairs(vec![("name", Value::String("Charlie".into())), ("age", Value::U64(30))]),
+            IBlob::from_pairs(vec![("name", Value::String("Alice".into())), ("age", Value::U64(25))]),
+            IBlob::from_pairs(vec![("name", Value::String("Bob".into())), ("age", Value::U64(35))]),
+        ];
+
+        let extractor = FieldKeyExtractor::new(vec!["name".into()]);
+        SSTableWriter::new().write(&path, &mut blobs, &extractor).unwrap();
+        let reader = SSTableReader::open(&path).unwrap();
+
+        // Iterate — should be sorted by name
+        let all = reader.iter().unwrap();
+        let names: Vec<_> = all.iter()
+            .map(|(_, blob)| blob.get("name").cloned())
+            .collect();
+        assert_eq!(names, vec![
+            Some(Value::String("Alice".into())),
+            Some(Value::String("Bob".into())),
+            Some(Value::String("Charlie".into())),
+        ]);
+
+        // Point lookup by key
+        let alice_key = encode_comparable_value(&Value::String("Alice".into()));
+        let found = reader.get(&alice_key).unwrap().unwrap();
+        assert_eq!(found.get("name"), Some(&Value::String("Alice".into())));
+    }
+
+    #[test]
+    fn test_comparable_encoding_order() {
+        // Verify that byte encoding preserves value ordering
+        let vals = vec![
+            Value::U64(0),
+            Value::U64(1),
+            Value::U64(255),
+            Value::U64(256),
+            Value::U64(u64::MAX),
+        ];
+        let encoded: Vec<Vec<u8>> = vals.iter().map(encode_comparable_value).collect();
+        for i in 1..encoded.len() {
+            assert!(encoded[i - 1] < encoded[i],
+                "encoding should preserve order: {:?} < {:?}", vals[i-1], vals[i]);
+        }
+
+        let strings = vec![
+            Value::String("".into()),
+            Value::String("a".into()),
+            Value::String("ab".into()),
+            Value::String("b".into()),
+        ];
+        let encoded: Vec<Vec<u8>> = strings.iter().map(encode_comparable_value).collect();
+        for i in 1..encoded.len() {
+            assert!(encoded[i - 1] < encoded[i],
+                "string encoding should preserve order: {:?} < {:?}", strings[i-1], strings[i]);
+        }
     }
 }
