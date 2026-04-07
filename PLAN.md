@@ -63,6 +63,11 @@ Each phase produces a working, testable artifact. No phase depends on network or
 - The `KeyExtractor` trait is ready — custom implementations can plug in
 - Comparator functions stored as metadata in the system collection
 
+### Phase 5e: Performance TODOs
+- **Scan performance**: Full scan of 100K docs takes ~200-370ms. Mixed workload with scans hangs — need scan optimization (secondary indexes for filter fields, not just sort fields)
+- **Index speedup modest** (~1.2x): secondary index still does per-document get() lookup back to primary. Consider storing full IBlobs in the index for covered queries.
+- **Bloom filter for MVCC keys**: Currently skipped for prefix lookups. Consider adding a separate _id-only bloom filter alongside the MVCC key bloom.
+
 ### Phase 7: Infrastructure (Future)
 - gRPC server with Liquid AST protocol (tonic)
 - Benchmarks with criterion (external benchmarks can be wired to Nyrkiö)
