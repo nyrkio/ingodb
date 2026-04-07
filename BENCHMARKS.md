@@ -67,6 +67,27 @@ from per-document get() back to primary. Optimization TODO.
 
 ---
 
+## 2026-04-07 — UCS Scaling Parameter Comparison
+
+100K products, 16 MB memtable. At this data size, all W values produce
+3 SSTables — the dataset is too small relative to the memtable to
+trigger enough flushes for W to differentiate. Need larger datasets
+or smaller memtables to see W's effect on SSTable count and read/write
+amplification tradeoffs.
+
+| Metric | W=-4 (leveled) | W=0 (balanced) | W=4 (tiered) |
+|--------|---------------|----------------|--------------|
+| Ingest | 98K docs/sec | 96K docs/sec | 97K docs/sec |
+| SSTables | 3 | 3 | 3 |
+| Point lookup p50 | 28.8 us | 29.1 us | 29.4 us |
+| Point lookup ops/sec | 38K | 37K | 37K |
+| Scan (cold) | 198ms | 196ms | 192ms |
+| 8-thread reads | 242K ops/sec | 260K ops/sec | 252K ops/sec |
+
+All values within noise. Larger benchmark needed to stress UCS differences.
+
+---
+
 ## 2026-04-07 — Pre-RwLock baseline (Mutex on SSTable list)
 
 Before switching SSTable list from Mutex to RwLock.

@@ -22,21 +22,33 @@ const CATEGORIES: &[&str] = &[
 ];
 
 fn main() {
+    let w: i32 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
     let dir = tempfile::tempdir().unwrap();
     let config = LsmConfig {
         data_dir: dir.path().to_path_buf(),
         memtable_size: 16 * 1024 * 1024, // 16 MB
         block_size: 4096,
         compaction_threshold: 4,
-        scaling_parameter: 0,
+        scaling_parameter: w,
         sort_spill_threshold: 1000,
     };
 
+    let mode = match w.cmp(&0) {
+        std::cmp::Ordering::Less => format!("leveled (W={w}, f={}, t=2)", 2 - w),
+        std::cmp::Ordering::Equal => "balanced (W=0, f=2, t=2)".into(),
+        std::cmp::Ordering::Greater => format!("tiered (W={w}, f={}, t={})", 2 + w, 2 + w),
+    };
+
     println!("=== IngoDB Benchmark: E-commerce Product Catalog ===\n");
-    println!("Config: {} products, {} MB memtable, {} byte blocks\n",
+    println!("Config: {} products, {} MB memtable, {} byte blocks, UCS {}\n",
         NUM_PRODUCTS,
         config.memtable_size / 1024 / 1024,
         config.block_size,
+        mode,
     );
 
     let engine = Arc::new(LsmEngine::open(config).unwrap());
