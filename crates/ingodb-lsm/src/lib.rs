@@ -1,10 +1,12 @@
 mod compaction;
+pub mod stats;
 
 use ingodb_blob::{DocumentId, IBlob, Value};
 use ingodb_memtable::MemTable;
 use ingodb_query::{compare_values, Filter, Query, SortDirection, SortField};
 use ingodb_sstable::{SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
+use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,6 +73,8 @@ pub struct LsmEngine {
     sstables: Mutex<Vec<SSTableReader>>,
     /// Counter for generating SSTable file names
     next_sst_id: AtomicU64,
+    /// Query statistics collector
+    query_stats: QueryStats,
 }
 
 impl LsmEngine {
@@ -140,6 +144,7 @@ impl LsmEngine {
             wal: Mutex::new(wal),
             sstables: Mutex::new(sstables),
             next_sst_id: AtomicU64::new(max_id + 1),
+            query_stats: QueryStats::new(),
         })
     }
 
@@ -194,19 +199,34 @@ impl LsmEngine {
     /// (b) compaction merges within a level and outputs to L(x+1) keeping only the highest _version,
     /// so higher levels never have newer versions than lower levels.
     pub fn get(&self, id: &DocumentId) -> Result<Option<IBlob>, LsmError> {
+        let mut timer = QueryTimer::start(QueryPattern {
+            query_type: "get".into(),
+            filter_fields: vec![],
+            sort_fields: vec![],
+            join_edge: None,
+        });
+        timer.set_docs_scanned(1);
+
         // Check memtable first (fastest, always has latest version for a given _id)
         if let Some(blob) = self.memtable.get(id) {
-            return Ok(if blob.is_deleted() { None } else { Some(blob) });
+            let found = if blob.is_deleted() { None } else { Some(blob) };
+            self.query_stats.record(timer.finish(if found.is_some() { 1 } else { 0 }));
+            return Ok(found);
         }
 
         // Check SSTables (level-ordered: L0 first, within level newest first)
         let sstables = self.sstables.lock();
         for sst in sstables.iter() {
             if let Some(blob) = sst.get(id)? {
-                return Ok(if blob.is_deleted() { None } else { Some(blob) });
+                let found = if blob.is_deleted() { None } else { Some(blob) };
+                drop(sstables);
+                self.query_stats.record(timer.finish(if found.is_some() { 1 } else { 0 }));
+                return Ok(found);
             }
         }
+        drop(sstables);
 
+        self.query_stats.record(timer.finish(0));
         Ok(None)
     }
 
@@ -361,6 +381,11 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Access the query statistics collector.
+    pub fn query_stats(&self) -> &QueryStats {
+        &self.query_stats
+    }
+
     /// Full scan: merge all live documents, apply filter/sort/projection/limit.
     pub fn scan(
         &self,
@@ -369,6 +394,13 @@ impl LsmEngine {
         project: Option<&[String]>,
         limit: Option<usize>,
     ) -> Result<Vec<IBlob>, LsmError> {
+        let mut timer = QueryTimer::start(QueryPattern {
+            query_type: "scan".into(),
+            filter_fields: filter.map(extract_filter_fields).unwrap_or_default(),
+            sort_fields: sort.map(|s| s.iter().map(|sf| sf.field.clone()).collect()).unwrap_or_default(),
+            join_edge: None,
+        });
+
         // Collect all entries from memtable + SSTables
         let mut all: Vec<(DocumentId, IBlob)> = Vec::new();
 
@@ -388,6 +420,10 @@ impl LsmEngine {
             id_a.cmp(id_b).then_with(|| _blob_b.version().cmp(_blob_a.version()))
         });
         all.dedup_by_key(|(id, _)| *id);
+
+        // Count live documents (docs scanned = after dedup, excluding tombstones)
+        let docs_scanned = all.iter().filter(|(_, b)| !b.is_deleted()).count() as u64;
+        timer.set_docs_scanned(docs_scanned);
 
         // Filter out tombstones and apply query filter
         let mut results: Vec<IBlob> = Vec::new();
@@ -439,6 +475,10 @@ impl LsmEngine {
             results = results.into_iter().map(|blob| blob.project(fields)).collect();
         }
 
+        // Record stats
+        let docs_returned = results.len() as u64;
+        self.query_stats.record(timer.finish(docs_returned));
+
         Ok(results)
     }
 
@@ -454,11 +494,19 @@ impl LsmEngine {
         to_field: &str,
         depth: usize,
     ) -> Result<Vec<IBlob>, LsmError> {
+        let timer = QueryTimer::start(QueryPattern {
+            query_type: "traverse".into(),
+            filter_fields: start.map(extract_filter_fields).unwrap_or_default(),
+            sort_fields: vec![],
+            join_edge: Some((from_field.into(), to_field.into())),
+        });
+
         if depth == 0 {
+            self.query_stats.record(timer.finish(0));
             return Ok(Vec::new());
         }
 
-        // Get starting documents
+        // Get starting documents (inner scan records its own stats)
         let mut current = self.scan(start, None, None, None)?;
         let mut all_results = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -493,6 +541,8 @@ impl LsmEngine {
             }
         }
 
+        let docs_returned = all_results.len() as u64;
+        self.query_stats.record(timer.finish(docs_returned));
         Ok(all_results)
     }
 

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --workspace          # Build all crates
-cargo test --workspace           # Run all 107 tests
+cargo test --workspace           # Run all 120 tests
 cargo test -p ingodb-blob        # Test just the blob format crate
 cargo test -p ingodb-wal         # Test just the WAL crate
 cargo test -p ingodb-memtable    # Test just the memtable crate
@@ -30,7 +30,8 @@ ingodb/                         Top-level API crate (re-exports everything)
 ├── ingodb-wal                  Write-Ahead Log: append-only, CRC32-checksummed, crash-recoverable
 ├── ingodb-memtable             In-memory sorted BTreeMap of IBlobs, size-bounded with flush signaling
 ├── ingodb-sstable              SSTable writer/reader: LZ4-compressed data blocks, bloom filters, block index
-├── ingodb-lsm                  LSM engine: WAL + MemTable + SSTables, UCS compaction, delete/tombstones
+├── ingodb-lsm                  LSM engine: WAL + MemTable + SSTables, UCS compaction, delete/tombstones,
+│                               scan/sort/filter/projection, traverse-as-join, query statistics
 └── ingodb-query                Liquid AST: enum-based query interface (Get/Scan/Traverse) with filter predicates
 ```
 
@@ -49,6 +50,7 @@ ingodb/                         Top-level API crate (re-exports everything)
 - `CompactionFilter` trait — Extension point for future adaptive morphing during compaction
 - `UcsCompaction` — Unified Compaction Strategy: level assignment by file size, overlap detection, configurable scaling parameter W (leveled/balanced/tiered)
 - `TombstoneFilter` — Purges tombstones during compaction when safe (output at last level)
+- `QueryStats` — Always-on statistics collector tracking per-query-pattern: count, latency, docs scanned vs returned. Exposes `low_selectivity()` for detecting index candidates.
 
 ## Architectural Vision
 

@@ -511,3 +511,81 @@ fn test_traverse_join_by_name() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get("text"), Some(&Value::String("Great product".into())));
 }
+
+#[test]
+fn test_query_stats_recorded() {
+    let (engine, _dir) = test_engine();
+    for i in 0..20 {
+        engine.put(make_user(&format!("User{i}"), i)).unwrap();
+    }
+
+    // Run a filtered scan several times
+    for _ in 0..5 {
+        engine.execute(&Query::Scan {
+            filter: Some(Filter::Gt { field: "age".into(), value: Value::U64(15) }),
+            sort: None,
+            project: None,
+            limit: None,
+        }).unwrap();
+    }
+
+    let stats = engine.query_stats().all_patterns();
+    // Should have at least one "scan" pattern
+    let scan_stats: Vec<_> = stats.iter()
+        .filter(|(p, _)| p.query_type == "scan" && p.filter_fields.contains(&"age".into()))
+        .collect();
+    assert!(!scan_stats.is_empty(), "scan pattern should be recorded");
+
+    let (_, ps) = &scan_stats[0];
+    assert_eq!(ps.count, 5, "should record 5 executions");
+    assert_eq!(ps.total_scanned, 100, "20 docs scanned × 5 runs");
+    assert_eq!(ps.total_returned, 20, "4 docs returned × 5 runs (age 16,17,18,19)");
+    assert!(ps.selectivity() < 0.25, "low selectivity — index candidate");
+}
+
+#[test]
+fn test_query_stats_get() {
+    let (engine, _dir) = test_engine();
+    let blob = make_user("Henrik", 42);
+    let id = *blob.id();
+    engine.put(blob).unwrap();
+
+    engine.get(&id).unwrap();
+    engine.get(&id).unwrap();
+    engine.get(&DocumentId::new()).unwrap(); // miss
+
+    let stats = engine.query_stats().all_patterns();
+    let get_stats: Vec<_> = stats.iter()
+        .filter(|(p, _)| p.query_type == "get")
+        .collect();
+    assert!(!get_stats.is_empty());
+
+    let (_, ps) = &get_stats[0];
+    assert_eq!(ps.count, 3, "3 get calls");
+    assert_eq!(ps.total_returned, 2, "2 hits, 1 miss");
+}
+
+#[test]
+fn test_query_stats_low_selectivity_detection() {
+    let (engine, _dir) = test_engine();
+    for i in 0..100 {
+        engine.put(IBlob::from_pairs(vec![
+            ("type", Value::String("item".into())),
+            ("category", Value::String(format!("cat{}", i % 10))),
+            ("seq", Value::U64(i)),
+        ])).unwrap();
+    }
+
+    // Query that scans 100 docs but returns only ~10 (category = "cat0")
+    for _ in 0..5 {
+        engine.scan(
+            Some(&Filter::Eq { field: "category".into(), value: Value::String("cat0".into()) }),
+            None, None, None,
+        ).unwrap();
+    }
+
+    // Detect index candidates
+    let candidates = engine.query_stats().low_selectivity(0.15, 3);
+    assert!(!candidates.is_empty(), "should detect low-selectivity pattern");
+    assert!(candidates[0].0.filter_fields.contains(&"category".into()));
+}
