@@ -992,6 +992,82 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Try to use a secondary index to accelerate a filter-only scan.
+    /// Works for simple Eq/Gt/Lt/Range filters on a single field that has an index.
+    fn scan_with_filter_index(
+        &self,
+        filter: &Filter,
+        limit: Option<usize>,
+        snapshot: &DocumentId,
+    ) -> Option<Result<Vec<IBlob>, LsmError>> {
+        // Extract the filter field — only simple single-field filters for now
+        let field = match filter {
+            Filter::Eq { field, .. }
+            | Filter::Gt { field, .. }
+            | Filter::Lt { field, .. }
+            | Filter::Range { field, .. } => field.clone(),
+            _ => return None, // compound/exists/not — can't use single-field index
+        };
+
+        // Check if we have an index on this field
+        let indexes = self.secondary_indexes.lock();
+        let index = indexes.iter().find(|idx| {
+            idx.fields.len() == 1 && idx.fields[0] == field
+        })?;
+        index.mark_used();
+
+        // Iterate the index and filter by the predicate
+        let sorted_entries = match index.iter_sorted() {
+            Ok(entries) => entries,
+            Err(e) => return Some(Err(e)),
+        };
+        drop(indexes);
+
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (id, projected) in sorted_entries {
+            if projected.is_deleted() {
+                continue;
+            }
+            // Check if the index entry's field value matches the filter
+            if !filter.matches(&|f| projected.get_field(f)) {
+                continue;
+            }
+            // Fetch the full document from primary
+            match self.get_at(&id, snapshot) {
+                Ok(Some(blob)) => {
+                    // Verify the filter still holds on the full document (stale check)
+                    if !filter.matches(&|f| blob.get_field(f)) {
+                        continue;
+                    }
+                    if seen.insert(*blob.id()) {
+                        results.push(blob);
+                        if let Some(lim) = limit {
+                            if results.len() >= lim {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Also check memtable for docs not in the index
+        for (_, blob) in self.memtable.iter() {
+            if blob.is_deleted() || blob.version() > snapshot {
+                continue;
+            }
+            if filter.matches(&|f| blob.get_field(f)) && seen.insert(*blob.id()) {
+                results.push(blob);
+            }
+        }
+
+        Some(Ok(results))
+    }
+
     /// Number of secondary indexes.
     pub fn secondary_index_count(&self) -> usize {
         self.secondary_indexes.lock().len()
@@ -1082,6 +1158,22 @@ impl LsmEngine {
                 }
             }
         }
+        // Try secondary index for filter-only scans (no sort required)
+        if sort.is_none() {
+            if let Some(filter) = filter {
+                if let Some(result) = self.scan_with_filter_index(filter, limit, snapshot) {
+                    let mut results = result?;
+                    if let Some(fields) = project {
+                        results = results.into_iter().map(|blob| blob.project(fields)).collect();
+                    }
+                    let docs_returned = results.len() as u64;
+                    timer.set_docs_scanned(docs_returned);
+                    self.query_stats.record(timer.finish(docs_returned));
+                    return Ok(results);
+                }
+            }
+        }
+
         } // end secondary index check (latest snapshot only)
 
         // Collect all IBlobs from memtable + SSTables
@@ -2572,6 +2664,49 @@ mod tests {
 
             // TODO: Once flush writes index entries to disk atomically,
             // this test should also verify sorted scan via index works after restart.
+        }
+    }
+
+    #[test]
+    fn test_filter_uses_secondary_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            sort_spill_threshold: 5,
+            compaction_threads: 1,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Insert docs with categories
+        for i in 0..20u64 {
+            let cat = if i % 2 == 0 { "electronics" } else { "books" };
+            engine.put(IBlob::from_pairs(vec![
+                ("category", Value::String(cat.into())),
+                ("n", Value::U64(i)),
+            ])).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Create index on category by doing a sorted scan
+        let sort = [SortField { field: "category".into(), direction: SortDirection::Ascending }];
+        engine.scan(None, Some(&sort), None, None).unwrap();
+        assert!(engine.secondary_index_count() >= 1);
+
+        // Now filter-only scan (no sort) should use the index
+        let results = engine.scan(
+            Some(&Filter::Eq { field: "category".into(), value: Value::String("electronics".into()) }),
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        assert_eq!(results.len(), 10, "should find 10 electronics docs via index");
+        for r in &results {
+            assert_eq!(r.get("category"), Some(&Value::String("electronics".into())));
         }
     }
 }

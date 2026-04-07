@@ -229,10 +229,11 @@ impl SSTableReader {
 
     /// Find the latest entry whose key starts with `prefix` and is <= `max_key`.
     /// Used for MVCC lookups where the key is (_id, _version).
-    fn get_latest_by_prefix(&self, _prefix: &[u8], max_key: &[u8]) -> Result<Option<IBlob>, SSTableError> {
-        // Note: bloom filter check skipped for prefix lookups because the bloom
-        // contains exact key hashes, not prefixes. This is a trade-off: we may
-        // read a block unnecessarily, but correctness is maintained.
+    fn get_latest_by_prefix(&self, prefix: &[u8], max_key: &[u8]) -> Result<Option<IBlob>, SSTableError> {
+        // Check bloom filter with the _id prefix (inserted at write time for MVCC keys)
+        if !self.bloom.may_contain(prefix) {
+            return Ok(None);
+        }
 
         // Binary search for the block that could contain max_key
         let block_idx = match self

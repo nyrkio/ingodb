@@ -81,6 +81,11 @@ impl SSTableWriter {
 
         for (key, idx) in &keyed {
             bloom.insert(key);
+            // For MVCC keys (_id + _version = 32 bytes), also insert the _id prefix
+            // so that point lookups by _id can use the bloom filter.
+            if key.len() > 16 {
+                bloom.insert(&key[..16]);
+            }
 
             let blob_bytes = blobs[*idx].encode();
             let entry_size = 2 + key.len() + 4 + blob_bytes.len();
