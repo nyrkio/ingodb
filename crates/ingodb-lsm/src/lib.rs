@@ -441,19 +441,21 @@ impl LsmEngine {
             .write(&sst_path, &mut blobs, &MvccKeyExtractor)?;
 
         // Step 2: Flush secondary index buffers to disk
-        // This ensures index entries for the flushed data are persisted
-        // before we discard the memtable and WAL.
+        // Only if there are secondary indexes to flush.
         {
             let mut indexes = self.secondary_indexes.lock();
-            let sstables = self.sstables.read();
-            let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
-            let primary_doc_count = sst_refs.iter()
-                .map(|s| s.iter().map(|e| e.len() as u64).unwrap_or(0))
-                .sum::<u64>()
-                + blobs.len() as u64;
+            if !indexes.is_empty() {
+                let sstables = self.sstables.read();
+                let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
+                // Estimate doc count from SSTable count * avg docs per table
+                // (avoid iterating all SSTables which is O(total data))
+                let estimated_doc_count = sst_refs.len() as u64
+                    * (self.config.memtable_size as u64 / 400) // ~400 bytes per doc estimate
+                    + blobs.len() as u64;
 
-            for index in indexes.iter_mut() {
-                let _ = index.compact(&sst_refs, primary_doc_count, self.config.block_size);
+                for index in indexes.iter_mut() {
+                    let _ = index.compact(&sst_refs, estimated_doc_count, self.config.block_size);
+                }
             }
         }
 
@@ -520,6 +522,9 @@ impl LsmEngine {
     /// Compact secondary indexes: drop unused, merge partial ranges, rebuild.
     fn maybe_compact_indexes(&self) -> Result<(), LsmError> {
         let mut indexes = self.secondary_indexes.lock();
+        if indexes.is_empty() {
+            return Ok(());
+        }
 
         // Drop unused indexes
         indexes.retain(|idx| {
@@ -541,10 +546,10 @@ impl LsmEngine {
 
         let sstables = self.sstables.read();
         let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
-        let primary_doc_count = self.memtable.len() as u64
-            + sst_refs.iter()
-                .map(|s| s.iter().map(|e| e.len() as u64).unwrap_or(0))
-                .sum::<u64>();
+        // Estimate doc count without iterating all SSTables (which is O(total data))
+        let estimated_doc_count = sst_refs.len() as u64
+            * (self.config.memtable_size as u64 / 400)
+            + self.memtable.len() as u64;
 
         for (fields, group_indices) in &field_groups {
             if group_indices.len() > 1 {
@@ -584,7 +589,7 @@ impl LsmEngine {
 
         // Compact individual indexes (merge buffer or full rebuild)
         for index in indexes.iter_mut() {
-            let _ = index.compact(&sst_refs, primary_doc_count, self.config.block_size);
+            let _ = index.compact(&sst_refs, estimated_doc_count, self.config.block_size);
         }
 
         Ok(())
