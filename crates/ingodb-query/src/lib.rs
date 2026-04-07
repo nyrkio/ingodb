@@ -16,10 +16,29 @@ pub enum Query {
         limit: Option<usize>,
     },
 
-    /// Follow document references from a starting document
+    /// Graph traversal as join-by-value.
+    ///
+    /// Starting from documents matching `start` filter, follow edges by joining
+    /// `from_field` values against `to_field` values of other documents.
+    /// A simple join is depth=1. Depth>1 repeats the join from the results.
+    ///
+    /// Example: find users referenced by orders
+    /// ```text
+    /// Traverse {
+    ///     start: Some(Eq { field: "type", value: "order" }),
+    ///     from_field: "user_id",
+    ///     to_field: "_id",
+    ///     depth: 1,
+    /// }
+    /// ```
     Traverse {
-        start_id: DocumentId,
-        edge_field: String,
+        /// Filter for starting documents (None = all documents)
+        start: Option<Filter>,
+        /// Field on source documents whose value is the join key
+        from_field: String,
+        /// Field on target documents to match against
+        to_field: String,
+        /// Number of hops (1 = simple join)
         depth: usize,
     },
 }

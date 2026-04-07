@@ -1,6 +1,6 @@
 mod compaction;
 
-use ingodb_blob::{DocumentId, IBlob};
+use ingodb_blob::{DocumentId, IBlob, Value};
 use ingodb_memtable::MemTable;
 use ingodb_query::{Filter, Query};
 use ingodb_sstable::{SSTableReader, SSTableWriter};
@@ -395,7 +395,7 @@ impl LsmEngine {
                 continue;
             }
             if let Some(f) = filter {
-                if !f.matches(&|field| blob.get(field).cloned()) {
+                if !f.matches(&|field| blob.get_field(field)) {
                     continue;
                 }
             }
@@ -414,6 +414,60 @@ impl LsmEngine {
         Ok(results)
     }
 
+    /// Graph traversal as join-by-value.
+    ///
+    /// Starting from documents matching `start` filter, follows edges by joining
+    /// `from_field` values against `to_field` values. Returns the discovered
+    /// documents (not the starting set). Deduplicates by `_id`.
+    pub fn traverse(
+        &self,
+        start: Option<&Filter>,
+        from_field: &str,
+        to_field: &str,
+        depth: usize,
+    ) -> Result<Vec<IBlob>, LsmError> {
+        if depth == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Get starting documents
+        let mut current = self.scan(start, None, None)?;
+        let mut all_results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for _ in 0..depth {
+            // Collect join keys from current documents
+            let join_values: Vec<Value> = current
+                .iter()
+                .filter_map(|blob| blob.get_field(from_field))
+                .collect();
+
+            if join_values.is_empty() {
+                break;
+            }
+
+            // Find target documents where to_field matches any join value
+            let mut next = Vec::new();
+            let candidates = self.scan(None, None, None)?;
+            for doc in candidates {
+                if let Some(target_val) = doc.get_field(to_field) {
+                    if join_values.contains(&target_val) && seen.insert(*doc.id()) {
+                        next.push(doc);
+                    }
+                }
+            }
+
+            all_results.extend(next.iter().cloned());
+            current = next;
+
+            if current.is_empty() {
+                break;
+            }
+        }
+
+        Ok(all_results)
+    }
+
     /// Execute a Liquid AST query.
     pub fn execute(&self, query: &Query) -> Result<Vec<IBlob>, LsmError> {
         match query {
@@ -427,8 +481,8 @@ impl LsmEngine {
                     *limit,
                 )
             }
-            Query::Traverse { .. } => {
-                Err(LsmError::NotImplemented("traverse".into()))
+            Query::Traverse { start, from_field, to_field, depth } => {
+                self.traverse(start.as_ref(), from_field, to_field, *depth)
             }
         }
     }
@@ -759,5 +813,188 @@ mod tests {
             limit: None,
         }).unwrap();
         assert_eq!(results.len(), 3); // n=0,1,2
+    }
+
+    #[test]
+    fn test_traverse_simple_join() {
+        let (engine, _dir) = test_engine();
+
+        // Create users
+        let user1 = IBlob::from_pairs(vec![
+            ("type", Value::String("user".into())),
+            ("name", Value::String("Henrik".into())),
+        ]);
+        let user1_id = *user1.id();
+        engine.put(user1).unwrap();
+
+        let user2 = IBlob::from_pairs(vec![
+            ("type", Value::String("user".into())),
+            ("name", Value::String("Alice".into())),
+        ]);
+        engine.put(user2).unwrap();
+
+        // Create orders referencing users by _id
+        engine.put(IBlob::from_pairs(vec![
+            ("type", Value::String("order".into())),
+            ("user_id", Value::Uuid(user1_id)),
+            ("amount", Value::U64(100)),
+        ])).unwrap();
+
+        // Traverse: from orders, join user_id -> _id to find referenced users
+        let results = engine.traverse(
+            Some(&Filter::Eq { field: "type".into(), value: Value::String("order".into()) }),
+            "user_id",
+            "_id",
+            1,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("name"), Some(&Value::String("Henrik".into())));
+    }
+
+    #[test]
+    fn test_traverse_non_unique_join() {
+        let (engine, _dir) = test_engine();
+
+        // Two users named Henrik
+        for i in 0..2 {
+            engine.put(IBlob::from_pairs(vec![
+                ("type", Value::String("user".into())),
+                ("name", Value::String("Henrik".into())),
+                ("seq", Value::U64(i)),
+            ])).unwrap();
+        }
+
+        // An order referencing "Henrik" by name
+        engine.put(IBlob::from_pairs(vec![
+            ("type", Value::String("order".into())),
+            ("user_name", Value::String("Henrik".into())),
+        ])).unwrap();
+
+        // Traverse: orders.user_name -> users.name (non-unique — should find both)
+        let results = engine.traverse(
+            Some(&Filter::Eq { field: "type".into(), value: Value::String("order".into()) }),
+            "user_name",
+            "name",
+            1,
+        ).unwrap();
+        assert_eq!(results.len(), 2, "non-unique join should find all matches");
+    }
+
+    #[test]
+    fn test_traverse_depth_2() {
+        let (engine, _dir) = test_engine();
+
+        // company -> department -> employee chain
+        let company = IBlob::from_pairs(vec![
+            ("type", Value::String("company".into())),
+            ("name", Value::String("Nyrkio".into())),
+        ]);
+        let company_id = *company.id();
+        engine.put(company).unwrap();
+
+        let dept = IBlob::from_pairs(vec![
+            ("type", Value::String("dept".into())),
+            ("company_id", Value::Uuid(company_id)),
+            ("name", Value::String("Engineering".into())),
+        ]);
+        let dept_id = *dept.id();
+        engine.put(dept).unwrap();
+
+        let emp = IBlob::from_pairs(vec![
+            ("type", Value::String("employee".into())),
+            ("dept_id", Value::Uuid(dept_id)),
+            ("name", Value::String("Henrik".into())),
+        ]);
+        engine.put(emp).unwrap();
+
+        // Depth 1: company -> departments (join company _id -> dept.company_id)
+        let depts = engine.traverse(
+            Some(&Filter::Eq { field: "type".into(), value: Value::String("company".into()) }),
+            "_id",
+            "company_id",
+            1,
+        ).unwrap();
+        assert_eq!(depts.len(), 1);
+        assert_eq!(depts[0].get("name"), Some(&Value::String("Engineering".into())));
+
+        // Depth 2: company -> dept -> employees (same edge pattern repeated)
+        // For depth>1 with the same edge, we need the same from/to fields to chain.
+        // Here the chain is: company._id -> dept.company_id at hop 1,
+        // then dept._id -> emp.dept_id at hop 2... but that's DIFFERENT edges.
+        // Depth>1 with same edge only works for self-referential graphs.
+        // For now, depth>1 repeats the same edge. So let's test that:
+
+        // Self-referential: manager chain
+        let ceo = IBlob::from_pairs(vec![
+            ("role", Value::String("CEO".into())),
+            ("name", Value::String("Boss".into())),
+        ]);
+        let ceo_id = *ceo.id();
+        engine.put(ceo).unwrap();
+
+        let vp = IBlob::from_pairs(vec![
+            ("role", Value::String("VP".into())),
+            ("name", Value::String("Manager".into())),
+            ("reports_to", Value::Uuid(ceo_id)),
+        ]);
+        let vp_id = *vp.id();
+        engine.put(vp).unwrap();
+
+        let dev = IBlob::from_pairs(vec![
+            ("role", Value::String("Dev".into())),
+            ("name", Value::String("Coder".into())),
+            ("reports_to", Value::Uuid(vp_id)),
+        ]);
+        engine.put(dev).unwrap();
+
+        // From dev, follow reports_to -> _id, depth 2
+        let chain = engine.traverse(
+            Some(&Filter::Eq { field: "role".into(), value: Value::String("Dev".into()) }),
+            "reports_to",
+            "_id",
+            2,
+        ).unwrap();
+        assert_eq!(chain.len(), 2, "depth 2 should find VP and CEO");
+    }
+
+    #[test]
+    fn test_traverse_no_matches() {
+        let (engine, _dir) = test_engine();
+        engine.put(make_blob(1)).unwrap();
+
+        let results = engine.traverse(
+            Some(&Filter::Eq { field: "n".into(), value: Value::U64(1) }),
+            "nonexistent_field",
+            "_id",
+            1,
+        ).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_traverse_depth_zero() {
+        let (engine, _dir) = test_engine();
+        engine.put(make_blob(1)).unwrap();
+
+        let results = engine.traverse(None, "_id", "_id", 0).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_filter_on_id() {
+        let (engine, _dir) = test_engine();
+        let blob = make_blob(42);
+        let id = *blob.id();
+        engine.put(blob).unwrap();
+        engine.put(make_blob(1)).unwrap();
+
+        // Scan filtering on _id
+        let results = engine.scan(
+            Some(&Filter::Eq { field: "_id".into(), value: Value::Uuid(id) }),
+            None,
+            None,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("n"), Some(&Value::U64(42)));
     }
 }

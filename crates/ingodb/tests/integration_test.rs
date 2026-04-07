@@ -442,3 +442,69 @@ fn test_scan_skips_deleted() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get("name"), Some(&Value::String("Keep".into())));
 }
+
+#[test]
+fn test_traverse_orders_to_users() {
+    let (engine, _dir) = test_engine();
+
+    // Users
+    let user1 = make_user("Henrik", 42);
+    let user1_id = *user1.id();
+    engine.put(user1).unwrap();
+
+    let user2 = make_user("Alice", 30);
+    let user2_id = *user2.id();
+    engine.put(user2).unwrap();
+
+    // Orders referencing users by _id stored as a Uuid field
+    engine.put(make_order(user1_id, 100)).unwrap();
+    engine.put(make_order(user1_id, 200)).unwrap();
+    engine.put(make_order(user2_id, 50)).unwrap();
+
+    // Find users referenced by orders over 75
+    let results = engine.execute(&Query::Traverse {
+        start: Some(Filter::Gt { field: "amount".into(), value: Value::U64(75) }),
+        from_field: "user".into(),
+        to_field: "_id".into(),
+        depth: 1,
+    }).unwrap();
+
+    // Orders over 75: two orders for Henrik (100, 200). Should find Henrik (deduplicated).
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("name"), Some(&Value::String("Henrik".into())));
+}
+
+#[test]
+fn test_traverse_join_by_name() {
+    let (engine, _dir) = test_engine();
+
+    // Users and their reviews — joined by name, not by _id
+    engine.put(make_user("Henrik", 42)).unwrap();
+    engine.put(make_user("Alice", 30)).unwrap();
+
+    engine.put(IBlob::from_pairs(vec![
+        ("type", Value::String("review".into())),
+        ("author", Value::String("Henrik".into())),
+        ("text", Value::String("Great product".into())),
+    ])).unwrap();
+
+    engine.put(IBlob::from_pairs(vec![
+        ("type", Value::String("review".into())),
+        ("author", Value::String("Alice".into())),
+        ("text", Value::String("Not bad".into())),
+    ])).unwrap();
+
+    // From Henrik's user doc, find reviews by joining name -> author
+    let results = engine.execute(&Query::Traverse {
+        start: Some(Filter::And(vec![
+            Filter::Eq { field: "type".into(), value: Value::String("user".into()) },
+            Filter::Eq { field: "name".into(), value: Value::String("Henrik".into()) },
+        ])),
+        from_field: "name".into(),
+        to_field: "author".into(),
+        depth: 1,
+    }).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("text"), Some(&Value::String("Great product".into())));
+}

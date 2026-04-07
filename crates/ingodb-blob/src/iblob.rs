@@ -169,9 +169,19 @@ impl IBlob {
         &self.fields
     }
 
-    /// Get a field by name.
+    /// Get a field by name. Only looks in user fields, not metadata.
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.fields.get(key)
+    }
+
+    /// Get a field by name, including virtual metadata fields `_id` and `_version`.
+    /// Returns owned Value since metadata fields are constructed on the fly.
+    pub fn get_field(&self, key: &str) -> Option<Value> {
+        match key {
+            "_id" => Some(Value::Uuid(self.id)),
+            "_version" => Some(Value::Uuid(self.version)),
+            _ => self.fields.get(key).cloned(),
+        }
     }
 
     /// Number of fields.
