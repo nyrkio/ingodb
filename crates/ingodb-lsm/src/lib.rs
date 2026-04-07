@@ -12,7 +12,7 @@ use ingodb_sstable::{IdKeyExtractor, SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
 use parking_lot::Mutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
@@ -81,6 +81,17 @@ pub struct LsmEngine {
     query_stats: QueryStats,
     /// Secondary indexes (sorted by non-_id fields)
     secondary_indexes: Mutex<Vec<secondary::SecondaryIndex>>,
+    /// Newly built indexes awaiting persistence (collection_name not known here — Database handles it)
+    pending_index_metadata: Mutex<Vec<IndexMetadata>>,
+}
+
+/// Metadata about a secondary index, for persistence in the system collection.
+#[derive(Debug, Clone)]
+pub struct IndexMetadata {
+    /// Fields the index covers
+    pub fields: Vec<String>,
+    /// Path to the index SSTable file
+    pub path: PathBuf,
 }
 
 impl LsmEngine {
@@ -152,6 +163,7 @@ impl LsmEngine {
             next_sst_id: AtomicU64::new(max_id + 1),
             query_stats: QueryStats::new(),
             secondary_indexes: Mutex::new(Vec::new()),
+            pending_index_metadata: Mutex::new(Vec::new()),
         })
     }
 
@@ -422,6 +434,11 @@ impl LsmEngine {
         )?;
         drop(sstables);
 
+        let meta = IndexMetadata {
+            fields: sort_fields.to_vec(),
+            path: idx_path,
+        };
+        self.pending_index_metadata.lock().push(meta);
         self.secondary_indexes.lock().push(index);
         Ok(())
     }
@@ -526,6 +543,18 @@ impl LsmEngine {
     /// Number of secondary indexes.
     pub fn secondary_index_count(&self) -> usize {
         self.secondary_indexes.lock().len()
+    }
+
+    /// Drain newly built index metadata (for persistence by Database).
+    pub fn drain_pending_index_metadata(&self) -> Vec<IndexMetadata> {
+        std::mem::take(&mut *self.pending_index_metadata.lock())
+    }
+
+    /// Load an existing secondary index from disk.
+    pub fn load_secondary_index(&self, fields: Vec<String>, path: &Path) -> Result<(), LsmError> {
+        let index = secondary::SecondaryIndex::open(fields, path)?;
+        self.secondary_indexes.lock().push(index);
+        Ok(())
     }
 
     /// Full scan: merge all live documents, apply filter/sort/projection/limit.

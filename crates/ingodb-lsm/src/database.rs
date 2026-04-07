@@ -1,4 +1,5 @@
 use crate::{LsmConfig, LsmEngine, LsmError};
+use ingodb_blob::{IBlob, Value};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ impl Database {
     /// Open or create a database at the given directory.
     /// Creates the `system` collection if it doesn't exist.
     /// Discovers and opens existing collection subdirectories.
+    /// Loads secondary index metadata from the system collection.
     pub fn open(config: LsmConfig) -> Result<Self, LsmError> {
         std::fs::create_dir_all(&config.data_dir)?;
 
@@ -48,6 +50,36 @@ impl Database {
             collections.insert("system".to_string(), engine);
         }
 
+        // Load secondary index metadata from system collection
+        let system = collections.get("system").unwrap();
+        let all_docs = system.scan(None, None, None, None)?;
+        for doc in &all_docs {
+            if doc.get("type") == Some(&Value::String("index".into())) {
+                let coll_name = match doc.get("collection") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                let fields_str = match doc.get("fields") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                let idx_path = match doc.get("path") {
+                    Some(Value::String(s)) => PathBuf::from(s),
+                    _ => continue,
+                };
+
+                let fields: Vec<String> = fields_str.split(',').map(|s| s.to_string()).collect();
+
+                if let Some(engine) = collections.get(&coll_name) {
+                    if idx_path.exists() {
+                        if let Err(e) = engine.load_secondary_index(fields, &idx_path) {
+                            eprintln!("warning: failed to load index {}: {e}", idx_path.display());
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Database {
             data_dir,
             config,
@@ -55,10 +87,7 @@ impl Database {
         })
     }
 
-    /// Get a reference to a collection's engine, creating it if it doesn't exist.
-    ///
-    /// Note: Returns a reference that borrows the Mutex guard. For longer-lived
-    /// access, use `with_collection()`.
+    /// Ensure a collection exists.
     pub fn collection(&self, name: &str) -> Result<(), LsmError> {
         let mut collections = self.collections.lock();
         if !collections.contains_key(name) {
@@ -70,15 +99,35 @@ impl Database {
     }
 
     /// Execute a closure with access to a collection's engine.
+    /// After the closure, persists any newly built index metadata to the system collection.
     pub fn with_collection<F, R>(&self, name: &str, f: F) -> Result<R, LsmError>
     where
         F: FnOnce(&LsmEngine) -> Result<R, LsmError>,
     {
-        // Ensure collection exists
         self.collection(name)?;
         let collections = self.collections.lock();
         let engine = collections.get(name).unwrap();
-        f(engine)
+        let result = f(engine)?;
+
+        // Persist any newly built secondary indexes
+        let pending = engine.drain_pending_index_metadata();
+        if !pending.is_empty() {
+            if let Some(system) = collections.get("system") {
+                for meta in pending {
+                    let fields_str = meta.fields.join(",");
+                    let path_str = meta.path.to_string_lossy().to_string();
+                    let blob = IBlob::from_pairs(vec![
+                        ("type", Value::String("index".into())),
+                        ("collection", Value::String(name.to_string())),
+                        ("fields", Value::String(fields_str)),
+                        ("path", Value::String(path_str)),
+                    ]);
+                    system.put(blob)?;
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Access the system collection directly.
@@ -130,7 +179,9 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ingodb_blob::{IBlob, Value};
+    use ingodb_blob::{DocumentId, Value};
+    use ingodb_query::{Filter, SortDirection, SortField};
+    use crate::secondary;
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -172,22 +223,15 @@ mod tests {
         let blob = IBlob::from_pairs(vec![("name", Value::String("Henrik".into()))]);
         let id = *blob.id();
 
-        // Put in users collection
         db.with_collection("users", |engine| {
             engine.put(blob)?;
             Ok(())
         }).unwrap();
 
-        // Should exist in users
-        let found = db.with_collection("users", |engine| {
-            engine.get(&id)
-        }).unwrap();
+        let found = db.with_collection("users", |engine| engine.get(&id)).unwrap();
         assert!(found.is_some());
 
-        // Should NOT exist in orders
-        let found = db.with_collection("orders", |engine| {
-            engine.get(&id)
-        }).unwrap();
+        let found = db.with_collection("orders", |engine| engine.get(&id)).unwrap();
         assert!(found.is_none());
     }
 
@@ -269,6 +313,76 @@ mod tests {
             assert!(db.list_collections().contains(&"mydata".to_string()));
             let found = db.with_collection("mydata", |engine| engine.get(&id)).unwrap();
             assert!(found.is_some(), "collection data survives restart");
+        }
+    }
+
+    #[test]
+    fn test_index_metadata_persisted_in_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+        };
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+
+            // Insert docs and flush
+            db.with_collection("users", |engine| {
+                for i in 0..10u64 {
+                    engine.put(IBlob::from_pairs(vec![
+                        ("name", Value::String(format!("User{i}"))),
+                        ("age", Value::U64(i)),
+                    ]))?;
+                }
+                engine.flush_memtable()?;
+                Ok(())
+            }).unwrap();
+
+            // Trigger reactive index creation
+            let sort = [SortField { field: "age".into(), direction: SortDirection::Ascending }];
+            for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
+                db.with_collection("users", |engine| {
+                    engine.scan(None, Some(&sort), None, None)?;
+                    Ok(())
+                }).unwrap();
+            }
+
+            // Verify index was built
+            let count = db.with_collection("users", |engine| {
+                Ok(engine.secondary_index_count())
+            }).unwrap();
+            assert_eq!(count, 1, "index should be built");
+
+            // Verify metadata in system collection
+            let system_docs = db.system(|engine| {
+                engine.scan(None, None, None, None)
+            }).unwrap();
+            let index_docs: Vec<_> = system_docs.iter()
+                .filter(|d| d.get("type") == Some(&Value::String("index".into())))
+                .collect();
+            assert_eq!(index_docs.len(), 1, "index metadata should be in system");
+            assert_eq!(index_docs[0].get("collection"), Some(&Value::String("users".into())));
+            assert_eq!(index_docs[0].get("fields"), Some(&Value::String("age".into())));
+        }
+
+        // Restart and verify index is loaded
+        {
+            let db = Database::open(config).unwrap();
+            let count = db.with_collection("users", |engine| {
+                Ok(engine.secondary_index_count())
+            }).unwrap();
+            assert_eq!(count, 1, "index should survive restart via system collection");
+
+            // Verify it works
+            let sort = [SortField { field: "age".into(), direction: SortDirection::Ascending }];
+            let results = db.with_collection("users", |engine| {
+                engine.scan(None, Some(&sort), None, None)
+            }).unwrap();
+            assert_eq!(results.len(), 10);
         }
     }
 }
