@@ -32,6 +32,11 @@ impl DocumentId {
         &self.0
     }
 
+    /// Maximum possible ID (all 0xFF bytes). Used as snapshot version meaning "latest".
+    pub fn max() -> Self {
+        DocumentId([0xFF; 16])
+    }
+
     /// A nil (all-zeros) ID, used as a sentinel for unset `_version`.
     pub fn nil() -> Self {
         DocumentId([0; 16])

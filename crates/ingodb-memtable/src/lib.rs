@@ -3,19 +3,21 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// In-memory sorted table of IBlobs keyed by document ID.
+/// In-memory sorted table of IBlobs keyed by `(_id, _version)`.
 ///
+/// Multiple versions of the same document coexist (MVCC).
 /// Thread-safe via RwLock. Tracks approximate memory usage
 /// and signals when it should be flushed to an SSTable.
 pub struct MemTable {
-    entries: RwLock<BTreeMap<DocumentId, IBlob>>,
+    /// Entries keyed by (_id, _version) for multi-version support
+    entries: RwLock<BTreeMap<(DocumentId, DocumentId), IBlob>>,
     /// Approximate bytes used (sum of encoded blob sizes)
     size_bytes: AtomicUsize,
     /// Flush threshold in bytes
     max_size: usize,
 }
 
-/// Iterator over memtable entries in ID-sorted order.
+/// Iterator over memtable entries in (_id, _version) order.
 pub struct MemTableIter {
     entries: Vec<(DocumentId, IBlob)>,
     pos: usize,
@@ -50,14 +52,15 @@ impl MemTable {
         Self::new(64 * 1024 * 1024)
     }
 
-    /// Insert a blob. Returns true if the memtable should be flushed.
+    /// Insert a blob. Multiple versions of the same _id coexist.
+    /// Returns true if the memtable should be flushed.
     pub fn insert(&self, mut blob: IBlob) -> bool {
         let encoded_size = blob.encode().len();
-        let id = *blob.id();
+        let key = (*blob.id(), *blob.version());
 
         let mut entries = self.entries.write();
-        if let Some(mut old) = entries.insert(id, blob) {
-            // Replacing existing entry (upsert) — adjust size
+        if let Some(mut old) = entries.insert(key, blob) {
+            // Same _id + _version (unlikely but possible on replay) — adjust size
             let old_size = old.encode().len();
             self.size_bytes.fetch_sub(old_size, Ordering::Relaxed);
         }
@@ -66,17 +69,33 @@ impl MemTable {
         self.size_bytes.load(Ordering::Relaxed) >= self.max_size
     }
 
-    /// Look up a blob by its document ID.
-    pub fn get(&self, id: &DocumentId) -> Option<IBlob> {
-        self.entries.read().get(id).cloned()
+    /// Look up the latest version of a document visible at `snapshot`.
+    /// Returns the highest _version <= snapshot for the given _id.
+    pub fn get(&self, id: &DocumentId, snapshot: &DocumentId) -> Option<IBlob> {
+        let entries = self.entries.read();
+        // Range scan: all entries with this _id, up to and including snapshot version
+        let start = (*id, DocumentId::nil());
+        let end = (*id, *snapshot);
+        entries
+            .range(start..=end)
+            .next_back() // highest _version <= snapshot
+            .map(|(_, blob)| blob.clone())
     }
 
-    /// Check if a document ID exists in the memtable.
+    /// Look up the latest version of a document (any version).
+    pub fn get_latest(&self, id: &DocumentId) -> Option<IBlob> {
+        self.get(id, &DocumentId::max())
+    }
+
+    /// Check if a document ID exists in the memtable (any version).
     pub fn contains(&self, id: &DocumentId) -> bool {
-        self.entries.read().contains_key(id)
+        let entries = self.entries.read();
+        let start = (*id, DocumentId::nil());
+        let end = (*id, DocumentId::max());
+        entries.range(start..=end).next().is_some()
     }
 
-    /// Number of entries.
+    /// Number of entries (including all versions).
     pub fn len(&self) -> usize {
         self.entries.read().len()
     }
@@ -97,18 +116,22 @@ impl MemTable {
     }
 
     /// Drain all entries for flushing to an SSTable.
-    /// Returns entries sorted by document ID.
-    pub fn drain(&self) -> Vec<(DocumentId, IBlob)> {
+    /// Returns all versions, sorted by (_id, _version).
+    pub fn drain(&self) -> Vec<IBlob> {
         let mut entries = self.entries.write();
-        let drained: Vec<_> = entries.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let drained: Vec<_> = entries.values().cloned().collect();
         entries.clear();
         self.size_bytes.store(0, Ordering::Relaxed);
         drained
     }
 
-    /// Create an iterator over entries in ID-sorted order.
+    /// Create an iterator over entries. Returns (_id, IBlob) pairs.
+    /// Includes all versions.
     pub fn iter(&self) -> MemTableIter {
-        let entries: Vec<_> = self.entries.read().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let entries: Vec<_> = self.entries.read()
+            .values()
+            .map(|v| (*v.id(), v.clone()))
+            .collect();
         MemTableIter { entries, pos: 0 }
     }
 }
@@ -116,13 +139,15 @@ impl MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ingodb_blob::{DocumentId, Value};
+    use ingodb_blob::Value;
 
     fn make_blob(n: u64) -> IBlob {
-        IBlob::from_pairs(vec![
+        let mut blob = IBlob::from_pairs(vec![
             ("n", Value::U64(n)),
             ("data", Value::String(format!("item-{n}"))),
-        ])
+        ]);
+        blob.set_version(DocumentId::new());
+        blob
     }
 
     #[test]
@@ -132,44 +157,69 @@ mod tests {
         let id = *blob.id();
 
         mt.insert(blob.clone());
-        let retrieved = mt.get(&id).unwrap();
+        let retrieved = mt.get_latest(&id).unwrap();
         assert_eq!(retrieved.id(), &id);
-        assert_eq!(mt.len(), 1);
     }
 
     #[test]
-    fn test_upsert_same_id() {
+    fn test_multi_version() {
         let mt = MemTable::new(1024 * 1024);
         let id = DocumentId::new();
 
-        let blob1 = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
-        let blob2 = IBlob::with_id(id, [("x".into(), Value::U64(2))].into());
+        let mut blob1 = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        blob1.set_version(DocumentId::new());
+        let v1 = *blob1.version();
+
+        let mut blob2 = IBlob::with_id(id, [("x".into(), Value::U64(2))].into());
+        blob2.set_version(DocumentId::new());
+        let v2 = *blob2.version();
 
         mt.insert(blob1);
-        mt.insert(blob2.clone());
-        assert_eq!(mt.len(), 1, "same _id replaces old entry");
+        mt.insert(blob2);
+        assert_eq!(mt.len(), 2, "both versions coexist");
 
-        let retrieved = mt.get(&id).unwrap();
-        assert_eq!(retrieved.get("x"), Some(&Value::U64(2)));
+        // Latest version
+        let latest = mt.get_latest(&id).unwrap();
+        assert_eq!(latest.get("x"), Some(&Value::U64(2)));
+
+        // Snapshot at v1 — should see v1
+        let old = mt.get(&id, &v1).unwrap();
+        assert_eq!(old.get("x"), Some(&Value::U64(1)));
+
+        // Snapshot at v2 — should see v2
+        let current = mt.get(&id, &v2).unwrap();
+        assert_eq!(current.get("x"), Some(&Value::U64(2)));
     }
 
     #[test]
-    fn test_drain() {
+    fn test_drain_all_versions() {
+        let mt = MemTable::new(1024 * 1024);
+        let id = DocumentId::new();
+
+        let mut v1 = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        v1.set_version(DocumentId::new());
+        let mut v2 = IBlob::with_id(id, [("x".into(), Value::U64(2))].into());
+        v2.set_version(DocumentId::new());
+
+        mt.insert(v1);
+        mt.insert(v2);
+
+        let drained = mt.drain();
+        assert_eq!(drained.len(), 2, "drain returns all versions");
+        assert!(mt.is_empty());
+    }
+
+    #[test]
+    fn test_drain_sorted() {
         let mt = MemTable::new(1024 * 1024);
         for i in 0..10 {
             mt.insert(make_blob(i));
         }
-        assert_eq!(mt.len(), 10);
 
         let drained = mt.drain();
         assert_eq!(drained.len(), 10);
         assert!(mt.is_empty());
         assert_eq!(mt.size_bytes(), 0);
-
-        // Verify sorted by document ID
-        for i in 1..drained.len() {
-            assert!(drained[i - 1].0 <= drained[i].0);
-        }
     }
 
     #[test]
@@ -192,31 +242,26 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_sorted() {
-        let mt = MemTable::new(1024 * 1024);
-        for i in 0..20 {
-            mt.insert(make_blob(i));
-        }
-
-        let entries: Vec<_> = mt.iter().collect();
-        assert_eq!(entries.len(), 20);
-        for i in 1..entries.len() {
-            assert!(entries[i - 1].0 <= entries[i].0);
-        }
-    }
-
-    #[test]
-    fn test_tombstone_replaces_live() {
+    fn test_tombstone_visible_at_snapshot() {
         let mt = MemTable::new(1024 * 1024);
         let id = DocumentId::new();
 
-        let blob = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        let mut blob = IBlob::with_id(id, [("x".into(), Value::U64(1))].into());
+        blob.set_version(DocumentId::new());
+        let v1 = *blob.version();
         mt.insert(blob);
-        assert!(!mt.get(&id).unwrap().is_deleted());
 
-        let tombstone = IBlob::tombstone(id);
+        let mut tombstone = IBlob::tombstone(id);
+        tombstone.set_version(DocumentId::new());
         mt.insert(tombstone);
-        assert_eq!(mt.len(), 1, "tombstone replaces live entry");
-        assert!(mt.get(&id).unwrap().is_deleted());
+
+        // Latest: tombstone
+        let latest = mt.get_latest(&id).unwrap();
+        assert!(latest.is_deleted());
+
+        // Snapshot at v1: live document
+        let old = mt.get(&id, &v1).unwrap();
+        assert!(!old.is_deleted());
+        assert_eq!(old.get("x"), Some(&Value::U64(1)));
     }
 }

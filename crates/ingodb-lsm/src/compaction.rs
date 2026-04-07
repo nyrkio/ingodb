@@ -201,10 +201,11 @@ pub struct TombstoneFilter {
 }
 
 impl TombstoneFilter {
-    /// Create a filter that purges tombstones if the output level is the max level.
-    pub fn new(output_level: u32, max_level: u32) -> Self {
+    /// Create a filter that purges tombstones if the output level is the max level
+    /// AND no snapshots are active (conservative: don't purge while any snapshot exists).
+    pub fn new(output_level: u32, max_level: u32, has_active_snapshots: bool) -> Self {
         TombstoneFilter {
-            purge: output_level > max_level,
+            purge: output_level > max_level && !has_active_snapshots,
         }
     }
 }
@@ -397,12 +398,12 @@ mod tests {
         let live = IBlob::from_pairs(vec![("x", ingodb_blob::Value::U64(1))]);
 
         // output_level > max_level → purge
-        let mut filter = TombstoneFilter::new(3, 2);
+        let mut filter = TombstoneFilter::new(3, 2, false);
         assert!(matches!(filter.filter(&id, &tomb), CompactionAction::Drop));
         assert!(matches!(filter.filter(&id, &live), CompactionAction::Keep));
 
         // output_level <= max_level → keep tombstone
-        let mut filter = TombstoneFilter::new(1, 2);
+        let mut filter = TombstoneFilter::new(1, 2, false);
         assert!(matches!(filter.filter(&id, &tomb), CompactionAction::Keep));
     }
 }

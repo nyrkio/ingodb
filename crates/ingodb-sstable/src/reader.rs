@@ -147,10 +147,11 @@ impl SSTableReader {
     }
 
     /// Convenience: min key as DocumentId (for primary SSTables).
+    /// Works with both 16-byte (IdKey) and 32-byte (MvccKey) formats.
     pub fn min_id(&self) -> DocumentId {
-        if self.min_key.len() == 16 {
+        if self.min_key.len() >= 16 {
             let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&self.min_key);
+            bytes.copy_from_slice(&self.min_key[..16]);
             DocumentId::from_bytes(bytes)
         } else {
             DocumentId::nil()
@@ -159,9 +160,9 @@ impl SSTableReader {
 
     /// Convenience: max key as DocumentId (for primary SSTables).
     pub fn max_id(&self) -> DocumentId {
-        if self.max_key.len() == 16 {
+        if self.max_key.len() >= 16 {
             let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&self.max_key);
+            bytes.copy_from_slice(&self.max_key[..16]);
             DocumentId::from_bytes(bytes)
         } else {
             DocumentId::nil()
@@ -202,9 +203,85 @@ impl SSTableReader {
         }
     }
 
-    /// Convenience: point lookup by DocumentId (for primary SSTables).
+    /// Point lookup by DocumentId — returns the latest version.
+    /// Works with both IdKeyExtractor (16-byte key) and MvccKeyExtractor (32-byte key).
     pub fn get_by_id(&self, id: &DocumentId) -> Result<Option<IBlob>, SSTableError> {
-        self.get(id.as_bytes())
+        // Try direct lookup first (IdKeyExtractor: 16-byte keys)
+        if let Some(blob) = self.get(id.as_bytes())? {
+            return Ok(Some(blob));
+        }
+
+        // Try MVCC key format: search for (_id + MAX_VERSION) and scan backward
+        let mut mvcc_key = Vec::with_capacity(32);
+        mvcc_key.extend_from_slice(id.as_bytes());
+        mvcc_key.extend_from_slice(&[0xFF; 16]); // max version
+        self.get_latest_by_prefix(id.as_bytes(), &mvcc_key)
+    }
+
+    /// Find the latest version of a document at a given snapshot.
+    /// Returns the highest version <= snapshot for the given _id.
+    pub fn get_by_id_at(&self, id: &DocumentId, snapshot: &DocumentId) -> Result<Option<IBlob>, SSTableError> {
+        let mut mvcc_key = Vec::with_capacity(32);
+        mvcc_key.extend_from_slice(id.as_bytes());
+        mvcc_key.extend_from_slice(snapshot.as_bytes());
+        self.get_latest_by_prefix(id.as_bytes(), &mvcc_key)
+    }
+
+    /// Find the latest entry whose key starts with `prefix` and is <= `max_key`.
+    /// Used for MVCC lookups where the key is (_id, _version).
+    fn get_latest_by_prefix(&self, _prefix: &[u8], max_key: &[u8]) -> Result<Option<IBlob>, SSTableError> {
+        // Note: bloom filter check skipped for prefix lookups because the bloom
+        // contains exact key hashes, not prefixes. This is a trade-off: we may
+        // read a block unnecessarily, but correctness is maintained.
+
+        // Binary search for the block that could contain max_key
+        let block_idx = match self
+            .block_indices
+            .binary_search_by(|idx| idx.last_key.as_slice().cmp(max_key))
+        {
+            Ok(i) => i,
+            Err(i) => {
+                if i >= self.block_indices.len() {
+                    // max_key is beyond all blocks — check the last block
+                    if self.block_indices.is_empty() {
+                        return Ok(None);
+                    }
+                    self.block_indices.len() - 1
+                } else {
+                    i
+                }
+            }
+        };
+
+        // Search this block for entries with matching _id prefix and version <= max
+        let id_prefix = &max_key[..16];
+        let block = &self.block_indices[block_idx];
+        let entries = self.read_block(block)?;
+
+        // Scan backward to find latest version with matching _id prefix <= max_key
+        let mut best: Option<IBlob> = None;
+        for (k, blob) in entries.iter().rev() {
+            if k.len() >= 16 && &k[..16] == id_prefix && k.as_slice() <= max_key {
+                best = Some(blob.clone());
+                break;
+            }
+        }
+
+        // If not found in this block, check previous block (entry might be there)
+        if best.is_none() && block_idx > 0 {
+            let prev_block = &self.block_indices[block_idx - 1];
+            if prev_block.last_key.len() >= 16 && &prev_block.last_key[..16] >= id_prefix {
+                let entries = self.read_block(prev_block)?;
+                for (k, blob) in entries.iter().rev() {
+                    if k.len() >= 16 && &k[..16] == id_prefix && k.as_slice() <= max_key {
+                        best = Some(blob.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(best)
     }
 
     /// Iterate over all entries in key-sorted order.

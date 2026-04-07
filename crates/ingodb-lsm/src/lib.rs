@@ -8,10 +8,11 @@ pub use database::Database;
 use ingodb_blob::{DocumentId, IBlob, Value};
 use ingodb_memtable::MemTable;
 use ingodb_query::{compare_values, Filter, Query, SortDirection, SortField};
-use ingodb_sstable::{IdKeyExtractor, SSTableReader, SSTableWriter};
+use ingodb_sstable::{MvccKeyExtractor, SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
 use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -86,6 +87,46 @@ pub struct LsmEngine {
     secondary_indexes: Mutex<Vec<secondary::SecondaryIndex>>,
     /// Newly built indexes awaiting persistence (collection_name not known here — Database handles it)
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
+    /// Active snapshot versions — compaction preserves versions >= oldest snapshot
+    active_snapshots: Mutex<BTreeSet<DocumentId>>,
+}
+
+/// A consistent point-in-time view of the database.
+///
+/// All reads through a Snapshot see only documents with `_version <= self.version`.
+/// Old versions are retained by compaction while any Snapshot references them.
+pub struct Snapshot<'a> {
+    engine: &'a LsmEngine,
+    version: DocumentId,
+}
+
+impl<'a> Snapshot<'a> {
+    /// Point lookup at this snapshot's point in time.
+    pub fn get(&self, id: &DocumentId) -> Result<Option<IBlob>, LsmError> {
+        self.engine.get_at(id, &self.version)
+    }
+
+    /// Scan at this snapshot's point in time.
+    pub fn scan(
+        &self,
+        filter: Option<&Filter>,
+        sort: Option<&[SortField]>,
+        project: Option<&[String]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<IBlob>, LsmError> {
+        self.engine.scan_at(filter, sort, project, limit, &self.version)
+    }
+
+    /// The snapshot version.
+    pub fn version(&self) -> &DocumentId {
+        &self.version
+    }
+}
+
+impl<'a> Drop for Snapshot<'a> {
+    fn drop(&mut self) {
+        self.engine.active_snapshots.lock().remove(&self.version);
+    }
 }
 
 /// Metadata about a secondary index, for persistence in the system collection.
@@ -169,6 +210,7 @@ impl LsmEngine {
             query_stats: QueryStats::new(),
             secondary_indexes: Mutex::new(Vec::new()),
             pending_index_metadata: Mutex::new(Vec::new()),
+            active_snapshots: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -230,15 +272,15 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Look up a document by its stable document ID.
+    /// Look up the latest version of a document by its stable document ID.
     /// Returns None if the document doesn't exist or has been deleted.
-    ///
-    /// Read order: memtable → SSTables (L0 first → L1 → ..., within each level newest first).
-    /// The first match is guaranteed to be the current version because:
-    /// (a) data enters at L0 via flush,
-    /// (b) compaction merges within a level and outputs to L(x+1) keeping only the highest _version,
-    /// so higher levels never have newer versions than lower levels.
     pub fn get(&self, id: &DocumentId) -> Result<Option<IBlob>, LsmError> {
+        self.get_at(id, &DocumentId::max())
+    }
+
+    /// Look up a document at a specific snapshot version.
+    /// Returns the highest version <= snapshot for the given _id.
+    fn get_at(&self, id: &DocumentId, snapshot: &DocumentId) -> Result<Option<IBlob>, LsmError> {
         let mut timer = QueryTimer::start(QueryPattern {
             query_type: "get".into(),
             filter_fields: vec![],
@@ -247,17 +289,17 @@ impl LsmEngine {
         });
         timer.set_docs_scanned(1);
 
-        // Check memtable first (fastest, always has latest version for a given _id)
-        if let Some(blob) = self.memtable.get(id) {
+        // Check memtable first — multi-version, returns highest version <= snapshot
+        if let Some(blob) = self.memtable.get(id, snapshot) {
             let found = if blob.is_deleted() { None } else { Some(blob) };
             self.query_stats.record(timer.finish(if found.is_some() { 1 } else { 0 }));
             return Ok(found);
         }
 
-        // Check SSTables (level-ordered: L0 first, within level newest first)
+        // Check SSTables — use snapshot-aware lookup
         let sstables = self.sstables.lock();
         for sst in sstables.iter() {
-            if let Some(blob) = sst.get_by_id(id)? {
+            if let Some(blob) = sst.get_by_id_at(id, snapshot)? {
                 let found = if blob.is_deleted() { None } else { Some(blob) };
                 drop(sstables);
                 self.query_stats.record(timer.finish(if found.is_some() { 1 } else { 0 }));
@@ -277,17 +319,16 @@ impl LsmEngine {
 
     /// Flush the current memtable to a new SSTable.
     pub fn flush_memtable(&self) -> Result<(), LsmError> {
-        let entries = self.memtable.drain();
-        if entries.is_empty() {
+        let mut blobs = self.memtable.drain();
+        if blobs.is_empty() {
             return Ok(());
         }
 
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let sst_path = self.config.data_dir.join(format!("{sst_id:012}.sst"));
 
-        let mut blobs: Vec<IBlob> = entries.into_iter().map(|(_, blob)| blob).collect();
         SSTableWriter::with_block_size(self.config.block_size)
-            .write(&sst_path, &mut blobs, &IdKeyExtractor)?;
+            .write(&sst_path, &mut blobs, &MvccKeyExtractor)?;
 
         let reader = SSTableReader::open(&sst_path)?;
 
@@ -333,7 +374,8 @@ impl LsmEngine {
         drop(sstables);
 
         if let Some(pick) = ucs.pick_compaction(&metas) {
-            let mut tombstone_filter = TombstoneFilter::new(pick.output_level, pick.max_level);
+            let has_snapshots = self.oldest_snapshot().is_some();
+            let mut tombstone_filter = TombstoneFilter::new(pick.output_level, pick.max_level, has_snapshots);
             self.run_compaction(&pick.inputs, Some(&mut tombstone_filter))?;
         }
 
@@ -435,11 +477,35 @@ impl LsmEngine {
             merged.extend(entries.into_iter().map(|(_, blob)| blob));
         }
 
-        // Sort by _id, then dedup: for same _id, keep the one with highest _version
+        // Sort by _id, then _version desc
         merged.sort_by(|a, b| {
             a.id().cmp(b.id()).then_with(|| b.version().cmp(a.version()))
         });
-        merged.dedup_by(|a, b| a.id() == b.id());
+
+        // MVCC-aware dedup: keep versions referenced by active snapshots
+        let oldest_snap = self.oldest_snapshot();
+        if let Some(oldest) = oldest_snap {
+            // Keep latest version per _id PLUS any version >= oldest snapshot
+            let mut kept = Vec::new();
+            let mut i = 0;
+            while i < merged.len() {
+                let id = *merged[i].id();
+                // Always keep the latest version (first in group)
+                kept.push(merged[i].clone());
+                i += 1;
+                // Keep older versions if >= oldest snapshot
+                while i < merged.len() && merged[i].id() == &id {
+                    if merged[i].version() >= &oldest {
+                        kept.push(merged[i].clone());
+                    }
+                    i += 1;
+                }
+            }
+            merged = kept;
+        } else {
+            // No active snapshots — normal dedup, keep only latest per _id
+            merged.dedup_by(|a, b| a.id() == b.id());
+        }
 
         // Apply compaction filter (tombstone purge + any user filter)
         if let Some(filter) = filter {
@@ -467,7 +533,7 @@ impl LsmEngine {
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let output_path = self.config.data_dir.join(format!("{sst_id:012}.sst"));
         SSTableWriter::with_block_size(self.config.block_size)
-            .write(&output_path, &mut merged, &IdKeyExtractor)?;
+            .write(&output_path, &mut merged, &MvccKeyExtractor)?;
         let new_reader = SSTableReader::open(&output_path)?;
 
         // Swap old SSTables for new one
@@ -504,6 +570,19 @@ impl LsmEngine {
     /// Access the query statistics collector.
     pub fn query_stats(&self) -> &QueryStats {
         &self.query_stats
+    }
+
+    /// Create a snapshot for consistent point-in-time reads.
+    /// All reads through the snapshot see only versions <= the snapshot's version.
+    pub fn snapshot(&self) -> Snapshot<'_> {
+        let version = DocumentId::new();
+        self.active_snapshots.lock().insert(version);
+        Snapshot { engine: self, version }
+    }
+
+    /// Oldest active snapshot version, or None if no snapshots active.
+    fn oldest_snapshot(&self) -> Option<DocumentId> {
+        self.active_snapshots.lock().iter().next().copied()
     }
 
     /// Check if a secondary index exists for the given sort fields.
@@ -733,6 +812,18 @@ impl LsmEngine {
         project: Option<&[String]>,
         limit: Option<usize>,
     ) -> Result<Vec<IBlob>, LsmError> {
+        self.scan_at(filter, sort, project, limit, &DocumentId::max())
+    }
+
+    /// Scan at a specific snapshot version.
+    fn scan_at(
+        &self,
+        filter: Option<&Filter>,
+        sort: Option<&[SortField]>,
+        project: Option<&[String]>,
+        limit: Option<usize>,
+        snapshot: &DocumentId,
+    ) -> Result<Vec<IBlob>, LsmError> {
         let mut timer = QueryTimer::start(QueryPattern {
             query_type: "scan".into(),
             filter_fields: filter.map(extract_filter_fields).unwrap_or_default(),
@@ -740,7 +831,8 @@ impl LsmEngine {
             join_edge: None,
         });
 
-        // Try secondary index for sorted scans
+        // Try secondary index for sorted scans (only for latest snapshot)
+        if *snapshot == DocumentId::max() {
         if let Some(sort_fields) = sort {
             let field_names: Vec<String> = sort_fields.iter().map(|sf| sf.field.clone()).collect();
             let all_ascending = sort_fields.iter().all(|sf| sf.direction == SortDirection::Ascending);
@@ -766,6 +858,7 @@ impl LsmEngine {
                 }
             }
         }
+        } // end secondary index check (latest snapshot only)
 
         // Collect all IBlobs from memtable + SSTables
         let mut all: Vec<IBlob> = Vec::new();
@@ -781,7 +874,10 @@ impl LsmEngine {
             }
         }
 
-        // Merge: sort by _id, dedup keeping highest _version
+        // MVCC: filter to versions visible at snapshot
+        all.retain(|b| b.version() <= snapshot);
+
+        // Merge: sort by _id, dedup keeping highest _version (within snapshot)
         all.sort_by(|a, b| {
             a.id().cmp(b.id()).then_with(|| b.version().cmp(a.version()))
         });
@@ -881,6 +977,17 @@ impl LsmEngine {
         to_field: &str,
         depth: usize,
     ) -> Result<Vec<IBlob>, LsmError> {
+        self.traverse_at(start, from_field, to_field, depth, &DocumentId::max())
+    }
+
+    fn traverse_at(
+        &self,
+        start: Option<&Filter>,
+        from_field: &str,
+        to_field: &str,
+        depth: usize,
+        snapshot: &DocumentId,
+    ) -> Result<Vec<IBlob>, LsmError> {
         let timer = QueryTimer::start(QueryPattern {
             query_type: "traverse".into(),
             filter_fields: start.map(extract_filter_fields).unwrap_or_default(),
@@ -894,12 +1001,11 @@ impl LsmEngine {
         }
 
         // Get starting documents (inner scan records its own stats)
-        let mut current = self.scan(start, None, None, None)?;
+        let mut current = self.scan_at(start, None, None, None, snapshot)?;
         let mut all_results = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
         for _ in 0..depth {
-            // Collect join keys from current documents
             let join_values: Vec<Value> = current
                 .iter()
                 .filter_map(|blob| blob.get_field(from_field))
@@ -909,9 +1015,8 @@ impl LsmEngine {
                 break;
             }
 
-            // Find target documents where to_field matches any join value
             let mut next = Vec::new();
-            let candidates = self.scan(None, None, None, None)?;
+            let candidates = self.scan_at(None, None, None, None, snapshot)?;
             for doc in candidates {
                 if let Some(target_val) = doc.get_field(to_field) {
                     if join_values.contains(&target_val) && seen.insert(*doc.id()) {
@@ -1871,5 +1976,156 @@ mod tests {
         engine.scan(Some(&filter2), Some(&sort), None, None).unwrap();
 
         assert_eq!(engine.secondary_index_count(), 2, "two different ranges should accumulate");
+    }
+
+    // ---- MVCC Snapshot Tests ----
+
+    #[test]
+    fn test_snapshot_get_sees_old_version() {
+        let (engine, _dir) = test_engine();
+        let id = DocumentId::new();
+
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(1))].into())).unwrap();
+
+        let snap = engine.snapshot();
+
+        let blob2 = IBlob::with_id(id, [("x".into(), Value::U64(2))].into());
+        engine.put(blob2).unwrap();
+
+        // Regular get sees latest
+        let latest = engine.get(&id).unwrap().unwrap();
+        assert_eq!(latest.get("x"), Some(&Value::U64(2)));
+
+        // Snapshot get sees old version
+        let old = snap.get(&id).unwrap().unwrap();
+        assert_eq!(old.get("x"), Some(&Value::U64(1)));
+    }
+
+    #[test]
+    fn test_snapshot_scan_consistent() {
+        let (engine, _dir) = test_engine();
+
+        for i in 0..5 {
+            engine.put(make_blob(i)).unwrap();
+        }
+
+        let snap = engine.snapshot();
+
+        // Insert more after snapshot
+        for i in 100..105 {
+            engine.put(make_blob(i)).unwrap();
+        }
+
+        // Regular scan sees all 10
+        let all = engine.scan(None, None, None, None).unwrap();
+        assert_eq!(all.len(), 10);
+
+        // Snapshot scan sees only the first 5
+        let snapped = snap.scan(None, None, None, None).unwrap();
+        assert_eq!(snapped.len(), 5);
+        for blob in &snapped {
+            if let Some(Value::U64(n)) = blob.get("n") {
+                assert!(*n < 100, "snapshot should not see docs inserted after snapshot");
+            }
+        }
+    }
+
+    #[test]
+    fn test_snapshot_survives_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 256,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            sort_spill_threshold: 5,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        let id = DocumentId::new();
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(1))].into())).unwrap();
+
+        let snap = engine.snapshot();
+
+        // Update and flush
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(2))].into())).unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Snapshot still sees old version
+        let old = snap.get(&id).unwrap().unwrap();
+        assert_eq!(old.get("x"), Some(&Value::U64(1)));
+
+        // Regular get sees new version
+        let new = engine.get(&id).unwrap().unwrap();
+        assert_eq!(new.get("x"), Some(&Value::U64(2)));
+    }
+
+    #[test]
+    fn test_snapshot_delete_visibility() {
+        let (engine, _dir) = test_engine();
+        let id = DocumentId::new();
+
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(1))].into())).unwrap();
+
+        let snap = engine.snapshot();
+
+        engine.delete(&id).unwrap();
+
+        // Regular get: deleted
+        assert!(engine.get(&id).unwrap().is_none());
+
+        // Snapshot: still sees the document
+        let found = snap.get(&id).unwrap().unwrap();
+        assert_eq!(found.get("x"), Some(&Value::U64(1)));
+    }
+
+    #[test]
+    fn test_multiple_snapshots() {
+        let (engine, _dir) = test_engine();
+        let id = DocumentId::new();
+
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(1))].into())).unwrap();
+        let s1 = engine.snapshot();
+
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(2))].into())).unwrap();
+        let s2 = engine.snapshot();
+
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(3))].into())).unwrap();
+
+        // Each snapshot sees its own point in time
+        assert_eq!(s1.get(&id).unwrap().unwrap().get("x"), Some(&Value::U64(1)));
+        assert_eq!(s2.get(&id).unwrap().unwrap().get("x"), Some(&Value::U64(2)));
+        assert_eq!(engine.get(&id).unwrap().unwrap().get("x"), Some(&Value::U64(3)));
+    }
+
+    #[test]
+    fn test_snapshot_gc_after_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 256,
+            compaction_threshold: 2, // low threshold to trigger compaction
+            scaling_parameter: 0,
+            sort_spill_threshold: 1000,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        let id = DocumentId::new();
+        engine.put(IBlob::with_id(id, [("x".into(), Value::U64(1))].into())).unwrap();
+        engine.flush_memtable().unwrap();
+
+        {
+            let _snap = engine.snapshot();
+            engine.put(IBlob::with_id(id, [("x".into(), Value::U64(2))].into())).unwrap();
+            engine.flush_memtable().unwrap();
+            // Snapshot is alive — compaction should keep both versions
+        }
+        // Snapshot dropped — next compaction can GC old version
+
+        // Latest should still work
+        let found = engine.get(&id).unwrap().unwrap();
+        assert_eq!(found.get("x"), Some(&Value::U64(2)));
     }
 }

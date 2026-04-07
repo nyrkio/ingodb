@@ -8,7 +8,7 @@ pub use writer::SSTableWriter;
 pub use reader::SSTableReader;
 pub use bloom::BloomFilter;
 pub use error::SSTableError;
-pub use keys::{encode_comparable_value, IdKeyExtractor, FieldKeyExtractor, KeyExtractor};
+pub use keys::{encode_comparable_value, IdKeyExtractor, FieldKeyExtractor, MvccKeyExtractor, KeyExtractor};
 
 /// SSTable file magic: "ISST"
 pub const SSTABLE_MAGIC: [u8; 4] = *b"ISST";

@@ -20,6 +20,20 @@ impl KeyExtractor for IdKeyExtractor {
     }
 }
 
+/// MVCC key extractor: sorts by `(_id, _version)` — 32 bytes total.
+/// This enables multiple versions of the same document in one SSTable,
+/// with natural binary search on the composite key.
+pub struct MvccKeyExtractor;
+
+impl KeyExtractor for MvccKeyExtractor {
+    fn extract_key(&self, blob: &IBlob) -> Vec<u8> {
+        let mut key = Vec::with_capacity(32);
+        key.extend_from_slice(blob.id().as_bytes());
+        key.extend_from_slice(blob.version().as_bytes());
+        key
+    }
+}
+
 /// Key extractor that sorts by specified field values.
 /// Multi-field keys are the concatenation of each field's comparable encoding.
 pub struct FieldKeyExtractor {
