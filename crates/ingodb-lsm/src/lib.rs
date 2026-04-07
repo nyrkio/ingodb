@@ -1,5 +1,9 @@
 mod compaction;
+mod database;
+mod secondary;
 pub mod stats;
+
+pub use database::Database;
 
 use ingodb_blob::{DocumentId, IBlob, Value};
 use ingodb_memtable::MemTable;
@@ -75,6 +79,8 @@ pub struct LsmEngine {
     next_sst_id: AtomicU64,
     /// Query statistics collector
     query_stats: QueryStats,
+    /// Secondary indexes (sorted by non-_id fields)
+    secondary_indexes: Mutex<Vec<secondary::SecondaryIndex>>,
 }
 
 impl LsmEngine {
@@ -145,6 +151,7 @@ impl LsmEngine {
             sstables: Mutex::new(sstables),
             next_sst_id: AtomicU64::new(max_id + 1),
             query_stats: QueryStats::new(),
+            secondary_indexes: Mutex::new(Vec::new()),
         })
     }
 
@@ -390,6 +397,137 @@ impl LsmEngine {
         &self.query_stats
     }
 
+    /// Check if a secondary index exists for the given sort fields.
+    fn has_secondary_index(&self, sort_fields: &[String]) -> bool {
+        self.secondary_indexes.lock().iter().any(|idx| idx.matches_sort(sort_fields))
+    }
+
+    /// Build a secondary index for the given sort fields from current SSTables.
+    fn build_secondary_index(&self, sort_fields: &[String]) -> Result<(), LsmError> {
+        let sstables = self.sstables.lock();
+        let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
+
+        if sst_refs.is_empty() {
+            return Ok(());
+        }
+
+        let idx_name = sort_fields.join("_");
+        let idx_path = self.config.data_dir.join(format!("idx_{idx_name}.sst"));
+
+        let index = secondary::SecondaryIndex::build(
+            sort_fields,
+            &sst_refs,
+            &idx_path,
+            self.config.block_size,
+        )?;
+        drop(sstables);
+
+        self.secondary_indexes.lock().push(index);
+        Ok(())
+    }
+
+    /// Try to use a secondary index for a sorted scan.
+    /// Returns None if no matching index exists.
+    fn scan_with_secondary_index(
+        &self,
+        sort_fields: &[String],
+        filter: Option<&Filter>,
+        limit: Option<usize>,
+    ) -> Option<Result<Vec<IBlob>, LsmError>> {
+        let indexes = self.secondary_indexes.lock();
+        let index = indexes.iter().find(|idx| idx.matches_sort(sort_fields))?;
+
+        // Read sorted entries from the index
+        let sorted_entries = match index.iter_sorted() {
+            Ok(entries) => entries,
+            Err(e) => return Some(Err(e)),
+        };
+        drop(indexes);
+
+        // For each entry, look up the full document by _id.
+        // This handles stale entries: if the doc was deleted or updated,
+        // get() returns the current version (or None).
+        let mut results = Vec::new();
+        for (id, _projected) in sorted_entries {
+            match self.get(&id) {
+                Ok(Some(blob)) => {
+                    // Apply filter on the full document
+                    if let Some(f) = filter {
+                        if !f.matches(&|field| blob.get_field(field)) {
+                            continue;
+                        }
+                    }
+                    results.push(blob);
+                    if let Some(lim) = limit {
+                        if results.len() >= lim {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => continue, // stale/deleted — skip
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Merge with memtable (always fresh, may have docs not in the index)
+        let memtable_docs: Vec<IBlob> = self.memtable.iter()
+            .map(|(_, blob)| blob)
+            .filter(|blob| !blob.is_deleted())
+            .filter(|blob| {
+                filter.map_or(true, |f| f.matches(&|field| blob.get_field(field)))
+            })
+            .collect();
+
+        if !memtable_docs.is_empty() {
+            // Merge memtable results into the sorted results
+            // Deduplicate: memtable version wins (newer)
+            let mut seen: std::collections::HashSet<DocumentId> = results.iter().map(|b| *b.id()).collect();
+
+            // Remove entries from results that are superseded by memtable
+            let memtable_ids: std::collections::HashSet<DocumentId> = memtable_docs.iter().map(|b| *b.id()).collect();
+            results.retain(|b| !memtable_ids.contains(b.id()));
+
+            // Add memtable docs and re-sort
+            for doc in memtable_docs {
+                if seen.insert(*doc.id()) {
+                    results.push(doc);
+                }
+            }
+
+            // Re-sort by the indexed fields
+            let sort_field_list: Vec<SortField> = sort_fields.iter()
+                .map(|f| SortField { field: f.clone(), direction: SortDirection::Ascending })
+                .collect();
+            results.sort_by(|a, b| {
+                for sf in &sort_field_list {
+                    let va = a.get_field(&sf.field);
+                    let vb = b.get_field(&sf.field);
+                    let ord = match (&va, &vb) {
+                        (Some(va), Some(vb)) => compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+
+            if let Some(lim) = limit {
+                results.truncate(lim);
+            }
+        }
+
+        Some(Ok(results))
+    }
+
+    /// Number of secondary indexes.
+    pub fn secondary_index_count(&self) -> usize {
+        self.secondary_indexes.lock().len()
+    }
+
     /// Full scan: merge all live documents, apply filter/sort/projection/limit.
     pub fn scan(
         &self,
@@ -404,6 +542,28 @@ impl LsmEngine {
             sort_fields: sort.map(|s| s.iter().map(|sf| sf.field.clone()).collect()).unwrap_or_default(),
             join_edge: None,
         });
+
+        // Try secondary index for sorted scans (ascending only for now)
+        if let Some(sort_fields) = sort {
+            let ascending_fields: Vec<String> = sort_fields.iter()
+                .filter(|sf| sf.direction == SortDirection::Ascending)
+                .map(|sf| sf.field.clone())
+                .collect();
+            if ascending_fields.len() == sort_fields.len() {
+                // All ascending — check for matching index
+                if let Some(result) = self.scan_with_secondary_index(&ascending_fields, filter, limit) {
+                    let mut results = result?;
+                    // Apply projection
+                    if let Some(fields) = project {
+                        results = results.into_iter().map(|blob| blob.project(fields)).collect();
+                    }
+                    let docs_returned = results.len() as u64;
+                    timer.set_docs_scanned(docs_returned); // index scan only touches returned docs
+                    self.query_stats.record(timer.finish(docs_returned));
+                    return Ok(results);
+                }
+            }
+        }
 
         // Collect all IBlobs from memtable + SSTables
         let mut all: Vec<IBlob> = Vec::new();
@@ -482,6 +642,31 @@ impl LsmEngine {
         // Record stats
         let docs_returned = results.len() as u64;
         self.query_stats.record(timer.finish(docs_returned));
+
+        // Reactive: consider building a secondary index for this sort pattern
+        if let Some(sort_fields) = sort {
+            let ascending_fields: Vec<String> = sort_fields.iter()
+                .filter(|sf| sf.direction == SortDirection::Ascending)
+                .map(|sf| sf.field.clone())
+                .collect();
+            if ascending_fields.len() == sort_fields.len()
+                && !self.has_secondary_index(&ascending_fields)
+            {
+                // Check if this pattern has been executed enough times
+                let pattern = QueryPattern {
+                    query_type: "scan".into(),
+                    filter_fields: filter.map(extract_filter_fields).unwrap_or_default(),
+                    sort_fields: ascending_fields.clone(),
+                    join_edge: None,
+                };
+                if let Some(stats) = self.query_stats.get_pattern(&pattern) {
+                    if stats.count >= secondary::DEFAULT_INDEX_THRESHOLD {
+                        // Build reactively — ignore errors (best effort)
+                        let _ = self.build_secondary_index(&ascending_fields);
+                    }
+                }
+            }
+        }
 
         Ok(results)
     }
@@ -1160,5 +1345,102 @@ mod tests {
             .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
             .collect();
         assert_eq!(ns, vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_reactive_index_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        // Insert docs and flush to SSTable (index only covers on-disk data)
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        assert_eq!(engine.secondary_index_count(), 0, "no index yet");
+
+        // Run sorted scan DEFAULT_INDEX_THRESHOLD times to trigger reactive index
+        let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
+            engine.scan(None, Some(&sort), None, None).unwrap();
+        }
+
+        assert_eq!(engine.secondary_index_count(), 1, "index should be created reactively");
+
+        // Next scan should use the index (and produce correct results)
+        let results = engine.scan(None, Some(&sort), None, None).unwrap();
+        let ns: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(ns, (0..10).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_no_index_below_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        for i in 0..5 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Run sorted scan fewer than threshold times
+        let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD - 1 {
+            engine.scan(None, Some(&sort), None, None).unwrap();
+        }
+
+        assert_eq!(engine.secondary_index_count(), 0, "should not build index below threshold");
+    }
+
+    #[test]
+    fn test_index_handles_stale_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        let blob1 = make_blob(1);
+        let blob2 = make_blob(2);
+        let id_to_delete = *blob1.id();
+        engine.put(blob1).unwrap();
+        engine.put(blob2).unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Build index
+        let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
+            engine.scan(None, Some(&sort), None, None).unwrap();
+        }
+        assert_eq!(engine.secondary_index_count(), 1);
+
+        // Delete one doc after index was built
+        engine.delete(&id_to_delete).unwrap();
+
+        // Scan with index should skip the deleted doc
+        let results = engine.scan(None, Some(&sort), None, None).unwrap();
+        assert_eq!(results.len(), 1, "stale entry should be skipped");
+        assert_eq!(results[0].get("n"), Some(&Value::U64(2)));
     }
 }
