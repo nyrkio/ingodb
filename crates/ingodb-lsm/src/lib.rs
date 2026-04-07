@@ -179,6 +179,14 @@ impl LsmEngine {
             wal.append(&mut blob)?;
         }
 
+        // Notify secondary indexes of the new/updated document
+        {
+            let indexes = self.secondary_indexes.lock();
+            for idx in indexes.iter() {
+                idx.notify_put(&blob);
+            }
+        }
+
         // Insert into memtable (keyed by _id; upsert replaces old version)
         let should_flush = self.memtable.insert(blob);
 
@@ -198,6 +206,14 @@ impl LsmEngine {
         {
             let mut wal = self.wal.lock();
             wal.append(&mut tombstone)?;
+        }
+
+        // Notify secondary indexes of the deletion
+        {
+            let indexes = self.secondary_indexes.lock();
+            for idx in indexes.iter() {
+                idx.notify_delete(id);
+            }
         }
 
         let should_flush = self.memtable.insert(tombstone);
@@ -454,20 +470,31 @@ impl LsmEngine {
         let indexes = self.secondary_indexes.lock();
         let index = indexes.iter().find(|idx| idx.matches_sort(sort_fields))?;
 
-        // Read sorted entries from the index
+        // Read sorted entries and clone fields before dropping the lock
         let sorted_entries = match index.iter_sorted() {
             Ok(entries) => entries,
             Err(e) => return Some(Err(e)),
         };
+        let index_fields = index.fields.clone();
         drop(indexes);
 
         // For each entry, look up the full document by _id.
-        // This handles stale entries: if the doc was deleted or updated,
-        // get() returns the current version (or None).
+        // Verify the indexed field values still match (stale check).
         let mut results = Vec::new();
-        for (id, _projected) in sorted_entries {
+        for (id, projected) in sorted_entries {
+            // Skip tombstones in the index buffer
+            if projected.is_deleted() {
+                continue;
+            }
             match self.get(&id) {
                 Ok(Some(blob)) => {
+                    // Stale check: verify indexed field values match the primary
+                    let is_current = index_fields.iter().all(|f| {
+                        blob.get_field(f) == projected.get_field(f)
+                    });
+                    if !is_current {
+                        continue; // stale index entry — field was updated
+                    }
                     // Apply filter on the full document
                     if let Some(f) = filter {
                         if !f.matches(&|field| blob.get_field(field)) {
@@ -496,15 +523,12 @@ impl LsmEngine {
             .collect();
 
         if !memtable_docs.is_empty() {
-            // Merge memtable results into the sorted results
-            // Deduplicate: memtable version wins (newer)
-            let mut seen: std::collections::HashSet<DocumentId> = results.iter().map(|b| *b.id()).collect();
-
-            // Remove entries from results that are superseded by memtable
+            // Merge: memtable version wins (newer), replace any matching index results
             let memtable_ids: std::collections::HashSet<DocumentId> = memtable_docs.iter().map(|b| *b.id()).collect();
             results.retain(|b| !memtable_ids.contains(b.id()));
 
-            // Add memtable docs and re-sort
+            // Add memtable docs (dedup within memtable docs by id)
+            let mut seen: std::collections::HashSet<DocumentId> = results.iter().map(|b| *b.id()).collect();
             for doc in memtable_docs {
                 if seen.insert(*doc.id()) {
                     results.push(doc);
@@ -1471,5 +1495,100 @@ mod tests {
         let results = engine.scan(None, Some(&sort), None, None).unwrap();
         assert_eq!(results.len(), 1, "stale entry should be skipped");
         assert_eq!(results[0].get("n"), Some(&Value::U64(2)));
+    }
+
+    #[test]
+    fn test_index_maintained_on_update() {
+        // Henrik's scenario: index on field1, update field1 from 5 to 9.
+        // Scan for field1 < 7 should NOT find the old value.
+        // Scan for field1 > 7 should find the new value.
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        let id = DocumentId::new();
+        let blob = IBlob::with_id(id, [("field1".into(), Value::U64(5))].into());
+        engine.put(blob).unwrap();
+
+        // Also add another doc to make the index interesting
+        engine.put(IBlob::from_pairs(vec![("field1", Value::U64(3))])).unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Build index on field1
+        let sort = [SortField { field: "field1".into(), direction: SortDirection::Ascending }];
+        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
+            engine.scan(None, Some(&sort), None, None).unwrap();
+        }
+        assert_eq!(engine.secondary_index_count(), 1);
+
+        // Update field1 from 5 to 9
+        let updated = IBlob::with_id(id, [("field1".into(), Value::U64(9))].into());
+        engine.put(updated).unwrap();
+
+        // Scan for field1 < 7 — should NOT find the old value (5)
+        let results = engine.scan(
+            Some(&Filter::Lt { field: "field1".into(), value: Value::U64(7) }),
+            Some(&sort),
+            None,
+            None,
+        ).unwrap();
+        let vals: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("field1") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(vals, vec![3], "old value 5 should not appear (stale index entry skipped)");
+
+        // Scan for field1 > 7 — should find the new value (9)
+        let results = engine.scan(
+            Some(&Filter::Gt { field: "field1".into(), value: Value::U64(7) }),
+            Some(&sort),
+            None,
+            None,
+        ).unwrap();
+        let vals: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("field1") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(vals, vec![9], "new value 9 should be found via new index entry");
+    }
+
+    #[test]
+    fn test_index_maintained_on_put_new_doc() {
+        // New document inserted after index built should appear in sorted scan
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        for i in 0..5u64 {
+            engine.put(IBlob::from_pairs(vec![("val", Value::U64(i * 10))])).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Build index on val
+        let sort = [SortField { field: "val".into(), direction: SortDirection::Ascending }];
+        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
+            engine.scan(None, Some(&sort), None, None).unwrap();
+        }
+        assert_eq!(engine.secondary_index_count(), 1);
+
+        // Insert new doc after index built
+        engine.put(IBlob::from_pairs(vec![("val", Value::U64(25))])).unwrap();
+
+        // Sorted scan should include the new doc in correct position
+        let results = engine.scan(None, Some(&sort), None, None).unwrap();
+        let vals: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("val") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(vals, vec![0, 10, 20, 25, 30, 40], "new doc should appear in sorted position");
     }
 }

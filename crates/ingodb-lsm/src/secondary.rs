@@ -1,5 +1,7 @@
 use ingodb_blob::{DocumentId, IBlob};
-use ingodb_sstable::{FieldKeyExtractor, SSTableReader, SSTableWriter};
+use ingodb_sstable::{FieldKeyExtractor, KeyExtractor, SSTableReader, SSTableWriter};
+use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::LsmError;
@@ -9,14 +11,18 @@ use crate::LsmError;
 /// Each entry is a projected IBlob containing just the indexed fields.
 /// The _id on each projected blob points back to the primary document.
 /// Stale entries (from updated/deleted documents) are detected at read
-/// time by checking the primary via get().
+/// time by verifying the indexed field values match the primary document.
+///
+/// New entries from put() are buffered in memory until flushed.
 pub struct SecondaryIndex {
     /// Fields this index covers (the sort key)
     pub fields: Vec<String>,
-    /// The index SSTable
+    /// The index SSTable (on-disk portion)
     pub reader: SSTableReader,
     /// Path to the index SSTable
     pub path: PathBuf,
+    /// In-memory buffer of new index entries from put() (sort_key -> (DocumentId, projected IBlob))
+    buffer: Mutex<BTreeMap<Vec<u8>, IBlob>>,
 }
 
 impl SecondaryIndex {
@@ -63,6 +69,7 @@ impl SecondaryIndex {
             fields: fields.to_vec(),
             reader,
             path: output_path,
+            buffer: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -70,12 +77,51 @@ impl SecondaryIndex {
     pub fn open(fields: Vec<String>, path: impl AsRef<Path>) -> Result<Self, LsmError> {
         let path = path.as_ref().to_path_buf();
         let reader = SSTableReader::open(&path)?;
-        Ok(SecondaryIndex { fields, reader, path })
+        Ok(SecondaryIndex {
+            fields: fields.to_vec(),
+            reader,
+            path,
+            buffer: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Notify the index that a document was written/updated.
+    /// If the document has the indexed fields, buffer a new index entry.
+    pub fn notify_put(&self, blob: &IBlob) {
+        let extractor = FieldKeyExtractor::new(self.fields.clone());
+        let key = extractor.extract_key(blob);
+        let projected = blob.project(&self.fields);
+        self.buffer.lock().insert(key, projected);
+    }
+
+    /// Notify the index that a document was deleted.
+    /// We don't remove from the buffer (stale entries handled on read).
+    /// A tombstone entry is added to ensure the delete is visible.
+    pub fn notify_delete(&self, id: &DocumentId) {
+        // Tombstone projection: just the id, no fields
+        let tomb = IBlob::tombstone(*id);
+        // Use a key that will be found during scan
+        // The stale check on read will handle it
+        let extractor = FieldKeyExtractor::new(self.fields.clone());
+        let key = extractor.extract_key(&tomb);
+        self.buffer.lock().insert(key, tomb);
     }
 
     /// Iterate the index in sorted order, yielding (_id, projected IBlob) pairs.
+    /// Merges on-disk SSTable entries with in-memory buffer.
     pub fn iter_sorted(&self) -> Result<Vec<(DocumentId, IBlob)>, LsmError> {
-        let entries = self.reader.iter()?;
+        // On-disk entries
+        let mut entries: Vec<(Vec<u8>, IBlob)> = self.reader.iter()?;
+        // Merge in-memory buffer
+        let buffer = self.buffer.lock();
+        for (key, blob) in buffer.iter() {
+            entries.push((key.clone(), blob.clone()));
+        }
+        drop(buffer);
+
+        // Sort by key (merge on-disk + buffer)
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
         Ok(entries
             .into_iter()
             .map(|(_, blob)| (*blob.id(), blob))
@@ -86,6 +132,7 @@ impl SecondaryIndex {
     pub fn matches_sort(&self, sort_fields: &[String]) -> bool {
         self.fields == sort_fields
     }
+
 }
 
 /// Default number of query executions before building an index reactively.
