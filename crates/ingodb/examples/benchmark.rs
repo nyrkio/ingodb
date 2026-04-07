@@ -10,6 +10,7 @@
 //! 5. Compaction performance
 
 use ingodb::{DocumentId, Filter, IBlob, LsmConfig, LsmEngine, Query, SortDirection, SortField, Value};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NUM_PRODUCTS: u64 = 100_000;
@@ -38,7 +39,7 @@ fn main() {
         config.block_size,
     );
 
-    let engine = LsmEngine::open(config).unwrap();
+    let engine = Arc::new(LsmEngine::open(config).unwrap());
 
     // Phase 1: Bulk ingest
     let ids = phase_bulk_ingest(&engine);
@@ -54,6 +55,9 @@ fn main() {
 
     // Phase 5: Mixed read/write
     phase_mixed_workload(&engine);
+
+    // Phase 6: Concurrent reads
+    phase_concurrent_reads(&engine, &ids);
 
     // Summary
     println!("\n=== Stats ===");
@@ -102,7 +106,7 @@ fn make_product(i: u64) -> IBlob {
     ])
 }
 
-fn phase_bulk_ingest(engine: &LsmEngine) -> Vec<DocumentId> {
+fn phase_bulk_ingest(engine: &Arc<LsmEngine>) -> Vec<DocumentId> {
     println!("--- Phase 1: Bulk Ingest ({} products) ---", NUM_PRODUCTS);
 
     let mut ids = Vec::with_capacity(NUM_PRODUCTS as usize);
@@ -130,7 +134,7 @@ fn phase_bulk_ingest(engine: &LsmEngine) -> Vec<DocumentId> {
     ids
 }
 
-fn phase_point_lookups(engine: &LsmEngine, ids: &[DocumentId]) {
+fn phase_point_lookups(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
     println!("\n--- Phase 2: Point Lookups ({} random gets) ---", NUM_LOOKUPS);
 
     let mut latencies = Vec::with_capacity(NUM_LOOKUPS as usize);
@@ -158,7 +162,7 @@ fn phase_point_lookups(engine: &LsmEngine, ids: &[DocumentId]) {
     println!("  Latency: p50={:>8.2?}  p95={:>8.2?}  p99={:>8.2?}", p50, p95, p99);
 }
 
-fn phase_scan_queries(engine: &LsmEngine) {
+fn phase_scan_queries(engine: &Arc<LsmEngine>) {
     println!("\n--- Phase 3: Scan + Sort Queries ---");
 
     // Query 1: filter by category, sort by price
@@ -235,7 +239,7 @@ fn phase_scan_queries(engine: &LsmEngine) {
     println!("  Secondary indexes after queries: {}", engine.secondary_index_count());
 }
 
-fn phase_snapshot_reads(engine: &LsmEngine, ids: &[DocumentId]) {
+fn phase_snapshot_reads(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
     println!("\n--- Phase 4: Snapshot Reads ---");
 
     // Take a snapshot of current state
@@ -294,7 +298,7 @@ fn phase_snapshot_reads(engine: &LsmEngine, ids: &[DocumentId]) {
     println!("  Snapshot released");
 }
 
-fn phase_mixed_workload(engine: &LsmEngine) {
+fn phase_mixed_workload(engine: &Arc<LsmEngine>) {
     println!("\n--- Phase 5: Mixed Read/Write ---");
 
     let total_ops = 10_000u64;
@@ -333,4 +337,87 @@ fn phase_mixed_workload(engine: &LsmEngine) {
     let rate = total_ops as f64 / elapsed.as_secs_f64();
     println!("  {} ops ({} reads, {} writes) in {:.2?}", total_ops, reads, writes, elapsed);
     println!("  {:.0} ops/sec", rate);
+}
+
+fn phase_concurrent_reads(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
+    println!("\n--- Phase 6: Concurrent Reads ---");
+
+    let ops_per_thread = 10_000u64;
+
+    for num_threads in [1, 2, 4, 8] {
+        let start = Instant::now();
+        let mut handles = Vec::new();
+
+        for t in 0..num_threads {
+            let engine = Arc::clone(engine);
+            let ids: Vec<DocumentId> = ids.to_vec();
+            handles.push(std::thread::spawn(move || {
+                let mut found = 0u64;
+                for i in 0..ops_per_thread {
+                    let idx = ((i * 7919 + t as u64 * 1013) % ids.len() as u64) as usize;
+                    if engine.get(&ids[idx]).unwrap().is_some() {
+                        found += 1;
+                    }
+                }
+                found
+            }));
+        }
+
+        let total_found: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        let elapsed = start.elapsed();
+        let total_ops = ops_per_thread * num_threads as u64;
+        let rate = total_ops as f64 / elapsed.as_secs_f64();
+
+        println!("  {:>2} threads: {:>6} ops in {:>8.2?} → {:>8.0} ops/sec  ({} found)",
+            num_threads, total_ops, elapsed, rate, total_found);
+    }
+
+    // Also test concurrent reads + writes
+    println!("\n  Concurrent reads + writes (4 reader threads, 1 writer thread):");
+    let ops_per_reader = 10_000u64;
+    let ops_writer = 2_000u64;
+
+    let start = Instant::now();
+    let mut handles = Vec::new();
+
+    // 4 reader threads
+    for t in 0..4u32 {
+        let engine = Arc::clone(engine);
+        let ids: Vec<DocumentId> = ids.to_vec();
+        handles.push(std::thread::spawn(move || {
+            let mut found = 0u64;
+            for i in 0..ops_per_reader {
+                let idx = ((i * 7919 + t as u64 * 1013) % ids.len() as u64) as usize;
+                if engine.get(&ids[idx]).unwrap().is_some() {
+                    found += 1;
+                }
+            }
+            (found, 0u64) // (reads, writes)
+        }));
+    }
+
+    // 1 writer thread
+    {
+        let engine = Arc::clone(engine);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ops_writer {
+                let blob = make_product(NUM_PRODUCTS + 100_000 + i);
+                engine.put(blob).unwrap();
+            }
+            (0u64, ops_writer) // (reads, writes)
+        }));
+    }
+
+    let mut total_reads = 0u64;
+    let mut total_writes = 0u64;
+    for h in handles {
+        let (r, w) = h.join().unwrap();
+        total_reads += r;
+        total_writes += w;
+    }
+    let elapsed = start.elapsed();
+    let total_ops = total_reads + total_writes;
+    let rate = total_ops as f64 / elapsed.as_secs_f64();
+    println!("    {} total ops ({} reads, {} writes) in {:?} → {:.0} ops/sec",
+        total_ops, total_reads, total_writes, elapsed, rate);
 }

@@ -11,7 +11,7 @@ use ingodb_query::{compare_values, Filter, Query, SortDirection, SortField};
 use ingodb_sstable::{MvccKeyExtractor, SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,8 +77,9 @@ pub struct LsmEngine {
     memtable: MemTable,
     /// WAL for the active memtable
     wal: Mutex<Wal>,
-    /// SSTables on disk, ordered for reads: L0 first → L1 → ..., within each level newest first
-    sstables: Mutex<Vec<SSTableReader>>,
+    /// SSTables on disk, ordered for reads: L0 first → L1 → ..., within each level newest first.
+    /// RwLock: multiple concurrent readers, exclusive access for flush/compaction.
+    sstables: RwLock<Vec<SSTableReader>>,
     /// Counter for generating SSTable file names
     next_sst_id: AtomicU64,
     /// Query statistics collector
@@ -205,7 +206,7 @@ impl LsmEngine {
             config,
             memtable,
             wal: Mutex::new(wal),
-            sstables: Mutex::new(sstables),
+            sstables: RwLock::new(sstables),
             next_sst_id: AtomicU64::new(max_id + 1),
             query_stats: QueryStats::new(),
             secondary_indexes: Mutex::new(Vec::new()),
@@ -297,7 +298,7 @@ impl LsmEngine {
         }
 
         // Check SSTables — use snapshot-aware lookup
-        let sstables = self.sstables.lock();
+        let sstables = self.sstables.read();
         for sst in sstables.iter() {
             if let Some(blob) = sst.get_by_id_at(id, snapshot)? {
                 let found = if blob.is_deleted() { None } else { Some(blob) };
@@ -333,7 +334,7 @@ impl LsmEngine {
         let reader = SSTableReader::open(&sst_path)?;
 
         {
-            let mut sstables = self.sstables.lock();
+            let mut sstables = self.sstables.write();
             sstables.insert(0, reader); // L0, newest — goes to front
             // Re-sort to maintain level ordering
             let ucs = self.ucs();
@@ -358,7 +359,7 @@ impl LsmEngine {
     /// Run UCS compaction if needed.
     fn maybe_compact(&self) -> Result<(), LsmError> {
         let ucs = self.ucs();
-        let sstables = self.sstables.lock();
+        let sstables = self.sstables.read();
 
         let metas: Vec<SstMeta> = sstables
             .iter()
@@ -407,7 +408,7 @@ impl LsmEngine {
             field_groups.entry(idx.fields.clone()).or_default().push(i);
         }
 
-        let sstables = self.sstables.lock();
+        let sstables = self.sstables.read();
         let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
         let primary_doc_count = self.memtable.len() as u64
             + sst_refs.iter()
@@ -521,7 +522,7 @@ impl LsmEngine {
 
         if merged.is_empty() {
             // All entries were dropped — just remove input files
-            let mut sstables = self.sstables.lock();
+            let mut sstables = self.sstables.write();
             for path in inputs {
                 sstables.retain(|s| s.path() != path);
                 std::fs::remove_file(path).ok();
@@ -537,7 +538,7 @@ impl LsmEngine {
         let new_reader = SSTableReader::open(&output_path)?;
 
         // Swap old SSTables for new one
-        let mut sstables = self.sstables.lock();
+        let mut sstables = self.sstables.write();
         for path in inputs {
             sstables.retain(|s| s.path() != path);
             std::fs::remove_file(path).ok();
@@ -553,7 +554,7 @@ impl LsmEngine {
 
     /// Number of SSTables on disk.
     pub fn sstable_count(&self) -> usize {
-        self.sstables.lock().len()
+        self.sstables.read().len()
     }
 
     /// Number of entries in the active memtable.
@@ -592,7 +593,7 @@ impl LsmEngine {
 
     /// Build a secondary index for the given sort fields from current SSTables.
     fn build_secondary_index(&self, sort_fields: &[String]) -> Result<(), LsmError> {
-        let sstables = self.sstables.lock();
+        let sstables = self.sstables.read();
         let sst_refs: Vec<&SSTableReader> = sstables.iter().collect();
 
         if sst_refs.is_empty() {
@@ -868,7 +869,7 @@ impl LsmEngine {
 
         // SSTable entries
         {
-            let sstables = self.sstables.lock();
+            let sstables = self.sstables.read();
             for sst in sstables.iter() {
                 all.extend(sst.iter()?.into_iter().map(|(_, blob)| blob));
             }
