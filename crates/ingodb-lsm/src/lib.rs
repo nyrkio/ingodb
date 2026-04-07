@@ -792,16 +792,25 @@ impl LsmEngine {
         let signal = Arc::clone(&self.compaction_signal);
         let num_threads = self.config.compaction_threads;
 
+        let adaptive = self.config.adaptive_w;
+        let cooldown = std::time::Duration::from_secs(self.config.adaptive_w_cooldown_secs);
+
         // Coordinator thread: wakes up, picks all compaction jobs, dispatches to workers
         let handle = std::thread::Builder::new()
             .name("ingodb-compaction-coordinator".into())
             .spawn(move || {
                 loop {
-                    // Wait for work or stop signal
+                    // Wait for work, stop signal, or periodic timeout (for adaptive W)
                     {
                         let mut pending = signal.pending.lock();
                         while !*pending && !signal.stop.load(Ordering::Relaxed) {
-                            signal.notify.wait(&mut pending);
+                            if adaptive {
+                                // Wake periodically to check read/write ratio
+                                signal.notify.wait_for(&mut pending, cooldown);
+                                break; // check regardless of whether signaled
+                            } else {
+                                signal.notify.wait(&mut pending);
+                            }
                         }
                         if signal.stop.load(Ordering::Relaxed) {
                             break;
