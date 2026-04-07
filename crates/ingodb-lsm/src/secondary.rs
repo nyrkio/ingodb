@@ -1,10 +1,21 @@
 use ingodb_blob::{DocumentId, IBlob};
+use ingodb_query::Filter;
 use ingodb_sstable::{FieldKeyExtractor, KeyExtractor, SSTableReader, SSTableWriter};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::LsmError;
+
+/// Minimum number of results before sorting spills to disk as a partial index.
+pub const SPILL_THRESHOLD: usize = 1000;
+
+/// Number of compaction cycles before considering dropping an unused index.
+pub const DROP_COMPACTION_CYCLES: u32 = 10;
+
+/// Hours of wall-clock time before considering dropping an unused index.
+pub const DROP_HOURS: u64 = 720; // 30 days
 
 /// A secondary index: an SSTable sorted by field values instead of _id.
 ///
@@ -13,16 +24,23 @@ use crate::LsmError;
 /// Stale entries (from updated/deleted documents) are detected at read
 /// time by verifying the indexed field values match the primary document.
 ///
-/// New entries from put() are buffered in memory until flushed.
+/// Partial indexes have a `range` — the filter that produced them.
+/// A full-range index (range=None) covers all documents.
 pub struct SecondaryIndex {
     /// Fields this index covers (the sort key)
     pub fields: Vec<String>,
+    /// The filter range this index covers. None = full range.
+    pub range: Option<Filter>,
     /// The index SSTable (on-disk portion)
     pub reader: SSTableReader,
     /// Path to the index SSTable
     pub path: PathBuf,
-    /// In-memory buffer of new index entries from put() (sort_key -> (DocumentId, projected IBlob))
+    /// In-memory buffer of new index entries from put()
     buffer: Mutex<BTreeMap<Vec<u8>, IBlob>>,
+    /// Last time this index was used for a query
+    pub last_used: Mutex<Instant>,
+    /// Number of compaction cycles since last use
+    pub compactions_since_use: Mutex<u32>,
 }
 
 impl SecondaryIndex {
@@ -67,21 +85,63 @@ impl SecondaryIndex {
         let reader = SSTableReader::open(&output_path)?;
         Ok(SecondaryIndex {
             fields: fields.to_vec(),
+            range: None, // full range by default
             reader,
             path: output_path,
             buffer: Mutex::new(BTreeMap::new()),
+            last_used: Mutex::new(Instant::now()),
+            compactions_since_use: Mutex::new(0),
+        })
+    }
+
+    /// Build a partial secondary index from pre-filtered, pre-sorted results.
+    /// The `range` records which filter produced these results.
+    pub fn build_partial(
+        fields: &[String],
+        range: Option<Filter>,
+        sorted_blobs: &mut [IBlob],
+        output_path: impl AsRef<Path>,
+        block_size: usize,
+    ) -> Result<Self, LsmError> {
+        if sorted_blobs.is_empty() {
+            return Err(LsmError::SSTable(ingodb_sstable::SSTableError::Empty));
+        }
+
+        // Project to indexed fields
+        let mut projected: Vec<IBlob> = sorted_blobs
+            .iter()
+            .map(|blob| blob.project(fields))
+            .collect();
+
+        let extractor = FieldKeyExtractor::new(fields.to_vec());
+        let output_path = output_path.as_ref().to_path_buf();
+        SSTableWriter::with_block_size(block_size)
+            .write(&output_path, &mut projected, &extractor)?;
+
+        let reader = SSTableReader::open(&output_path)?;
+        Ok(SecondaryIndex {
+            fields: fields.to_vec(),
+            range,
+            reader,
+            path: output_path,
+            buffer: Mutex::new(BTreeMap::new()),
+            last_used: Mutex::new(Instant::now()),
+            compactions_since_use: Mutex::new(0),
         })
     }
 
     /// Open an existing secondary index from disk.
-    pub fn open(fields: Vec<String>, path: impl AsRef<Path>) -> Result<Self, LsmError> {
+    pub fn open(fields: Vec<String>, range: Option<Filter>, path: impl AsRef<Path>) -> Result<Self, LsmError> {
         let path = path.as_ref().to_path_buf();
         let reader = SSTableReader::open(&path)?;
         Ok(SecondaryIndex {
             fields: fields.to_vec(),
+            range,
             reader,
             path,
             buffer: Mutex::new(BTreeMap::new()),
+            last_used: Mutex::new(Instant::now()),
+            compactions_since_use: Mutex::new(0),
         })
     }
 
@@ -128,9 +188,42 @@ impl SecondaryIndex {
             .collect())
     }
 
-    /// Check if this index covers the given sort fields.
+    /// Check if this index covers the given sort fields AND the query filter.
+    /// A full-range index (range=None) matches any filter.
+    /// A partial index matches only if the query filter is exactly equal.
+    pub fn matches_query(&self, sort_fields: &[String], query_filter: Option<&Filter>) -> bool {
+        if self.fields != sort_fields {
+            return false;
+        }
+        match (&self.range, query_filter) {
+            (None, _) => true,           // full range covers everything
+            (Some(_), None) => false,     // partial index can't serve unfiltered scan
+            (Some(idx_range), Some(qf)) => idx_range == qf, // exact match
+        }
+    }
+
+    /// Legacy: check sort fields only (for backward compat with existing tests).
     pub fn matches_sort(&self, sort_fields: &[String]) -> bool {
         self.fields == sort_fields
+    }
+
+    /// Mark this index as used (resets drop timer).
+    pub fn mark_used(&self) {
+        *self.last_used.lock() = Instant::now();
+        *self.compactions_since_use.lock() = 0;
+    }
+
+    /// Mark a compaction cycle (for drop decisions).
+    pub fn mark_compaction(&self) {
+        *self.compactions_since_use.lock() += 1;
+    }
+
+    /// Should this index be dropped? True if unused for too long.
+    pub fn should_drop(&self) -> bool {
+        let cycles = *self.compactions_since_use.lock();
+        let elapsed = self.last_used.lock().elapsed();
+        cycles >= DROP_COMPACTION_CYCLES
+            && elapsed >= std::time::Duration::from_secs(DROP_HOURS * 3600)
     }
 
     /// Total entry count (on-disk SSTable entries + in-memory buffer).
@@ -356,7 +449,7 @@ mod tests {
         SecondaryIndex::build(&["x".into()], &[&primary], &idx_path, 4096).unwrap();
 
         // Reopen
-        let index = SecondaryIndex::open(vec!["x".into()], &idx_path).unwrap();
+        let index = SecondaryIndex::open(vec!["x".into()], None, &idx_path).unwrap();
         assert_eq!(index.iter_sorted().unwrap().len(), 1);
     }
 

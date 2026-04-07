@@ -72,7 +72,7 @@ impl Database {
 
                 if let Some(engine) = collections.get(&coll_name) {
                     if idx_path.exists() {
-                        if let Err(e) = engine.load_secondary_index(fields, &idx_path) {
+                        if let Err(e) = engine.load_secondary_index(fields, None, &idx_path) {
                             eprintln!("warning: failed to load index {}: {e}", idx_path.display());
                         }
                     }
@@ -172,6 +172,7 @@ impl Database {
             block_size: base.block_size,
             compaction_threshold: base.compaction_threshold,
             scaling_parameter: base.scaling_parameter,
+            sort_spill_threshold: base.sort_spill_threshold,
         }
     }
 }
@@ -191,6 +192,7 @@ mod tests {
             block_size: 512,
             compaction_threshold: 4,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let db = Database::open(config).unwrap();
         (db, dir)
@@ -244,6 +246,7 @@ mod tests {
             block_size: 512,
             compaction_threshold: 4,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
 
         let blob = IBlob::from_pairs(vec![
@@ -294,6 +297,7 @@ mod tests {
             block_size: 512,
             compaction_threshold: 4,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
 
         let blob = IBlob::from_pairs(vec![("x", Value::U64(42))]);
@@ -325,6 +329,7 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
 
         {

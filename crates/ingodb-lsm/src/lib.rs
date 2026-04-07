@@ -52,6 +52,8 @@ pub struct LsmConfig {
     pub compaction_threshold: usize,
     /// UCS scaling parameter W: <0 leveled, 0 balanced, >0 tiered (default 0)
     pub scaling_parameter: i32,
+    /// Minimum result count before sort spills to disk as a partial index (default 1000)
+    pub sort_spill_threshold: usize,
 }
 
 impl Default for LsmConfig {
@@ -62,6 +64,7 @@ impl Default for LsmConfig {
             block_size: 4096,
             compaction_threshold: 4,
             scaling_parameter: 0,
+            sort_spill_threshold: secondary::SPILL_THRESHOLD,
         }
     }
 }
@@ -92,6 +95,8 @@ pub struct IndexMetadata {
     pub fields: Vec<String>,
     /// Path to the index SSTable file
     pub path: PathBuf,
+    /// Whether this is a full-range or partial index
+    pub is_full_range: bool,
 }
 
 impl LsmEngine {
@@ -477,6 +482,7 @@ impl LsmEngine {
         let meta = IndexMetadata {
             fields: sort_fields.to_vec(),
             path: idx_path,
+            is_full_range: true,
         };
         self.pending_index_metadata.lock().push(meta);
         self.secondary_indexes.lock().push(index);
@@ -492,7 +498,8 @@ impl LsmEngine {
         limit: Option<usize>,
     ) -> Option<Result<Vec<IBlob>, LsmError>> {
         let indexes = self.secondary_indexes.lock();
-        let index = indexes.iter().find(|idx| idx.matches_sort(sort_fields))?;
+        let index = indexes.iter().find(|idx| idx.matches_query(sort_fields, filter))?;
+        index.mark_used();
 
         // Read sorted entries and clone fields before dropping the lock
         let sorted_entries = match index.iter_sorted() {
@@ -588,6 +595,45 @@ impl LsmEngine {
         Some(Ok(results))
     }
 
+    /// Spill sorted scan results to disk as a partial secondary index.
+    /// Replaces any existing index for the same sort fields.
+    fn spill_to_partial_index(
+        &self,
+        sort_fields: &[String],
+        range: Option<Filter>,
+        sorted_results: &mut [IBlob],
+    ) -> Result<(), LsmError> {
+        let idx_name = sort_fields.join("_");
+        let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let idx_path = self.config.data_dir.join(format!("idx_{idx_name}_{sst_id:012}.sst"));
+
+        let index = secondary::SecondaryIndex::build_partial(
+            sort_fields,
+            range,
+            sorted_results,
+            &idx_path,
+            self.config.block_size,
+        )?;
+
+        let meta = IndexMetadata {
+            fields: sort_fields.to_vec(),
+            path: idx_path,
+            is_full_range: index.range.is_none(),
+        };
+
+        // Replace any existing index for the same sort fields
+        let mut indexes = self.secondary_indexes.lock();
+        if let Some(pos) = indexes.iter().position(|idx| idx.matches_sort(sort_fields)) {
+            let old = indexes.remove(pos);
+            std::fs::remove_file(&old.path).ok();
+        }
+        indexes.push(index);
+        drop(indexes);
+
+        self.pending_index_metadata.lock().push(meta);
+        Ok(())
+    }
+
     /// Number of secondary indexes.
     pub fn secondary_index_count(&self) -> usize {
         self.secondary_indexes.lock().len()
@@ -599,8 +645,8 @@ impl LsmEngine {
     }
 
     /// Load an existing secondary index from disk.
-    pub fn load_secondary_index(&self, fields: Vec<String>, path: &Path) -> Result<(), LsmError> {
-        let index = secondary::SecondaryIndex::open(fields, path)?;
+    pub fn load_secondary_index(&self, fields: Vec<String>, range: Option<Filter>, path: &Path) -> Result<(), LsmError> {
+        let index = secondary::SecondaryIndex::open(fields, range, path)?;
         self.secondary_indexes.lock().push(index);
         Ok(())
     }
@@ -706,6 +752,24 @@ impl LsmEngine {
             });
         }
 
+        // Spill sorted results to disk as a partial index if above threshold
+        if let Some(sort_fields) = sort {
+            let ascending_fields: Vec<String> = sort_fields.iter()
+                .filter(|sf| sf.direction == SortDirection::Ascending)
+                .map(|sf| sf.field.clone())
+                .collect();
+            if ascending_fields.len() == sort_fields.len()
+                && results.len() > self.config.sort_spill_threshold
+            {
+                // Build partial index from the sorted results, replacing any existing one
+                let _ = self.spill_to_partial_index(
+                    &ascending_fields,
+                    filter.cloned(),
+                    &mut results,
+                );
+            }
+        }
+
         // Apply limit (after sort)
         if let Some(lim) = limit {
             results.truncate(lim);
@@ -719,31 +783,6 @@ impl LsmEngine {
         // Record stats
         let docs_returned = results.len() as u64;
         self.query_stats.record(timer.finish(docs_returned));
-
-        // Reactive: consider building a secondary index for this sort pattern
-        if let Some(sort_fields) = sort {
-            let ascending_fields: Vec<String> = sort_fields.iter()
-                .filter(|sf| sf.direction == SortDirection::Ascending)
-                .map(|sf| sf.field.clone())
-                .collect();
-            if ascending_fields.len() == sort_fields.len()
-                && !self.has_secondary_index(&ascending_fields)
-            {
-                // Check if this pattern has been executed enough times
-                let pattern = QueryPattern {
-                    query_type: "scan".into(),
-                    filter_fields: filter.map(extract_filter_fields).unwrap_or_default(),
-                    sort_fields: ascending_fields.clone(),
-                    join_edge: None,
-                };
-                if let Some(stats) = self.query_stats.get_pattern(&pattern) {
-                    if stats.count >= secondary::DEFAULT_INDEX_THRESHOLD {
-                        // Build reactively — ignore errors (best effort)
-                        let _ = self.build_secondary_index(&ascending_fields);
-                    }
-                }
-            }
-        }
 
         Ok(results)
     }
@@ -868,6 +907,7 @@ mod tests {
             block_size: 256,
             compaction_threshold: 4,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let engine = LsmEngine::open(config).unwrap();
         (engine, dir)
@@ -924,6 +964,7 @@ mod tests {
             block_size: 256,
             compaction_threshold: 4,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
 
         let blob = make_blob(42);
@@ -1048,6 +1089,7 @@ mod tests {
             block_size: 256,
             compaction_threshold: 100, // prevent auto-compaction
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let engine = LsmEngine::open(config).unwrap();
         let id = DocumentId::new();
@@ -1433,6 +1475,7 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -1469,21 +1512,21 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let engine = LsmEngine::open(config).unwrap();
 
-        for i in 0..5 {
+        // Only 3 docs — below spill threshold (5)
+        for i in 0..3 {
             engine.put(make_blob(i)).unwrap();
         }
         engine.flush_memtable().unwrap();
 
-        // Run sorted scan fewer than threshold times
+        // Sorted scan with ≤threshold results stays in memory, no index created
         let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
-        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD - 1 {
-            engine.scan(None, Some(&sort), None, None).unwrap();
-        }
+        engine.scan(None, Some(&sort), None, None).unwrap();
 
-        assert_eq!(engine.secondary_index_count(), 0, "should not build index below threshold");
+        assert_eq!(engine.secondary_index_count(), 0, "should not build index below spill threshold");
     }
 
     #[test]
@@ -1495,21 +1538,21 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let engine = LsmEngine::open(config).unwrap();
 
         let blob1 = make_blob(1);
-        let blob2 = make_blob(2);
         let id_to_delete = *blob1.id();
         engine.put(blob1).unwrap();
-        engine.put(blob2).unwrap();
+        for i in 2..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
         engine.flush_memtable().unwrap();
 
-        // Build index
+        // Sorted scan creates index via spill
         let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
-        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
-            engine.scan(None, Some(&sort), None, None).unwrap();
-        }
+        engine.scan(None, Some(&sort), None, None).unwrap();
         assert_eq!(engine.secondary_index_count(), 1);
 
         // Delete one doc after index was built
@@ -1517,8 +1560,8 @@ mod tests {
 
         // Scan with index should skip the deleted doc
         let results = engine.scan(None, Some(&sort), None, None).unwrap();
-        assert_eq!(results.len(), 1, "stale entry should be skipped");
-        assert_eq!(results[0].get("n"), Some(&Value::U64(2)));
+        assert_eq!(results.len(), 8, "stale entry should be skipped");
+        assert!(results.iter().all(|b| b.get("n") != Some(&Value::U64(1))));
     }
 
     #[test]
@@ -1533,6 +1576,7 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -1540,15 +1584,15 @@ mod tests {
         let blob = IBlob::with_id(id, [("field1".into(), Value::U64(5))].into());
         engine.put(blob).unwrap();
 
-        // Also add another doc to make the index interesting
-        engine.put(IBlob::from_pairs(vec![("field1", Value::U64(3))])).unwrap();
+        // Add enough docs to exceed spill threshold
+        for i in [1u64, 2, 3, 4, 6, 8, 10, 11, 12] {
+            engine.put(IBlob::from_pairs(vec![("field1", Value::U64(i))])).unwrap();
+        }
         engine.flush_memtable().unwrap();
 
-        // Build index on field1
+        // Sorted scan creates index via spill (>5 results)
         let sort = [SortField { field: "field1".into(), direction: SortDirection::Ascending }];
-        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
-            engine.scan(None, Some(&sort), None, None).unwrap();
-        }
+        engine.scan(None, Some(&sort), None, None).unwrap();
         assert_eq!(engine.secondary_index_count(), 1);
 
         // Update field1 from 5 to 9
@@ -1565,9 +1609,9 @@ mod tests {
         let vals: Vec<u64> = results.iter()
             .filter_map(|b| match b.get("field1") { Some(Value::U64(n)) => Some(*n), _ => None })
             .collect();
-        assert_eq!(vals, vec![3], "old value 5 should not appear (stale index entry skipped)");
+        assert_eq!(vals, vec![1, 2, 3, 4, 6], "old value 5 should not appear (stale, updated to 9)");
 
-        // Scan for field1 > 7 — should find the new value (9)
+        // Scan for field1 > 7 — should find the new value (9) plus 8, 10, 11, 12
         let results = engine.scan(
             Some(&Filter::Gt { field: "field1".into(), value: Value::U64(7) }),
             Some(&sort),
@@ -1577,7 +1621,7 @@ mod tests {
         let vals: Vec<u64> = results.iter()
             .filter_map(|b| match b.get("field1") { Some(Value::U64(n)) => Some(*n), _ => None })
             .collect();
-        assert_eq!(vals, vec![9], "new value 9 should be found via new index entry");
+        assert_eq!(vals, vec![8, 9, 10, 11, 12], "new value 9 should appear among results > 7");
     }
 
     #[test]
@@ -1590,19 +1634,18 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
+            sort_spill_threshold: 5,
         };
         let engine = LsmEngine::open(config).unwrap();
 
-        for i in 0..5u64 {
+        for i in 0..8u64 {
             engine.put(IBlob::from_pairs(vec![("val", Value::U64(i * 10))])).unwrap();
         }
         engine.flush_memtable().unwrap();
 
-        // Build index on val
+        // Sorted scan creates index via spill (8 > 5)
         let sort = [SortField { field: "val".into(), direction: SortDirection::Ascending }];
-        for _ in 0..secondary::DEFAULT_INDEX_THRESHOLD {
-            engine.scan(None, Some(&sort), None, None).unwrap();
-        }
+        engine.scan(None, Some(&sort), None, None).unwrap();
         assert_eq!(engine.secondary_index_count(), 1);
 
         // Insert new doc after index built
@@ -1613,6 +1656,63 @@ mod tests {
         let vals: Vec<u64> = results.iter()
             .filter_map(|b| match b.get("val") { Some(Value::U64(n)) => Some(*n), _ => None })
             .collect();
-        assert_eq!(vals, vec![0, 10, 20, 25, 30, 40], "new doc should appear in sorted position");
+        assert_eq!(vals, vec![0, 10, 20, 25, 30, 40, 50, 60, 70], "new doc should appear in sorted position");
+    }
+
+    #[test]
+    fn test_sort_spills_to_disk() {
+        let (engine, _dir) = test_engine();
+
+        // Insert >5 docs (spill threshold)
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        assert_eq!(engine.secondary_index_count(), 0);
+
+        // Sorted scan should spill to disk and create an index
+        let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+        let results = engine.scan(None, Some(&sort), None, None).unwrap();
+        assert_eq!(results.len(), 10);
+
+        assert_eq!(engine.secondary_index_count(), 1, "should spill to disk as partial index");
+    }
+
+    #[test]
+    fn test_small_sort_stays_in_memory() {
+        let (engine, _dir) = test_engine();
+
+        // Insert ≤5 docs (at or below threshold)
+        for i in 0..5 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+        let results = engine.scan(None, Some(&sort), None, None).unwrap();
+        assert_eq!(results.len(), 5);
+
+        assert_eq!(engine.secondary_index_count(), 0, "small sort should stay in memory");
+    }
+
+    #[test]
+    fn test_new_scan_replaces_old_index() {
+        let (engine, _dir) = test_engine();
+
+        for i in 0..20 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // First sorted scan creates an index (full range, no filter)
+        let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
+        engine.scan(None, Some(&sort), None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 1);
+
+        // Second sorted scan with a filter creates a new partial index, replacing the old
+        let filter = Filter::Lt { field: "n".into(), value: Value::U64(10) };
+        engine.scan(Some(&filter), Some(&sort), None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 1, "should replace, not accumulate");
     }
 }

@@ -45,7 +45,7 @@ pub enum Query {
 }
 
 /// Filter predicates for scan queries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     /// Field equals a value
     Eq { field: String, value: Value },
