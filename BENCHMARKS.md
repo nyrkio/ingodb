@@ -28,6 +28,21 @@ the write-heavy phase, then gradually shifted back to full leveled (W=-8)
 during the read-heavy phase. 5 compaction runs total, 623 MB read,
 481 MB written (WA=0.77x).
 
+### Performance Metrics
+
+| Phase | Metric | Value |
+|-------|--------|-------|
+| Ingest | 1M docs | starts 210K/sec, degrades to 64K/sec as SSTables grow |
+| Updates | 1M random | starts 230K/sec, degrades as compaction runs |
+| Point lookups | 20K gets (4 SSTables) | 52K ops/sec, p50=15µs, p95=36µs, p99=43µs |
+| Scan cold | category filter, 100K results | 4.8s |
+| Scan warm (index) | same query | 2.2s (**2.2x speedup**) |
+| Compound filter+sort | price>50 AND rating>3, limit 20 | 9.5s |
+| Snapshot isolation | | 100/100 correct |
+| Mixed read/write | 10K ops | 737K ops/sec |
+| 8-thread concurrent | 80K reads | 254K ops/sec |
+| Pure reads | 2M gets (2 SSTables, W=-8) | 57K ops/sec |
+
 Final state: W=-8 (fully leveled), 2 SSTables, 57K point lookup ops/sec.
 
 ---
