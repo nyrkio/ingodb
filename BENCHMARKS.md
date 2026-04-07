@@ -6,6 +6,34 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-04-08 — 1M Products with Random Updates, UCS W Comparison
+
+1M inserts + 500K random updates. Compaction settle time and read performance.
+
+| W | Mode | f | t | Settle time | Final SSTables | Compact runs | Bytes read | WA | Lookup p50 | Lookup ops/sec | Update rate |
+|---|------|---|---|------------|---------------|-------------|-----------|-----|-----------|---------------|-------------|
+| 9 | Tiered | 11 | 11 | **12.1s** | **2** | 2 | 410 MB | 0.81x | 13.8 us | **66K** | 10K/sec |
+| 4 | Tiered | 6 | 6 | **9.5s** | **2** | 3 | 286 MB | 0.89x | 26.1 us | 34K | 10K/sec |
+| 0 | Balanced | 2 | 2 | **16.3s** | **3** | 8 | 416 MB | 0.93x | 39.1 us | 24K | 12K/sec |
+| -4 | Leveled | 6 | 2 | **12.7s** | **2** | 8 | 486 MB | 0.94x | 26.3 us | 36K | 12K/sec |
+| -9 | Leveled | 11 | 2 | **15.9s** | **1** | 4 | 749 MB | 0.90x | 14.3 us | **62K** | 16K/sec |
+
+Key findings at 1M scale:
+- **W=9 (tiered)**: fewest compaction runs (2), reads 410 MB, produces 2 SSTables.
+  Best read performance (66K ops/sec) after settling. But settle takes 12s.
+- **W=0 (balanced)**: most compaction runs (8), reads 416 MB, but 3 SSTables remain.
+  Worst read performance (24K ops/sec). Most write amplification (0.93x).
+- **W=-9 (leveled)**: 4 compaction runs, reads 749 MB (most I/O), but produces 1 SSTable.
+  Best single-SSTable result. Settle takes 16s.
+- **W=4 vs W=-4**: similar final state (2 SSTables), but W=4 gets there with
+  fewer compaction rounds (3 vs 8) and less I/O (286 vs 486 MB).
+
+The tradeoff is now clear: higher |W| = larger fanout = bigger individual merges
+but fewer total rounds. W=0 does many small merges (8 rounds) which is less
+efficient at scale.
+
+---
+
 ## 2026-04-08 — 100K Products with Random Updates, UCS W Comparison
 
 100K inserts + 50K random updates. Shows UCS tradeoff with compaction settle time.
