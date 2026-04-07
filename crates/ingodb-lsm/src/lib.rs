@@ -2,7 +2,7 @@ mod compaction;
 
 use ingodb_blob::{DocumentId, IBlob, Value};
 use ingodb_memtable::MemTable;
-use ingodb_query::{Filter, Query};
+use ingodb_query::{compare_values, Filter, Query, SortDirection, SortField};
 use ingodb_sstable::{SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use parking_lot::Mutex;
@@ -361,10 +361,11 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Full scan: merge all live documents, apply filter/projection/limit.
+    /// Full scan: merge all live documents, apply filter/sort/projection/limit.
     pub fn scan(
         &self,
         filter: Option<&Filter>,
+        sort: Option<&[SortField]>,
         project: Option<&[String]>,
         limit: Option<usize>,
     ) -> Result<Vec<IBlob>, LsmError> {
@@ -383,13 +384,13 @@ impl LsmEngine {
         }
 
         // Merge: sort by _id, dedup keeping highest _version
-        all.sort_by(|(id_a, blob_a), (id_b, blob_b)| {
-            id_a.cmp(id_b).then_with(|| blob_b.version().cmp(blob_a.version()))
+        all.sort_by(|(id_a, _blob_a), (id_b, _blob_b)| {
+            id_a.cmp(id_b).then_with(|| _blob_b.version().cmp(_blob_a.version()))
         });
         all.dedup_by_key(|(id, _)| *id);
 
-        // Filter out tombstones, apply query filter, projection, and limit
-        let mut results = Vec::new();
+        // Filter out tombstones and apply query filter
+        let mut results: Vec<IBlob> = Vec::new();
         for (_, blob) in all {
             if blob.is_deleted() {
                 continue;
@@ -399,16 +400,43 @@ impl LsmEngine {
                     continue;
                 }
             }
-            let result = match project {
-                Some(fields) => blob.project(fields),
-                None => blob,
-            };
-            results.push(result);
-            if let Some(lim) = limit {
-                if results.len() >= lim {
-                    break;
+            results.push(blob);
+        }
+
+        // Sort (before projection — sort fields may not be in the projection)
+        if let Some(sort_fields) = sort {
+            results.sort_by(|a, b| {
+                for sf in sort_fields {
+                    let va = a.get_field(&sf.field);
+                    let vb = b.get_field(&sf.field);
+                    let ord = match (&va, &vb) {
+                        (Some(va), Some(vb)) => {
+                            compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        (Some(_), None) => std::cmp::Ordering::Less,   // non-null first
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    };
+                    let ord = match sf.direction {
+                        SortDirection::Ascending => ord,
+                        SortDirection::Descending => ord.reverse(),
+                    };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
                 }
-            }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // Apply limit (after sort)
+        if let Some(lim) = limit {
+            results.truncate(lim);
+        }
+
+        // Apply projection (last — sort fields may not be projected)
+        if let Some(fields) = project {
+            results = results.into_iter().map(|blob| blob.project(fields)).collect();
         }
 
         Ok(results)
@@ -431,7 +459,7 @@ impl LsmEngine {
         }
 
         // Get starting documents
-        let mut current = self.scan(start, None, None)?;
+        let mut current = self.scan(start, None, None, None)?;
         let mut all_results = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -448,7 +476,7 @@ impl LsmEngine {
 
             // Find target documents where to_field matches any join value
             let mut next = Vec::new();
-            let candidates = self.scan(None, None, None)?;
+            let candidates = self.scan(None, None, None, None)?;
             for doc in candidates {
                 if let Some(target_val) = doc.get_field(to_field) {
                     if join_values.contains(&target_val) && seen.insert(*doc.id()) {
@@ -474,9 +502,10 @@ impl LsmEngine {
             Query::Get { id } => {
                 Ok(self.get(id)?.into_iter().collect())
             }
-            Query::Scan { filter, project, limit } => {
+            Query::Scan { filter, sort, project, limit } => {
                 self.scan(
                     filter.as_ref(),
+                    sort.as_deref(),
                     project.as_deref(),
                     *limit,
                 )
@@ -729,7 +758,7 @@ mod tests {
         for i in 0..5 {
             engine.put(make_blob(i)).unwrap();
         }
-        let results = engine.scan(None, None, None).unwrap();
+        let results = engine.scan(None, None, None, None).unwrap();
         assert_eq!(results.len(), 5);
     }
 
@@ -743,7 +772,7 @@ mod tests {
             field: "n".into(),
             value: Value::U64(6),
         };
-        let results = engine.scan(Some(&filter), None, None).unwrap();
+        let results = engine.scan(Some(&filter), None, None, None).unwrap();
         assert_eq!(results.len(), 3); // n=7,8,9
         for r in &results {
             if let Some(Value::U64(n)) = r.get("n") {
@@ -758,7 +787,7 @@ mod tests {
         for i in 0..10 {
             engine.put(make_blob(i)).unwrap();
         }
-        let results = engine.scan(None, None, Some(3)).unwrap();
+        let results = engine.scan(None, None, None, Some(3)).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -767,7 +796,7 @@ mod tests {
         let (engine, _dir) = test_engine();
         engine.put(make_blob(1)).unwrap();
 
-        let results = engine.scan(None, Some(&["n".into()]), None).unwrap();
+        let results = engine.scan(None, None, Some(&["n".into()]), None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].is_projection());
         assert_eq!(results[0].field_count(), 1);
@@ -785,7 +814,7 @@ mod tests {
 
         engine.delete(&id).unwrap();
 
-        let results = engine.scan(None, None, None).unwrap();
+        let results = engine.scan(None, None, None, None).unwrap();
         assert_eq!(results.len(), 1, "deleted doc not in scan results");
     }
 
@@ -809,6 +838,7 @@ mod tests {
         }
         let results = engine.execute(&Query::Scan {
             filter: Some(Filter::Lt { field: "n".into(), value: Value::U64(3) }),
+            sort: None,
             project: None,
             limit: None,
         }).unwrap();
@@ -993,8 +1023,88 @@ mod tests {
             Some(&Filter::Eq { field: "_id".into(), value: Value::Uuid(id) }),
             None,
             None,
+            None,
         ).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].get("n"), Some(&Value::U64(42)));
+    }
+
+    #[test]
+    fn test_scan_sort_ascending() {
+        let (engine, _dir) = test_engine();
+        engine.put(make_blob(30)).unwrap();
+        engine.put(make_blob(10)).unwrap();
+        engine.put(make_blob(20)).unwrap();
+
+        let results = engine.scan(
+            None,
+            Some(&[SortField { field: "n".into(), direction: SortDirection::Ascending }]),
+            None,
+            None,
+        ).unwrap();
+        let ns: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(ns, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_scan_sort_descending() {
+        let (engine, _dir) = test_engine();
+        engine.put(make_blob(30)).unwrap();
+        engine.put(make_blob(10)).unwrap();
+        engine.put(make_blob(20)).unwrap();
+
+        let results = engine.scan(
+            None,
+            Some(&[SortField { field: "n".into(), direction: SortDirection::Descending }]),
+            None,
+            None,
+        ).unwrap();
+        let ns: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(ns, vec![30, 20, 10]);
+    }
+
+    #[test]
+    fn test_scan_sort_with_limit() {
+        let (engine, _dir) = test_engine();
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        // Sort descending, take top 3
+        let results = engine.scan(
+            None,
+            Some(&[SortField { field: "n".into(), direction: SortDirection::Descending }]),
+            None,
+            Some(3),
+        ).unwrap();
+        let ns: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(ns, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn test_scan_sort_with_filter_and_projection() {
+        let (engine, _dir) = test_engine();
+        for i in 0..10 {
+            engine.put(make_blob(i)).unwrap();
+        }
+        // Filter n > 5, sort ascending, project only "n"
+        let filter = Filter::Gt { field: "n".into(), value: Value::U64(5) };
+        let results = engine.scan(
+            Some(&filter),
+            Some(&[SortField { field: "n".into(), direction: SortDirection::Ascending }]),
+            Some(&["n".into()]),
+            None,
+        ).unwrap();
+        assert_eq!(results.len(), 4); // 6,7,8,9
+        assert!(results[0].is_projection());
+        let ns: Vec<u64> = results.iter()
+            .filter_map(|b| match b.get("n") { Some(Value::U64(n)) => Some(*n), _ => None })
+            .collect();
+        assert_eq!(ns, vec![6, 7, 8, 9]);
     }
 }

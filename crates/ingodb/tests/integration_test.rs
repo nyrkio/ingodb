@@ -382,6 +382,7 @@ fn test_execute_scan_with_filter() {
     // Find users older than 30
     let results = engine.execute(&Query::Scan {
         filter: Some(Filter::Gt { field: "age".into(), value: Value::U64(30) }),
+        sort: None,
         project: None,
         limit: None,
     }).unwrap();
@@ -401,6 +402,7 @@ fn test_execute_scan_with_projection() {
 
     let results = engine.execute(&Query::Scan {
         filter: None,
+        sort: None,
         project: Some(vec!["name".into()]),
         limit: None,
     }).unwrap();
@@ -422,6 +424,7 @@ fn test_execute_scan_with_limit() {
     }
     let results = engine.execute(&Query::Scan {
         filter: None,
+        sort: None,
         project: None,
         limit: Some(3),
     }).unwrap();
@@ -438,7 +441,7 @@ fn test_scan_skips_deleted() {
     engine.put(user2).unwrap();
     engine.delete(&delete_id).unwrap();
 
-    let results = engine.scan(None, None, None).unwrap();
+    let results = engine.scan(None, None, None, None).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get("name"), Some(&Value::String("Keep".into())));
 }

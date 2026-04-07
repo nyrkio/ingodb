@@ -9,9 +9,10 @@ pub enum Query {
     /// Point lookup by document ID
     Get { id: DocumentId },
 
-    /// Scan with optional filter and projection
+    /// Scan with optional filter, sort, projection, and limit
     Scan {
         filter: Option<Filter>,
+        sort: Option<Vec<SortField>>,
         project: Option<Vec<String>>,
         limit: Option<usize>,
     },
@@ -117,8 +118,22 @@ impl Filter {
     }
 }
 
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// A field to sort by, with direction.
+#[derive(Debug, Clone)]
+pub struct SortField {
+    pub field: String,
+    pub direction: SortDirection,
+}
+
 /// Compare two values of the same type. Returns None for incompatible types.
-fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+pub fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::I64(a), Value::I64(b)) => Some(a.cmp(b)),
         (Value::U64(a), Value::U64(b)) => Some(a.cmp(b)),
