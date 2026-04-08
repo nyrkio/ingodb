@@ -55,6 +55,21 @@ impl Wal {
         })
     }
 
+    /// Append multiple blobs to the WAL in one batch. Single flush at the end.
+    pub fn append_batch(&mut self, blobs: &mut [IBlob]) -> Result<(), WalError> {
+        for blob in blobs.iter_mut() {
+            let blob_bytes = blob.encode();
+            let length = blob_bytes.len() as u32;
+            let crc = crc32fast::hash(&blob_bytes);
+            self.writer.write_all(&length.to_le_bytes())?;
+            self.writer.write_all(&crc.to_le_bytes())?;
+            self.writer.write_all(&blob_bytes)?;
+            self.size += 4 + 4 + blob_bytes.len() as u64;
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Append a blob to the WAL. Returns the byte offset of the record.
     pub fn append(&mut self, blob: &mut IBlob) -> Result<u64, WalError> {
         let offset = self.size;

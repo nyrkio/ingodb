@@ -160,6 +160,10 @@ pub struct LsmEngine {
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
     /// Active snapshot versions — compaction preserves versions >= oldest snapshot
     active_snapshots: Mutex<BTreeSet<DocumentId>>,
+    /// Group commit: pending WAL writes from concurrent put() calls
+    wal_batch: Mutex<Vec<IBlob>>,
+    /// Notifies waiting writers that their batch was committed
+    wal_batch_done: Condvar,
     /// Background compaction signaling
     compaction_signal: Arc<CompactionSignal>,
     /// Background compaction thread handle
@@ -300,6 +304,8 @@ impl LsmEngine {
             secondary_indexes: Mutex::new(Vec::new()),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
+            wal_batch: Mutex::new(Vec::new()),
+            wal_batch_done: Condvar::new(),
             compaction_signal: Arc::new(CompactionSignal {
                 pending: Mutex::new(false),
                 notify: Condvar::new(),
@@ -319,28 +325,40 @@ impl LsmEngine {
     }
 
     /// Insert a document into the engine.
-    /// Stamps a server-assigned `_version` before writing.
+    /// Uses group commit: concurrent put() calls batch their WAL writes.
     pub fn put(&self, mut blob: IBlob) -> Result<(), LsmError> {
         self.write_count.fetch_add(1, Ordering::Relaxed);
-        // Server stamps the version — this is the single point of version assignment
         blob.set_version(DocumentId::new());
 
-        // Write to WAL first for durability (version is now embedded in the blob)
-        {
-            let mut wal = self.wal.lock();
-            wal.append(&mut blob)?;
+        // Group commit: add to batch buffer, then grab WAL lock.
+        // While we wait for the lock, other writers accumulate in the batch.
+        self.wal_batch.lock().push(blob);
+        let mut wal = self.wal.lock();
+
+        // Drain everything that accumulated while we waited
+        let mut to_write: Vec<IBlob> = std::mem::take(&mut *self.wal_batch.lock());
+        if to_write.is_empty() {
+            return Ok(()); // another leader already wrote our entry
         }
 
-        // Notify secondary indexes of the new/updated document
-        {
-            let indexes = self.secondary_indexes.lock();
-            for idx in indexes.iter() {
-                idx.notify_put(&blob);
+        // Write the whole batch to WAL at once
+        wal.append_batch(&mut to_write)?;
+        drop(wal);
+
+        // Insert all into memtable + notify indexes
+        let indexes = self.secondary_indexes.lock();
+        let memtable = self.memtable.read();
+        for blob in to_write {
+            if !indexes.is_empty() {
+                for idx in indexes.iter() {
+                    idx.notify_put(&blob);
+                }
             }
+            memtable.insert(blob);
         }
-
-        // Insert into active memtable
-        let should_flush = self.memtable.read().insert(blob);
+        let should_flush = memtable.should_flush();
+        drop(memtable);
+        drop(indexes);
 
         if should_flush {
             self.rotate_memtable()?;
