@@ -235,27 +235,52 @@ fn phase_bulk_ingest(engine: &Arc<LsmEngine>) -> Vec<DocumentId> {
 }
 
 fn phase_random_updates(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
-    let num_updates = NUM_PRODUCTS; // update 100% of docs
-    println!("\n--- Phase 1b: Random Updates ({} updates to existing docs) ---", num_updates);
+    let num_updates = NUM_PRODUCTS;
+    println!("\n--- Phase 1b: Random Updates ({} updates) ---", num_updates);
 
-    let start = Instant::now();
-    for i in 0..num_updates {
-        // Pseudo-random selection: update a uniformly distributed existing doc
-        let idx = ((i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) % ids.len() as u64) as usize;
-        let id = ids[idx];
-        let updated = make_product_with_id(id, i + NUM_PRODUCTS); // different field values, same _id
-        engine.put(updated).unwrap();
-
-        if (i + 1) % 10_000 == 0 {
-            let elapsed = start.elapsed();
-            let rate = (i + 1) as f64 / elapsed.as_secs_f64();
-            eprint!("\r  {}/{} ({:.0} updates/sec)", i + 1, num_updates, rate);
+    // Single-threaded baseline
+    {
+        let start = Instant::now();
+        for i in 0..num_updates {
+            let idx = ((i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) % ids.len() as u64) as usize;
+            let updated = make_product_with_id(ids[idx], i + NUM_PRODUCTS);
+            engine.put(updated).unwrap();
         }
+        let elapsed = start.elapsed();
+        let rate = num_updates as f64 / elapsed.as_secs_f64();
+        println!("  1 thread:  {} updates in {:.2?} → {:.0} updates/sec", num_updates, elapsed, rate);
     }
 
-    let elapsed = start.elapsed();
-    let rate = num_updates as f64 / elapsed.as_secs_f64();
-    println!("\r  {} updates in {:.2?} ({:.0} updates/sec)", num_updates, elapsed, rate);
+    // Multi-threaded scaling
+    for num_threads in [2, 4, 8] {
+        let updates_per_thread = num_updates / num_threads as u64;
+        let start = Instant::now();
+        let mut handles = Vec::new();
+
+        for t in 0..num_threads {
+            let engine = Arc::clone(engine);
+            let ids = ids.to_vec();
+            handles.push(std::thread::spawn(move || {
+                let offset = t as u64 * updates_per_thread;
+                for i in 0..updates_per_thread {
+                    let j = offset + i;
+                    let idx = ((j.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) % ids.len() as u64) as usize;
+                    let updated = make_product_with_id(ids[idx], j + NUM_PRODUCTS * 2);
+                    engine.put(updated).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let elapsed = start.elapsed();
+        let rate = num_updates as f64 / elapsed.as_secs_f64();
+        println!("  {} threads: {} updates in {:.2?} → {:.0} updates/sec",
+            num_threads, num_updates, elapsed, rate);
+    }
+
     println!("  SSTables after updates: {}", engine.sstable_count());
 }
 
