@@ -349,6 +349,54 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Insert a batch of documents. More efficient than individual put() calls
+    /// because locks are acquired once for the entire batch.
+    pub fn put_batch(&self, mut blobs: Vec<IBlob>) -> Result<(), LsmError> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        self.write_count.fetch_add(blobs.len() as u64, Ordering::Relaxed);
+
+        // Stamp versions
+        for blob in blobs.iter_mut() {
+            blob.set_version(DocumentId::new());
+        }
+
+        // WAL: one lock, all appends
+        {
+            let mut wal = self.wal.lock();
+            for blob in blobs.iter_mut() {
+                wal.append(blob)?;
+            }
+        }
+
+        // Secondary indexes: one lock, all notifications
+        {
+            let indexes = self.secondary_indexes.lock();
+            if !indexes.is_empty() {
+                for blob in blobs.iter() {
+                    for idx in indexes.iter() {
+                        idx.notify_put(blob);
+                    }
+                }
+            }
+        }
+
+        // Memtable: one lock, all inserts
+        {
+            let memtable = self.memtable.read();
+            for blob in blobs {
+                memtable.insert(blob);
+            }
+            if memtable.should_flush() {
+                drop(memtable);
+                self.rotate_memtable()?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Delete a document by writing a tombstone.
     /// Stamps a server-assigned `_version` on the tombstone.
     pub fn delete(&self, id: &DocumentId) -> Result<(), LsmError> {

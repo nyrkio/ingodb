@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const NUM_PRODUCTS: u64 = 100_000;
+const NUM_PRODUCTS: u64 = 1_000_000;
 const NUM_LOOKUPS: u64 = 20_000;
 const NUM_SCAN_QUERIES: u64 = 50;
 const CATEGORIES: &[&str] = &[
@@ -202,22 +202,27 @@ fn make_product_with_id(id: DocumentId, i: u64) -> IBlob {
 }
 
 fn phase_bulk_ingest(engine: &Arc<LsmEngine>) -> Vec<DocumentId> {
-    println!("--- Phase 1: Bulk Ingest ({} products) ---", NUM_PRODUCTS);
+    const BATCH_SIZE: u64 = 1000;
+    println!("--- Phase 1: Bulk Ingest ({} products, batch={}) ---", NUM_PRODUCTS, BATCH_SIZE);
 
     let mut ids = Vec::with_capacity(NUM_PRODUCTS as usize);
     let start = Instant::now();
-    let mut bytes_written = 0u64;
 
-    for i in 0..NUM_PRODUCTS {
-        let blob = make_product(i);
-        ids.push(*blob.id());
-        bytes_written += blob.fields().len() as u64 * 50; // rough estimate
-        engine.put(blob).unwrap();
+    let mut i = 0u64;
+    while i < NUM_PRODUCTS {
+        let end = (i + BATCH_SIZE).min(NUM_PRODUCTS);
+        let mut batch: Vec<IBlob> = (i..end).map(|j| {
+            let blob = make_product(j);
+            ids.push(*blob.id());
+            blob
+        }).collect();
+        engine.put_batch(batch).unwrap();
+        i = end;
 
-        if (i + 1) % 10_000 == 0 {
+        if i % 10_000 == 0 {
             let elapsed = start.elapsed();
-            let rate = (i + 1) as f64 / elapsed.as_secs_f64();
-            eprint!("\r  {}/{} ({:.0} docs/sec)", i + 1, NUM_PRODUCTS, rate);
+            let rate = i as f64 / elapsed.as_secs_f64();
+            eprint!("\r  {}/{} ({:.0} docs/sec)", i, NUM_PRODUCTS, rate);
         }
     }
 

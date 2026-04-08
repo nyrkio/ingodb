@@ -6,6 +6,28 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-04-08 — 1M Products, batch writes + double-buffer memtable + adaptive W
+
+Batch writes (1000 docs/batch), double-buffered memtable, adaptive W (unlimited step).
+
+| Phase | Metric | Value |
+|-------|--------|-------|
+| Ingest | 1M docs (batch=1000) | **210-235K docs/sec sustained** |
+| Ingest total | | 4.0s (was 42s before O(N) fix + double-buffer) |
+| Updates | 1M random | starts 230K, settles ~120K during compaction |
+| Compaction settle | after updates | 7.7s → 2 SSTables |
+| Point lookups | 20K gets (2 SSTables) | 56K ops/sec, p50=14µs |
+| Scan cold | category filter, 100K results | 3.9s |
+| Scan warm (index) | | 1.8s (**2.2x speedup**) |
+| 8-thread concurrent | | 413K ops/sec |
+| Mixed read/write | | 781K ops/sec |
+| Pure reads | 2M gets | 51K ops/sec |
+
+Adaptive W journey: 0 → 8 (writes) → -8 (scans) → -3 (mixed) → -8 (reads).
+3 compaction runs, 586 MB read, 423 MB written, WA=0.72x.
+
+---
+
 ## 2026-04-08 — 1M Products, Adaptive W unlimited step (starting W=0)
 
 Same workload as below but with max_step=16 (effectively unlimited).
