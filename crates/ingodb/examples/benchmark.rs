@@ -104,7 +104,7 @@ fn main() {
     phase_snapshot_reads(&engine, &ids);
 
     // Phase 5: Mixed read/write
-    phase_mixed_workload(&engine);
+    phase_mixed_workload(&engine, &ids);
     let t = Instant::now();
     engine.wait_for_compaction().unwrap();
     println!("  Compaction settled in {:?}", t.elapsed());
@@ -423,27 +423,15 @@ fn phase_snapshot_reads(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
     println!("  Snapshot released");
 }
 
-fn phase_mixed_workload(engine: &Arc<LsmEngine>) {
+fn phase_mixed_workload(engine: &Arc<LsmEngine>, ids: &[DocumentId]) {
     println!("\n--- Phase 5: Mixed Read/Write ---");
 
     let total_ops = 10_000u64;
-    let write_ratio = 0.2; // 20% writes, 80% reads
+    let _write_ratio = 0.2; // 20% writes, 80% reads
 
     let start = Instant::now();
     let mut reads = 0u64;
     let mut writes = 0u64;
-
-    // Collect some IDs for reads
-    let read_ids: Vec<DocumentId> = (0..100).map(|_| {
-        let blob = make_product(0);
-        *blob.id()
-    }).collect();
-
-    // Pre-insert read targets
-    for i in 0..100u64 {
-        let blob = make_product(NUM_PRODUCTS + 50000 + i);
-        engine.put(blob).unwrap();
-    }
 
     for i in 0..total_ops {
         if (i % 5) == 0 {
@@ -451,9 +439,9 @@ fn phase_mixed_workload(engine: &Arc<LsmEngine>) {
             engine.put(make_product(NUM_PRODUCTS + 10000 + i)).unwrap();
             writes += 1;
         } else {
-            // Read — point lookup
-            let idx = (i * 7919 % 100) as usize;
-            let _ = engine.get(&read_ids[idx]);
+            // Read — point lookup of real documents
+            let idx = ((i * 7919) % ids.len() as u64) as usize;
+            let _ = engine.get(&ids[idx]);
             reads += 1;
         }
     }
