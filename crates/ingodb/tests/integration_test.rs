@@ -778,3 +778,76 @@ fn test_filter_index_survives_restart() {
 
     let _ = target_ids;
 }
+
+/// Regression test: merging multiple partial indexes must perform a full rebuild
+/// from primary SSTables, not just union the partial entries.
+///
+/// If partial entries were naively merged into a "full range" index, a subsequent
+/// no-filter sort scan would miss documents that don't satisfy either partial filter.
+#[test]
+fn test_partial_index_merge_produces_full_coverage() {
+    // Low spill threshold so partial indexes are created easily.
+    let dir = tempfile::tempdir().unwrap();
+    let config = LsmConfig {
+        data_dir: dir.path().to_path_buf(),
+        memtable_size: 4096,
+        block_size: 512,
+        compaction_threshold: 4,
+        scaling_parameter: 0,
+        sort_spill_threshold: 5,
+        compaction_threads: 1,
+        adaptive_w: false,
+        adaptive_w_cooldown_secs: 1,
+        adaptive_w_max_step: 2,
+        adaptive_w_min: -8,
+        adaptive_w_max: 8,
+    };
+    let engine = LsmEngine::open(config).unwrap();
+
+    // Insert 30 docs: 10 "alpha", 10 "beta", 10 "gamma".
+    for i in 0..10u64 {
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String("alpha".into())),
+            ("score", Value::U64(i)),
+        ])).unwrap();
+    }
+    for i in 0..10u64 {
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String("beta".into())),
+            ("score", Value::U64(i + 10)),
+        ])).unwrap();
+    }
+    for i in 0..10u64 {
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String("gamma".into())),
+            ("score", Value::U64(i + 20)),
+        ])).unwrap();
+    }
+
+    use ingodb::{SortDirection, SortField};
+    let sort = vec![SortField { field: "score".into(), direction: SortDirection::Ascending }];
+
+    // Two filtered sort scans → one partial index each (alpha range, beta range).
+    let alpha_filter = Filter::Eq { field: "category".into(), value: Value::String("alpha".into()) };
+    let r1 = engine.scan(Some(&alpha_filter), Some(&sort), None, None).unwrap();
+    assert_eq!(r1.len(), 10, "alpha scan returns 10 docs");
+
+    let beta_filter = Filter::Eq { field: "category".into(), value: Value::String("beta".into()) };
+    let r2 = engine.scan(Some(&beta_filter), Some(&sort), None, None).unwrap();
+    assert_eq!(r2.len(), 10, "beta scan returns 10 docs");
+
+    // Compaction merges the two partial indexes via full rebuild.
+    engine.compact_now().unwrap();
+
+    // A no-filter sort scan must return ALL 30 docs.
+    // The old buggy merge (union of partial entries) would return only 20.
+    let all = engine.scan(None, Some(&sort), None, None).unwrap();
+    assert_eq!(all.len(), 30, "full sort scan returns all docs after partial index merge");
+
+    // Verify ascending sort order.
+    let scores: Vec<u64> = all.iter().map(|b| match b.get_field("score") {
+        Some(Value::U64(v)) => v,
+        _ => panic!("missing score field"),
+    }).collect();
+    assert_eq!(scores, (0u64..30).collect::<Vec<_>>(), "docs in ascending score order");
+}
