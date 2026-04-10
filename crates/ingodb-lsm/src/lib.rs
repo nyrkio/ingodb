@@ -1529,8 +1529,10 @@ impl LsmEngine {
         let docs_returned = results.len() as u64;
         self.query_stats.record(timer.finish(docs_returned));
 
-        // Reactive: build filter index if warranted
-        if sort.is_none() && results.len() > self.config.sort_spill_threshold {
+        // Reactive: build filter index if warranted.
+        // Trigger is based on docs_scanned (the cost of the full scan), not results.len().
+        // A highly selective filter (1% match rate) has low results.len() but high scan cost.
+        if sort.is_none() && docs_scanned > self.config.sort_spill_threshold as u64 {
             if let Some(filter) = filter {
                 // Extract the filter field for a simple single-field filter
                 let field = match filter {
