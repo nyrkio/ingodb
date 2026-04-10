@@ -669,36 +669,35 @@ impl LsmEngine {
 
         for (fields, group_indices) in &field_groups {
             if group_indices.len() > 1 {
-                // Multiple partial indexes for the same fields — merge them
-                // Combine all entries, dedup, write as one index with combined range
-                let mut all_entries: Vec<IBlob> = Vec::new();
-                for &i in group_indices {
-                    if let Ok(entries) = indexes[i].iter_sorted() {
-                        all_entries.extend(entries.into_iter().map(|(_, blob)| blob));
-                    }
-                }
+                // Multiple partial indexes for the same fields — replace with a full rebuild.
+                // Merging partial entries would produce a false "full range" index that only
+                // covers the union of the partial filter ranges, causing missed documents on
+                // no-filter sort scans. A full rebuild from primary SSTables is correct.
+                let idx_name = fields.join("_");
+                let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+                let merged_path = self.config.data_dir.join(format!("idx_{idx_name}_{sst_id:012}.sst"));
 
-                if !all_entries.is_empty() {
-                    let idx_name = fields.join("_");
-                    let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-                    let merged_path = self.config.data_dir.join(format!("idx_{idx_name}_{sst_id:012}.sst"));
-
-                    if let Ok(merged) = secondary::SecondaryIndex::build_partial(
-                        fields,
-                        None, // merged range becomes full rebuild from entries
-                        &mut all_entries,
-                        &merged_path,
-                        self.config.block_size,
-                    ) {
-                        // Remove old indexes (reverse order to keep indices valid)
-                        let mut to_remove: Vec<usize> = group_indices.clone();
-                        to_remove.sort_unstable_by(|a, b| b.cmp(a));
-                        for i in to_remove {
-                            let old = indexes.remove(i);
-                            std::fs::remove_file(&old.path).ok();
-                        }
-                        indexes.push(merged);
+                if let Ok(merged) = secondary::SecondaryIndex::build(
+                    fields,
+                    &sst_refs,
+                    &merged_path,
+                    self.config.block_size,
+                ) {
+                    // Remove old indexes (reverse order to keep indices valid).
+                    let mut to_remove: Vec<usize> = group_indices.clone();
+                    to_remove.sort_unstable_by(|a, b| b.cmp(a));
+                    for i in to_remove {
+                        let old = indexes.remove(i);
+                        std::fs::remove_file(&old.path).ok();
                     }
+                    indexes.push(merged);
+
+                    // Persist metadata so the merged index survives a restart.
+                    self.pending_index_metadata.lock().push(IndexMetadata {
+                        fields: fields.clone(),
+                        path: merged_path,
+                        is_full_range: true,
+                    });
                 }
             }
         }
@@ -1351,6 +1350,16 @@ impl LsmEngine {
         }
     }
 
+    /// Synchronously flush and compact (SSTable + index).
+    /// Primarily useful in tests and benchmarks to trigger immediate compaction.
+    pub fn compact_now(&self) -> Result<(), LsmError> {
+        if self.memtable.read().len() > 0 {
+            self.rotate_memtable()?;
+        }
+        self.flush_immutable_memtables()?;
+        self.maybe_compact()
+    }
+
     /// Full scan: merge all live documents, apply filter/sort/projection/limit.
     pub fn scan(
         &self,
@@ -1529,8 +1538,10 @@ impl LsmEngine {
         let docs_returned = results.len() as u64;
         self.query_stats.record(timer.finish(docs_returned));
 
-        // Reactive: build filter index if warranted
-        if sort.is_none() && results.len() > self.config.sort_spill_threshold {
+        // Reactive: build filter index if warranted.
+        // Trigger is based on docs_scanned (the cost of the full scan), not results.len().
+        // A highly selective filter (1% match rate) has low results.len() but high scan cost.
+        if sort.is_none() && docs_scanned > self.config.sort_spill_threshold as u64 {
             if let Some(filter) = filter {
                 // Extract the filter field for a simple single-field filter
                 let field = match filter {

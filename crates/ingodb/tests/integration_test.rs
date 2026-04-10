@@ -1,4 +1,4 @@
-use ingodb::{DocumentId, IBlob, LsmConfig, LsmEngine, Value, Filter, Query};
+use ingodb::{Database, DocumentId, IBlob, LsmConfig, LsmEngine, Value, Filter, Query};
 
 fn make_user(name: &str, age: u64) -> IBlob {
     IBlob::from_pairs(vec![
@@ -550,9 +550,11 @@ fn test_query_stats_recorded() {
 
     let (_, ps) = &scan_stats[0];
     assert_eq!(ps.count, 5, "should record 5 executions");
-    assert_eq!(ps.total_scanned, 100, "20 docs scanned × 5 runs");
     assert_eq!(ps.total_returned, 20, "4 docs returned × 5 runs (age 16,17,18,19)");
-    assert!(ps.selectivity() < 0.25, "low selectivity — index candidate");
+    // A reactive filter index is built after scan 2 (docs_scanned=20 > threshold=5).
+    // Scans 3-5 use the index and record docs_scanned=docs_returned=4 each.
+    // Total: 20+20+4+4+4 = 52 — confirms the index reduced scan cost.
+    assert_eq!(ps.total_scanned, 52, "first two scans full (20 each), then 3 via index (4 each)");
 }
 
 #[test]
@@ -602,4 +604,250 @@ fn test_query_stats_low_selectivity_detection() {
     let candidates = engine.query_stats().low_selectivity(0.15, 2);
     assert!(!candidates.is_empty(), "should detect low-selectivity pattern");
     assert!(candidates[0].0.filter_fields.contains(&"category".into()));
+}
+
+#[test]
+fn test_filter_index_built_for_selective_queries() {
+    // The reactive index trigger must be based on docs_scanned, not results.len().
+    // A highly selective filter returns few docs but scans many — that is exactly
+    // the case where an index gives the most benefit.
+    //
+    // With sort_spill_threshold=100 and 500 docs, 5 matching:
+    //   OLD (wrong): results.len()=5 < 100 → no index ever built
+    //   NEW (correct): docs_scanned=500 > 100 → index built after 2 scans
+    let dir = tempfile::tempdir().unwrap();
+    let config = LsmConfig {
+        data_dir: dir.path().to_path_buf(),
+        memtable_size: 1024 * 1024,
+        block_size: 512,
+        compaction_threshold: 100,
+        scaling_parameter: 0,
+        sort_spill_threshold: 100, // 5 results < 100 < 500 docs scanned
+        compaction_threads: 1,
+        adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+    };
+    let engine = LsmEngine::open(config).unwrap();
+
+    // Insert 500 docs: only 5 have category='rare' (1% selectivity).
+    for i in 0u64..500 {
+        let category = if i < 5 { "rare" } else { "common" };
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String(category.into())),
+            ("seq", Value::U64(i)),
+        ])).unwrap();
+    }
+    engine.flush_memtable().unwrap();
+
+    let filter = Filter::Eq {
+        field: "category".into(),
+        value: Value::String("rare".into()),
+    };
+
+    assert_eq!(engine.secondary_index_count(), 0, "no index before any scan");
+
+    // First scan: records stats (count=1), no index yet.
+    let results1 = engine.scan(Some(&filter), None, None, None).unwrap();
+    assert_eq!(results1.len(), 5, "first scan returns 5 docs");
+    assert_eq!(engine.secondary_index_count(), 0, "no index after first scan");
+
+    // Second scan: stats.count=2, docs_scanned=500 > threshold=100, selectivity=0.01 < 0.5.
+    // Index is built reactively.
+    let results2 = engine.scan(Some(&filter), None, None, None).unwrap();
+    assert_eq!(results2.len(), 5, "second scan returns 5 docs");
+    assert_eq!(engine.secondary_index_count(), 1, "filter index built after second scan");
+
+    // Third scan uses the index: O(log N + R) instead of O(N).
+    let results3 = engine.scan(Some(&filter), None, None, None).unwrap();
+    assert_eq!(results3.len(), 5, "third scan returns 5 docs via index");
+    for doc in &results3 {
+        assert_eq!(doc.get("category"), Some(&Value::String("rare".into())));
+    }
+}
+
+#[test]
+fn test_filter_index_not_built_below_scan_threshold() {
+    // When docs_scanned <= sort_spill_threshold, no reactive index is built.
+    // Avoids building indexes for cheap scans that don't need them.
+    let dir = tempfile::tempdir().unwrap();
+    let config = LsmConfig {
+        data_dir: dir.path().to_path_buf(),
+        memtable_size: 1024 * 1024,
+        block_size: 512,
+        compaction_threshold: 100,
+        scaling_parameter: 0,
+        sort_spill_threshold: 1000, // threshold higher than total docs
+        compaction_threads: 1,
+        adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+    };
+    let engine = LsmEngine::open(config).unwrap();
+
+    for i in 0u64..100 {
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String("common".into())),
+            ("seq", Value::U64(i)),
+        ])).unwrap();
+    }
+    engine.flush_memtable().unwrap();
+
+    let filter = Filter::Eq {
+        field: "category".into(),
+        value: Value::String("common".into()),
+    };
+
+    // Run many scans — docs_scanned=100 < threshold=1000, so no index.
+    for _ in 0..5 {
+        engine.scan(Some(&filter), None, None, None).unwrap();
+    }
+    assert_eq!(engine.secondary_index_count(), 0, "no index when scan cost is below threshold");
+}
+
+#[test]
+fn test_filter_index_survives_restart() {
+    // A filter-field index persisted via the system collection must be loaded
+    // on restart and used for subsequent queries.
+    let dir = tempfile::tempdir().unwrap();
+    let config = LsmConfig {
+        data_dir: dir.path().to_path_buf(),
+        memtable_size: 1024 * 1024,
+        block_size: 512,
+        compaction_threshold: 100,
+        scaling_parameter: 0,
+        sort_spill_threshold: 100,
+        compaction_threads: 1,
+        adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+    };
+
+    let target_ids: Vec<DocumentId>;
+
+    {
+        let db = Database::open(config.clone()).unwrap();
+
+        let mut ids = Vec::new();
+        db.with_collection("items", |engine: &LsmEngine| {
+            for i in 0u64..500 {
+                let category = if i < 5 { "rare" } else { "common" };
+                let blob = IBlob::from_pairs(vec![
+                    ("category", Value::String(category.into())),
+                    ("seq", Value::U64(i)),
+                ]);
+                ids.push(*blob.id());
+                engine.put(blob)?;
+            }
+            engine.flush_memtable()
+        }).unwrap();
+
+        target_ids = ids;
+
+        let filter = Filter::Eq {
+            field: "category".into(),
+            value: Value::String("rare".into()),
+        };
+
+        // Two scans to trigger reactive index creation.
+        for _ in 0..2 {
+            db.with_collection("items", |engine: &LsmEngine| {
+                engine.scan(Some(&filter), None, None, None)?;
+                Ok(())
+            }).unwrap();
+        }
+
+        let count = db.with_collection("items", |engine: &LsmEngine| {
+            Ok(engine.secondary_index_count())
+        }).unwrap();
+        assert_eq!(count, 1, "filter index built before restart");
+    }
+
+    // Restart — index must be reloaded from system collection.
+    {
+        let db = Database::open(config).unwrap();
+
+        let count = db.with_collection("items", |engine: &LsmEngine| {
+            Ok(engine.secondary_index_count())
+        }).unwrap();
+        assert_eq!(count, 1, "filter index survives restart");
+
+        let filter = Filter::Eq {
+            field: "category".into(),
+            value: Value::String("rare".into()),
+        };
+        let results = db.with_collection("items", |engine: &LsmEngine| {
+            engine.scan(Some(&filter), None, None, None)
+        }).unwrap();
+        assert_eq!(results.len(), 5, "correct results via reloaded filter index");
+    }
+
+    let _ = target_ids;
+}
+
+/// Regression test: merging multiple partial indexes must perform a full rebuild
+/// from primary SSTables, not just union the partial entries.
+///
+/// If partial entries were naively merged into a "full range" index, a subsequent
+/// no-filter sort scan would miss documents that don't satisfy either partial filter.
+#[test]
+fn test_partial_index_merge_produces_full_coverage() {
+    // Low spill threshold so partial indexes are created easily.
+    let dir = tempfile::tempdir().unwrap();
+    let config = LsmConfig {
+        data_dir: dir.path().to_path_buf(),
+        memtable_size: 4096,
+        block_size: 512,
+        compaction_threshold: 4,
+        scaling_parameter: 0,
+        sort_spill_threshold: 5,
+        compaction_threads: 1,
+        adaptive_w: false,
+        adaptive_w_cooldown_secs: 1,
+        adaptive_w_max_step: 2,
+        adaptive_w_min: -8,
+        adaptive_w_max: 8,
+    };
+    let engine = LsmEngine::open(config).unwrap();
+
+    // Insert 30 docs: 10 "alpha", 10 "beta", 10 "gamma".
+    for i in 0..10u64 {
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String("alpha".into())),
+            ("score", Value::U64(i)),
+        ])).unwrap();
+    }
+    for i in 0..10u64 {
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String("beta".into())),
+            ("score", Value::U64(i + 10)),
+        ])).unwrap();
+    }
+    for i in 0..10u64 {
+        engine.put(IBlob::from_pairs(vec![
+            ("category", Value::String("gamma".into())),
+            ("score", Value::U64(i + 20)),
+        ])).unwrap();
+    }
+
+    use ingodb::{SortDirection, SortField};
+    let sort = vec![SortField { field: "score".into(), direction: SortDirection::Ascending }];
+
+    // Two filtered sort scans → one partial index each (alpha range, beta range).
+    let alpha_filter = Filter::Eq { field: "category".into(), value: Value::String("alpha".into()) };
+    let r1 = engine.scan(Some(&alpha_filter), Some(&sort), None, None).unwrap();
+    assert_eq!(r1.len(), 10, "alpha scan returns 10 docs");
+
+    let beta_filter = Filter::Eq { field: "category".into(), value: Value::String("beta".into()) };
+    let r2 = engine.scan(Some(&beta_filter), Some(&sort), None, None).unwrap();
+    assert_eq!(r2.len(), 10, "beta scan returns 10 docs");
+
+    // Compaction merges the two partial indexes via full rebuild.
+    engine.compact_now().unwrap();
+
+    // A no-filter sort scan must return ALL 30 docs.
+    // The old buggy merge (union of partial entries) would return only 20.
+    let all = engine.scan(None, Some(&sort), None, None).unwrap();
+    assert_eq!(all.len(), 30, "full sort scan returns all docs after partial index merge");
+
+    // Verify ascending sort order.
+    let scores: Vec<u64> = all.iter().map(|b| match b.get_field("score") {
+        Some(Value::U64(v)) => v,
+        _ => panic!("missing score field"),
+    }).collect();
+    assert_eq!(scores, (0u64..30).collect::<Vec<_>>(), "docs in ascending score order");
 }

@@ -36,18 +36,19 @@ Each phase produces a working, testable artifact. No phase depends on network or
 - Partial index ranges: each index covers a specific filter range, accumulates, merged at compaction
 - Index maintenance: eager buffer on put, lazy stale check on read
 - Smart compaction: merge vs full rebuild at M > 0.5*N*ln(N), extend to full range at ≥50% coverage
+- Multiple partial indexes for the same field are merged via full rebuild from primary SSTables (ensures complete coverage)
 - Drop unused indexes after ≥10 compaction cycles AND ≥30 days
 - Collections: Database wraps multiple LsmEngines, system collection for crash-safe metadata
+
+### Phase 5b: MVCC — Snapshot Reads ✓
+- Read from a stable snapshot: `_version <= snapshot_version` at scan start
+- `get_at()` and `scan_at()` filter by snapshot version via MvccKeyExtractor
+- Old versions retained until no snapshot references them (GC via `active_snapshots` BTreeSet)
+- Enables consistent scan results during concurrent writes
 
 ---
 
 ## Remaining Phases
-
-### Phase 5b: MVCC — Snapshot Reads
-- Read from a stable snapshot: `_version <= snapshot_version` at scan start
-- `get()` and `scan()` filter by snapshot version
-- Old versions retained until no snapshot references them (GC)
-- Enables consistent scan results during concurrent writes
 
 ### Phase 5c: Advanced Reactive Morphing
 - **Semantic shredding**: extract hot fields into columnar side-structures during compaction
