@@ -7,7 +7,7 @@
 //! over time based on access patterns and benchmarking data.
 
 pub use ingodb_blob::{self as blob, ContentHash, DocumentId, IBlob, Value};
-pub use ingodb_lsm::{self as lsm, LsmConfig, LsmEngine, LsmError};
+pub use ingodb_lsm::{self as lsm, Database, LsmConfig, LsmEngine, LsmError};
 pub use ingodb_memtable::{self as memtable, MemTable};
 pub use ingodb_query::{self as query, Filter, Query, QueryResult, SortDirection, SortField};
 pub use ingodb_sstable::{self as sstable, SSTableReader, SSTableWriter};
