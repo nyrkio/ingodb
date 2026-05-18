@@ -1,4 +1,4 @@
-use ingodb::{DocumentId, IBlob, LsmConfig, LsmEngine, Value, Filter, Query};
+use ingodb::{Consistency, DocumentId, IBlob, LsmConfig, LsmEngine, Value, Filter, Query};
 
 fn make_user(name: &str, age: u64) -> IBlob {
     IBlob::from_pairs(vec![
@@ -26,7 +26,7 @@ fn test_engine() -> (LsmEngine, tempfile::TempDir) {
         scaling_parameter: 0,
         sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
     };
     let engine = LsmEngine::open(config).unwrap();
     (engine, dir)
@@ -142,7 +142,7 @@ fn test_survive_restart() {
         scaling_parameter: 0,
         sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
     };
 
     let user = make_user("Persistent", 99);
@@ -176,7 +176,7 @@ fn test_flush_and_recover_from_sstable() {
         scaling_parameter: 0,
         sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
     };
 
     let mut ids = Vec::new();
@@ -321,7 +321,7 @@ fn test_delete_survives_restart() {
         scaling_parameter: 0,
         sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
     };
 
     let user = make_user("RestartDelete", 40);

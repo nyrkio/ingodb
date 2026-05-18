@@ -1,5 +1,6 @@
 use crate::{LsmConfig, LsmEngine, LsmError};
 use ingodb_blob::{IBlob, Value};
+use ingodb_consistency::Consistency;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -194,7 +195,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let db = Database::open(config).unwrap();
         (db, dir)
@@ -250,7 +251,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
 
         let blob = IBlob::from_pairs(vec![
@@ -303,7 +304,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
 
         let blob = IBlob::from_pairs(vec![("x", Value::U64(42))]);
@@ -337,7 +338,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
 
         {
@@ -410,7 +411,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
 
         let update_id;
@@ -481,7 +482,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5, // low: creates index on first scan
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
 
         fn det_id(i: u64) -> DocumentId {

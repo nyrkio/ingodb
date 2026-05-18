@@ -9,7 +9,7 @@
 //! 4. Snapshot reads under concurrent writes
 //! 5. Compaction performance
 
-use ingodb::{DocumentId, Filter, IBlob, LsmConfig, LsmEngine, Query, SortDirection, SortField, Value};
+use ingodb::{Consistency, DocumentId, Filter, IBlob, LsmConfig, LsmEngine, Query, SortDirection, SortField, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,7 +47,7 @@ fn main() {
         adaptive_w_cooldown_secs: 1, // very short cooldown for benchmarks
         adaptive_w_max_step: 16, // effectively unlimited — jump to target immediately
         adaptive_w_min: -8,
-        adaptive_w_max: 8,
+        adaptive_w_max: 8, min_consistency: Consistency::default(),
     };
 
     let mode = match w.cmp(&0) {

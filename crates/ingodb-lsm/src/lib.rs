@@ -6,6 +6,7 @@ pub mod stats;
 pub use database::Database;
 
 use ingodb_blob::{DocumentId, IBlob, Value};
+use ingodb_consistency::{Consistency, ConsistencyModel, Scope};
 use ingodb_memtable::MemTable;
 use ingodb_query::{compare_values, Filter, Query, SortDirection, SortField};
 use ingodb_sstable::{MvccKeyExtractor, SSTableReader, SSTableWriter};
@@ -40,6 +41,9 @@ pub enum LsmError {
 
     #[error("not implemented: {0}")]
     NotImplemented(String),
+
+    #[error("requested consistency {0:?} cannot be provided by this engine: {1}")]
+    UnsupportedConsistency(Consistency, &'static str),
 }
 
 /// Configuration for the LSM storage engine.
@@ -69,6 +73,14 @@ pub struct LsmConfig {
     pub adaptive_w_min: i32,
     /// Maximum W value (default 8)
     pub adaptive_w_max: i32,
+    /// Minimum consistency level provided by `put()`. Default: `Consistency::default()`
+    /// (single-node, no guarantees) — matches historical optimistic behavior.
+    ///
+    /// To get read-your-writes (and fix the small RYW race in optimistic mode),
+    /// use `Consistency::single_node(ConsistencyModel::LINEARIZABLE)`.
+    /// To additionally fsync per batch, use `STRICT_LINEARIZABLE`.
+    /// Cluster scope is currently unsupported and errors at `open()`.
+    pub min_consistency: Consistency,
 }
 
 impl Default for LsmConfig {
@@ -86,7 +98,74 @@ impl Default for LsmConfig {
             adaptive_w_max_step: 2,
             adaptive_w_min: -8,
             adaptive_w_max: 8,
+            min_consistency: Consistency::default(),
         }
+    }
+}
+
+/// A single pending write in the group-commit queue. Used for Visible and
+/// Durable modes — Optimistic mode uses a simpler `Vec<IBlob>` instead.
+///
+/// `blob` is consumed by the leader (taken via `Option::take`) before being
+/// inserted into the memtable. `done` is signaled by the leader once the
+/// caller's contract is met (memtable-visible, fsync'd if Durable).
+struct CommitEntry {
+    blob: Option<IBlob>,
+    done: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// The group-commit queue. `leader_active` is set atomically with a push:
+/// the thread that flips it from false to true becomes the batch leader,
+/// later arrivals are followers. The leader resets it to false only while
+/// holding this mutex AND observing the entries vec is empty — that atomic
+/// check-and-release is what prevents follower entries from being orphaned.
+struct CommitQueue {
+    entries: Vec<CommitEntry>,
+    leader_active: bool,
+}
+
+impl CommitQueue {
+    fn new() -> Self {
+        CommitQueue {
+            entries: Vec::new(),
+            leader_active: false,
+        }
+    }
+}
+
+/// How `put()` returns to the caller. Derived from [`LsmConfig::min_consistency`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitMode {
+    /// Followers return immediately after pushing their blob to the batch.
+    /// Used when the requested consistency model is empty.
+    /// Smallest latency; small RYW race possible if a concurrent thread reads
+    /// just after a follower returns.
+    Optimistic,
+    /// Followers wait until the leader has fsync'd AND inserted into the memtable.
+    /// Provides `single_node(STRICT_LINEARIZABLE)`.
+    Durable,
+    /// Followers wait until the leader has inserted into the memtable
+    /// (no fsync). Provides `single_node(LINEARIZABLE)`.
+    Visible,
+}
+
+impl CommitMode {
+    /// Map a requested consistency level to the cheapest commit mode that satisfies it.
+    /// Returns an error if the requested level can't be provided on a single node.
+    fn select(min: Consistency) -> Result<CommitMode, LsmError> {
+        if min.scope == Scope::Cluster && !min.model.is_empty() {
+            return Err(LsmError::UnsupportedConsistency(
+                min,
+                "cluster scope requires replication, not implemented",
+            ));
+        }
+        Ok(if min.model.is_empty() {
+            CommitMode::Optimistic
+        } else if min.model.contains(ConsistencyModel::DURABLE) {
+            CommitMode::Durable
+        } else {
+            CommitMode::Visible
+        })
     }
 }
 
@@ -160,10 +239,14 @@ pub struct LsmEngine {
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
     /// Active snapshot versions — compaction preserves versions >= oldest snapshot
     active_snapshots: Mutex<BTreeSet<DocumentId>>,
-    /// Group commit: pending WAL writes from concurrent put() calls
-    wal_batch: Mutex<Vec<IBlob>>,
-    /// Notifies waiting writers that their batch was committed
-    wal_batch_done: Condvar,
+    /// Group commit: queue of pending writes from concurrent put() calls.
+    /// Used by Visible and Durable modes; Optimistic mode uses the legacy
+    /// fast path with `optimistic_batch`.
+    commit_queue: Mutex<CommitQueue>,
+    /// Optimistic mode: pending blobs without follower-wait state.
+    optimistic_batch: Mutex<Vec<IBlob>>,
+    /// Derived from `config.min_consistency` at open() time.
+    commit_mode: CommitMode,
     /// Background compaction signaling
     compaction_signal: Arc<CompactionSignal>,
     /// Background compaction thread handle
@@ -234,6 +317,7 @@ pub struct IndexMetadata {
 impl LsmEngine {
     /// Open or create an LSM engine at the given directory.
     pub fn open(config: LsmConfig) -> Result<Self, LsmError> {
+        let commit_mode = CommitMode::select(config.min_consistency)?;
         std::fs::create_dir_all(&config.data_dir)?;
         let wal_path = config.data_dir.join("wal.log");
 
@@ -304,8 +388,9 @@ impl LsmEngine {
             secondary_indexes: Mutex::new(Vec::new()),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
-            wal_batch: Mutex::new(Vec::new()),
-            wal_batch_done: Condvar::new(),
+            commit_queue: Mutex::new(CommitQueue::new()),
+            optimistic_batch: Mutex::new(Vec::new()),
+            commit_mode,
             compaction_signal: Arc::new(CompactionSignal {
                 pending: Mutex::new(false),
                 notify: Condvar::new(),
@@ -325,27 +410,43 @@ impl LsmEngine {
     }
 
     /// Insert a document into the engine.
-    /// Uses group commit: concurrent put() calls batch their WAL writes.
+    ///
+    /// Concurrent `put()` calls batch their WAL writes via group commit.
+    /// The exact return semantics depend on [`LsmConfig::min_consistency`]:
+    ///
+    /// - `Optimistic` (default, empty consistency): returns once the blob is
+    ///   queued; the leader writes the WAL asynchronously. A small RYW race
+    ///   exists for concurrent readers.
+    /// - `Visible` (`LINEARIZABLE`): returns only after the leader has
+    ///   inserted into the memtable.
+    /// - `Durable` (`STRICT_LINEARIZABLE`): returns only after the leader has
+    ///   fsync'd the WAL AND inserted into the memtable.
     pub fn put(&self, mut blob: IBlob) -> Result<(), LsmError> {
         self.write_count.fetch_add(1, Ordering::Relaxed);
         blob.set_version(DocumentId::new());
 
-        // Group commit: add to batch buffer, then grab WAL lock.
-        // While we wait for the lock, other writers accumulate in the batch.
-        self.wal_batch.lock().push(blob);
+        match self.commit_mode {
+            CommitMode::Optimistic => self.put_optimistic(blob),
+            CommitMode::Visible | CommitMode::Durable => self.put_with_wait(blob),
+        }
+    }
+
+    /// Optimistic group-commit path: followers return as soon as the WAL lock
+    /// is free, regardless of whether their blob has reached the memtable yet.
+    /// Matches historical behavior; preserved for throughput when callers
+    /// don't need RYW.
+    fn put_optimistic(&self, blob: IBlob) -> Result<(), LsmError> {
+        self.optimistic_batch.lock().push(blob);
         let mut wal = self.wal.lock();
 
-        // Drain everything that accumulated while we waited
-        let mut to_write: Vec<IBlob> = std::mem::take(&mut *self.wal_batch.lock());
+        let mut to_write: Vec<IBlob> = std::mem::take(&mut *self.optimistic_batch.lock());
         if to_write.is_empty() {
             return Ok(()); // another leader already wrote our entry
         }
 
-        // Write the whole batch to WAL at once
         wal.append_batch(&mut to_write)?;
         drop(wal);
 
-        // Insert all into memtable + notify indexes
         let indexes = self.secondary_indexes.lock();
         let memtable = self.memtable.read();
         for blob in to_write {
@@ -363,7 +464,117 @@ impl LsmEngine {
         if should_flush {
             self.rotate_memtable()?;
         }
+        Ok(())
+    }
 
+    /// MariaDB-style group commit with explicit follower wait.
+    ///
+    /// Algorithm:
+    /// 1. Push entry into `commit_queue`. Whoever flips `leader_active` from
+    ///    false→true becomes the batch leader; others are followers.
+    /// 2. Leader takes the WAL lock and loops:
+    ///    - Drain the queue. If empty (and only under the queue lock), reset
+    ///      `leader_active = false` and exit.
+    ///    - Otherwise: append all blobs to WAL, fsync if Durable, insert into
+    ///      memtable, signal each entry's `done` condvar.
+    /// 3. Followers wait on their per-entry condvar until the leader signals.
+    ///
+    /// The atomic check-and-release of `leader_active` under the queue lock is
+    /// what prevents a late-arriving follower from being stranded with no
+    /// leader to process it.
+    fn put_with_wait(&self, blob: IBlob) -> Result<(), LsmError> {
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let entry = CommitEntry {
+            blob: Some(blob),
+            done: done.clone(),
+        };
+
+        let became_leader = {
+            let mut q = self.commit_queue.lock();
+            q.entries.push(entry);
+            if q.leader_active {
+                false
+            } else {
+                q.leader_active = true;
+                true
+            }
+        };
+
+        if became_leader {
+            self.run_leader()?;
+        } else {
+            // Follower: wait until the leader signals us.
+            let (lock, cv) = &*done;
+            let mut g = lock.lock();
+            while !*g {
+                cv.wait(&mut g);
+            }
+        }
+        Ok(())
+    }
+
+    /// Process batches until the queue is empty, then release leadership.
+    /// Caller has already set `leader_active = true`.
+    fn run_leader(&self) -> Result<(), LsmError> {
+        let mut wal = self.wal.lock();
+        let durable = self.commit_mode == CommitMode::Durable;
+        let mut any_processed = false;
+
+        loop {
+            // Drain the queue OR release leadership if empty. Both checks must
+            // happen under the queue lock in the same critical section so a
+            // concurrent push either lands in the batch we're about to process
+            // or sees leader_active=false and becomes the next leader itself.
+            let mut entries = {
+                let mut q = self.commit_queue.lock();
+                if q.entries.is_empty() {
+                    q.leader_active = false;
+                    break;
+                }
+                std::mem::take(&mut q.entries)
+            };
+
+            let mut blobs: Vec<IBlob> = entries
+                .iter_mut()
+                .map(|e| e.blob.take().expect("entry blob not yet taken"))
+                .collect();
+
+            // WAL append (+ fsync for Durable mode).
+            wal.append_batch(&mut blobs)?;
+            if durable {
+                wal.sync()?;
+            }
+
+            // Indexes + memtable. Followers can be signaled only after this:
+            // RYW requires that a returning follower's blob is queryable.
+            {
+                let indexes = self.secondary_indexes.lock();
+                let memtable = self.memtable.read();
+                for blob in blobs {
+                    for idx in indexes.iter() {
+                        idx.notify_put(&blob);
+                    }
+                    memtable.insert(blob);
+                }
+            }
+
+            // Signal followers.
+            for entry in &entries {
+                let (lock, cv) = &*entry.done;
+                *lock.lock() = true;
+                cv.notify_one();
+            }
+            any_processed = true;
+        }
+
+        drop(wal);
+
+        if any_processed {
+            let should_flush = self.memtable.read().should_flush();
+            if should_flush {
+                self.rotate_memtable()?;
+            }
+        }
         Ok(())
     }
 
@@ -380,11 +591,14 @@ impl LsmEngine {
             blob.set_version(DocumentId::new());
         }
 
-        // WAL: one lock, all appends
+        // WAL: one lock, all appends. fsync at the end if Durable mode.
         {
             let mut wal = self.wal.lock();
             for blob in blobs.iter_mut() {
                 wal.append(blob)?;
+            }
+            if self.commit_mode == CommitMode::Durable {
+                wal.sync()?;
             }
         }
 
@@ -1749,7 +1963,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
         (engine, dir)
@@ -1808,7 +2022,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
 
         let blob = make_blob(42);
@@ -1935,7 +2149,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
         let id = DocumentId::new();
@@ -2323,7 +2537,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2362,7 +2576,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2390,7 +2604,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2430,7 +2644,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2490,7 +2704,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2628,7 +2842,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2712,7 +2926,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2783,7 +2997,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 1000,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2819,7 +3033,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2874,7 +3088,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2927,7 +3141,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
 
         let target_id = deterministic_id(0);
@@ -2995,7 +3209,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3041,7 +3255,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3073,5 +3287,197 @@ mod tests {
         // Third scan should use the index
         let results = engine.scan(Some(&filter), None, None, None).unwrap();
         assert_eq!(results.len(), 10, "filter scan via index returns correct results");
+    }
+
+    // ── Consistency level tests ──
+
+    fn test_config_with_consistency(
+        dir: &std::path::Path,
+        c: Consistency,
+    ) -> LsmConfig {
+        LsmConfig {
+            data_dir: dir.to_path_buf(),
+            memtable_size: 4 * 1024 * 1024,
+            block_size: 4096,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            sort_spill_threshold: 1000,
+            compaction_threads: 1,
+            adaptive_w: false,
+            adaptive_w_cooldown_secs: 900,
+            adaptive_w_max_step: 2,
+            adaptive_w_min: -8,
+            adaptive_w_max: 8,
+            min_consistency: c,
+        }
+    }
+
+    #[test]
+    fn commit_mode_select_maps_correctly() {
+        assert_eq!(
+            CommitMode::select(Consistency::default()).unwrap(),
+            CommitMode::Optimistic
+        );
+        assert_eq!(
+            CommitMode::select(Consistency::single_node(ConsistencyModel::LINEARIZABLE)).unwrap(),
+            CommitMode::Visible
+        );
+        assert_eq!(
+            CommitMode::select(Consistency::single_node(ConsistencyModel::READ_YOUR_WRITES))
+                .unwrap(),
+            CommitMode::Visible,
+        );
+        assert_eq!(
+            CommitMode::select(Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE))
+                .unwrap(),
+            CommitMode::Durable
+        );
+        assert_eq!(
+            CommitMode::select(Consistency::single_node(ConsistencyModel::DURABLE)).unwrap(),
+            CommitMode::Durable
+        );
+    }
+
+    #[test]
+    fn cluster_consistency_rejected_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_consistency(
+            dir.path(),
+            Consistency::cluster(ConsistencyModel::LINEARIZABLE),
+        );
+        match LsmEngine::open(config) {
+            Err(LsmError::UnsupportedConsistency(_, _)) => {}
+            Err(other) => panic!("expected UnsupportedConsistency, got {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    /// Read-your-writes under concurrent writers, Visible mode: every put()
+    /// that returns must immediately be observable via get() from any thread.
+    #[test]
+    fn ryw_holds_under_visible_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_consistency(
+            dir.path(),
+            Consistency::single_node(ConsistencyModel::LINEARIZABLE),
+        );
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 200;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let e = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut misses = 0usize;
+                for i in 0..PER_THREAD {
+                    let blob = make_product_with_id(
+                        deterministic_id((t * PER_THREAD + i) as u64),
+                        (t * PER_THREAD + i) as u64,
+                    );
+                    let id = *blob.id();
+                    e.put(blob).unwrap();
+                    // Read-your-writes: the leader has signaled us → blob is
+                    // in the memtable → get() must succeed.
+                    if e.get(&id).unwrap().is_none() {
+                        misses += 1;
+                    }
+                }
+                misses
+            }));
+        }
+        let total_misses: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total_misses, 0, "RYW violation: {total_misses} misses under Visible mode");
+    }
+
+    /// Same RYW property under Durable mode (fsync per batch).
+    #[test]
+    fn ryw_holds_under_durable_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_consistency(
+            dir.path(),
+            Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE),
+        );
+        let engine = Arc::new(LsmEngine::open(config).unwrap());
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 100;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let e = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut misses = 0usize;
+                for i in 0..PER_THREAD {
+                    let blob = make_product_with_id(
+                        deterministic_id((t * PER_THREAD + i) as u64),
+                        (t * PER_THREAD + i) as u64,
+                    );
+                    let id = *blob.id();
+                    e.put(blob).unwrap();
+                    if e.get(&id).unwrap().is_none() {
+                        misses += 1;
+                    }
+                }
+                misses
+            }));
+        }
+        let total_misses: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total_misses, 0, "RYW violation under Durable mode");
+    }
+
+    /// Durability: with STRICT_LINEARIZABLE, every put() that returns must be
+    /// recoverable after dropping the engine without an explicit flush.
+    #[test]
+    fn durable_mode_survives_reopen_without_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_consistency(
+            dir.path(),
+            Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE),
+        );
+
+        const N: u64 = 500;
+        let ids: Vec<DocumentId> = (0..N).map(deterministic_id).collect();
+        {
+            let engine = LsmEngine::open(config.clone()).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                engine.put(make_product_with_id(*id, i as u64)).unwrap();
+            }
+            // No flush_memtable(), no explicit sync — drop the engine here.
+            // STRICT_LINEARIZABLE means every put() already fsync'd the WAL.
+        }
+
+        // Reopen and read.
+        let engine = LsmEngine::open(config).unwrap();
+        let mut missing = Vec::new();
+        for id in &ids {
+            if engine.get(id).unwrap().is_none() {
+                missing.push(*id);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} blobs missing after reopen — durability broken",
+            missing.len(),
+            N
+        );
+    }
+
+    /// Same scenario with Optimistic mode (default): NO durability guarantee.
+    /// This test documents the contract; it's allowed to lose writes.
+    /// We assert only that the engine reopens cleanly — not that data is intact.
+    #[test]
+    fn optimistic_mode_reopens_cleanly_even_if_writes_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_consistency(dir.path(), Consistency::default());
+        {
+            let engine = LsmEngine::open(config.clone()).unwrap();
+            for i in 0..100u64 {
+                engine.put(make_product_with_id(deterministic_id(i), i)).unwrap();
+            }
+        }
+        let engine = LsmEngine::open(config).unwrap();
+        // Some or all writes may survive (BufWriter happens to flush on close).
+        // The contract only guarantees that reopen doesn't error.
+        let _ = engine.get(&deterministic_id(0));
     }
 }
