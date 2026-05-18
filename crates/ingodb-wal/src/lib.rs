@@ -2,6 +2,7 @@ use ingodb_blob::IBlob;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -36,6 +37,11 @@ pub enum WalError {
 pub struct Wal {
     path: PathBuf,
     writer: BufWriter<File>,
+    /// Separate file handle (dup'd from the writer's file) used for fsync
+    /// calls that don't need to hold the writer mutex. Enables pipelined
+    /// group commit: while one leader is in `sync_all()`, the next can be
+    /// appending under the writer lock.
+    sync_handle: Arc<File>,
     size: u64,
 }
 
@@ -48,9 +54,11 @@ impl Wal {
             .append(true)
             .open(&path)?;
         let size = file.metadata()?.len();
+        let sync_handle = Arc::new(file.try_clone()?);
         Ok(Wal {
             path,
             writer: BufWriter::new(file),
+            sync_handle,
             size,
         })
     }
@@ -86,11 +94,34 @@ impl Wal {
         Ok(offset)
     }
 
-    /// Sync the WAL to disk (fsync).
+    /// Sync the WAL to disk (fsync). Convenience: flush + sync_all on the
+    /// writer's own handle. Holds &mut self for the duration. For pipelined
+    /// group commit, prefer `flush_buf()` + `sync_handle()`.
     pub fn sync(&mut self) -> Result<(), WalError> {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         Ok(())
+    }
+
+    /// Push the user-space `BufWriter` buffer into the OS page cache.
+    /// Does NOT call fsync. Required before invoking `sync_handle().sync_all()`
+    /// so the new data is visible to fsync.
+    pub fn flush_buf(&mut self) -> Result<(), WalError> {
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// A cloned file handle for calling `sync_all()` without holding the
+    /// writer mutex. Cheap to clone (Arc bump).
+    ///
+    /// Pipelined group-commit pattern:
+    /// 1. Acquire WAL mutex
+    /// 2. `append_batch(...)` + `flush_buf()`
+    /// 3. `let handle = wal.sync_handle()`
+    /// 4. Drop WAL mutex
+    /// 5. `handle.sync_all()` (concurrent with the next leader's append)
+    pub fn sync_handle(&self) -> Arc<File> {
+        self.sync_handle.clone()
     }
 
     /// Current size of the WAL in bytes.

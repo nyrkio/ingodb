@@ -467,21 +467,8 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// MariaDB-style group commit with explicit follower wait.
-    ///
-    /// Algorithm:
-    /// 1. Push entry into `commit_queue`. Whoever flips `leader_active` from
-    ///    false→true becomes the batch leader; others are followers.
-    /// 2. Leader takes the WAL lock and loops:
-    ///    - Drain the queue. If empty (and only under the queue lock), reset
-    ///      `leader_active = false` and exit.
-    ///    - Otherwise: append all blobs to WAL, fsync if Durable, insert into
-    ///      memtable, signal each entry's `done` condvar.
-    /// 3. Followers wait on their per-entry condvar until the leader signals.
-    ///
-    /// The atomic check-and-release of `leader_active` under the queue lock is
-    /// what prevents a late-arriving follower from being stranded with no
-    /// leader to process it.
+    /// MariaDB-style group commit with explicit follower wait. The leader's
+    /// loop differs between Visible and Durable modes (see dispatch below).
     fn put_with_wait(&self, blob: IBlob) -> Result<(), LsmError> {
         let done = Arc::new((Mutex::new(false), Condvar::new()));
         let entry = CommitEntry {
@@ -501,7 +488,11 @@ impl LsmEngine {
         };
 
         if became_leader {
-            self.run_leader()?;
+            match self.commit_mode {
+                CommitMode::Durable => self.run_leader_pipelined()?,
+                CommitMode::Visible => self.run_leader_visible()?,
+                CommitMode::Optimistic => unreachable!("optimistic uses put_optimistic"),
+            }
         } else {
             // Follower: wait until the leader signals us.
             let (lock, cv) = &*done;
@@ -513,18 +504,14 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Process batches until the queue is empty, then release leadership.
-    /// Caller has already set `leader_active = true`.
-    fn run_leader(&self) -> Result<(), LsmError> {
-        let mut wal = self.wal.lock();
-        let durable = self.commit_mode == CommitMode::Durable;
+    /// Visible-mode leader: no slow stage to pipeline, so we keep leadership
+    /// throughout the loop and process every batch that accumulates while
+    /// holding the WAL writer mutex. Handoff overhead dominates parallelism
+    /// gains here.
+    fn run_leader_visible(&self) -> Result<(), LsmError> {
         let mut any_processed = false;
-
+        let mut wal = self.wal.lock();
         loop {
-            // Drain the queue OR release leadership if empty. Both checks must
-            // happen under the queue lock in the same critical section so a
-            // concurrent push either lands in the batch we're about to process
-            // or sees leader_active=false and becomes the next leader itself.
             let mut entries = {
                 let mut q = self.commit_queue.lock();
                 if q.entries.is_empty() {
@@ -539,14 +526,8 @@ impl LsmEngine {
                 .map(|e| e.blob.take().expect("entry blob not yet taken"))
                 .collect();
 
-            // WAL append (+ fsync for Durable mode).
             wal.append_batch(&mut blobs)?;
-            if durable {
-                wal.sync()?;
-            }
 
-            // Indexes + memtable. Followers can be signaled only after this:
-            // RYW requires that a returning follower's blob is queryable.
             {
                 let indexes = self.secondary_indexes.lock();
                 let memtable = self.memtable.read();
@@ -558,7 +539,6 @@ impl LsmEngine {
                 }
             }
 
-            // Signal followers.
             for entry in &entries {
                 let (lock, cv) = &*entry.done;
                 *lock.lock() = true;
@@ -566,7 +546,6 @@ impl LsmEngine {
             }
             any_processed = true;
         }
-
         drop(wal);
 
         if any_processed {
@@ -574,6 +553,98 @@ impl LsmEngine {
             if should_flush {
                 self.rotate_memtable()?;
             }
+        }
+        Ok(())
+    }
+
+    /// Durable-mode leader with pipelined fsync.
+    ///
+    /// Releases `leader_active` immediately after draining the queue so a
+    /// new arrival can become leader of batch N+1 and start appending while
+    /// batch N is in fsync. The WAL writer mutex is held only for the brief
+    /// append + OS flush; `sync_all()` runs on a cloned file handle.
+    ///
+    /// Self-regulating: after each batch, if more work has piled up AND no
+    /// new leader has stepped in, the current leader takes leadership back
+    /// and continues. At low contention this collapses to one leader looping;
+    /// at high contention leadership naturally fragments and many fsyncs
+    /// pipeline.
+    fn run_leader_pipelined(&self) -> Result<(), LsmError> {
+        loop {
+            // Drain + release leadership. New arrivals can now become the
+            // next leader and append while we're in fsync below.
+            let mut entries = {
+                let mut q = self.commit_queue.lock();
+                let entries = std::mem::take(&mut q.entries);
+                q.leader_active = false;
+                entries
+            };
+            if entries.is_empty() {
+                break;
+            }
+
+            self.process_batch_durable(&mut entries)?;
+
+            // Self-regulating: continue only if (a) work is pending and
+            // (b) no other leader has claimed it during our processing.
+            let continue_as_leader = {
+                let mut q = self.commit_queue.lock();
+                if q.entries.is_empty() || q.leader_active {
+                    false
+                } else {
+                    q.leader_active = true;
+                    true
+                }
+            };
+            if !continue_as_leader {
+                break;
+            }
+        }
+
+        let should_flush = self.memtable.read().should_flush();
+        if should_flush {
+            self.rotate_memtable()?;
+        }
+        Ok(())
+    }
+
+    /// One Durable batch with pipelined fsync. WAL writer mutex held only
+    /// during append + OS flush; fsync runs without it so other leaders can
+    /// append batch N+1 in parallel.
+    fn process_batch_durable(&self, entries: &mut [CommitEntry]) -> Result<(), LsmError> {
+        let mut blobs: Vec<IBlob> = entries
+            .iter_mut()
+            .map(|e| e.blob.take().expect("entry blob not yet taken"))
+            .collect();
+
+        // Phase 1: append + push BufWriter to OS page cache (WAL lock).
+        let sync_handle = {
+            let mut wal = self.wal.lock();
+            wal.append_batch(&mut blobs)?;
+            wal.flush_buf()?;
+            wal.sync_handle()
+        };
+
+        // Phase 2: fsync without WAL lock — pipelines with other leaders.
+        sync_handle.sync_all()?;
+
+        // Phase 3: memtable + indexes. Must precede signaling.
+        {
+            let indexes = self.secondary_indexes.lock();
+            let memtable = self.memtable.read();
+            for blob in blobs {
+                for idx in indexes.iter() {
+                    idx.notify_put(&blob);
+                }
+                memtable.insert(blob);
+            }
+        }
+
+        // Phase 4: signal followers — RYW + durability now satisfied.
+        for entry in entries.iter() {
+            let (lock, cv) = &*entry.done;
+            *lock.lock() = true;
+            cv.notify_one();
         }
         Ok(())
     }

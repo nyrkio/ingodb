@@ -6,6 +6,51 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-05-18 — fsync amortization via pipelined group commit
+
+`cargo run --release --example fsync_bench` — TOTAL_OPS_TARGET=200K per cell,
+ops/thread clamped to [200, 5000]. Three consistency levels × 1 to 1024
+concurrent writers. Mode-specific leader paths: Durable releases the WAL
+writer mutex before fsync (pipelined); Visible keeps the looping leader.
+
+| Level      |  1t |  2t |  4t |  8t | 16t | 32t | 64t |128t |256t |512t |1024t|
+|------------|----:|----:|----:|----:|----:|----:|----:|----:|----:|----:|----:|
+| Optimistic | 217K| 308K| 245K| 225K| 200K| 186K| 174K| 170K| 176K| 162K| 150K|
+| Visible    | 274K| 231K| 289K| 358K| 347K| 387K| 365K| 339K| 356K| 368K| 281K|
+| Durable    | 143 | 175 | 329 | 664 |   1K|   3K|   7K|  13K|  21K|  32K|  34K|
+
+Read:
+- **Durable scales 236×** from 1→1024 threads (143 → 34K ops/sec).
+  Saturates around 512-1024 threads — that's the practical fsync-throughput
+  ceiling of this system. At 1024 threads, one fsync amortizes ~240 writes
+  (34K ops/sec × 7ms per fsync).
+- **Pipelining is what unlocks the scaling beyond ~32 threads.** Before
+  pipelining (leader holds WAL mutex through fsync), Durable plateaued at
+  ~2K ops/sec at 32 threads. After releasing the writer mutex before
+  `sync_all()` (using a cloned File handle), batch N+1's append can run
+  concurrently with batch N's fsync.
+- **Visible recovers to ~390K at 32 threads** with the mode-specific path
+  (keeping the looping leader). Pipelining hurt it: handoff overhead
+  dominates when there's no slow stage to overlap with.
+- **Optimistic gradually loses ground at extreme concurrency** due to
+  unbridled WAL-lock contention from every thread — exactly the case the
+  Visible leader/follower fixes.
+
+Self-regulation:
+- Durable leader releases `leader_active` *before* fsync, then re-checks
+  after. If no new leader stepped in AND work is queued, it continues.
+  At low contention this collapses to a single leader looping; at high
+  fsync load it naturally fragments into many pipelined leaders.
+
+Headroom (not yet implemented):
+- `wait_count` / `wait_usec` knobs — deliberately delay the leader to
+  grow the batch at low concurrency where threads arrive faster than the
+  fsync rate.
+- An adaptive scheme: the engine could observe its own fsync latency and
+  tune wait_usec from data (the IngoDB "liquid" thesis).
+
+---
+
 ## 2026-04-08 — 1M Products, batch writes + double-buffer memtable + adaptive W
 
 Batch writes (1000 docs/batch), double-buffered memtable, adaptive W (unlimited step).
