@@ -49,6 +49,73 @@ Headroom (not yet implemented):
 - An adaptive scheme: the engine could observe its own fsync latency and
   tune wait_usec from data (the IngoDB "liquid" thesis).
 
+### Cross-check against MariaDB's group commit work
+
+For validation we compared to two Percona benchmarks of Kristian Nielsen's
+MariaDB 5.3/10.0 group commit fix (MWL#116), which is the prior art our
+leader/follower design is modeled on.
+
+**Percona, "Testing the Group Commit Fix"** — sysbench update_non_index,
+`innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`, slow fsync (no
+write-back cache). This isolates the value of group commit itself:
+
+| Threads | Without fix | With fix    | speedup |
+|--------:|------------:|------------:|--------:|
+|       1 |       21.51 |       21.99 |     1×  |
+|       8 |       52.30 |       95.41 |   1.8×  |
+|     128 |       58.18 |     1066.05 |    18×  |
+|     256 |       57.62 |     1669.11 |    29×  |
+
+Without the fix, throughput stays flat ~50–60 tps — that's the broken-
+binlog-group-commit case (Bug#13669). With the fix, 1 → 256 threads
+scales **78×**.
+
+**Percona, "Maximal write throughput in MySQL"** — same engine on Dell
+R900 + FusionIO + battery-backed RAID. This isolates the cost of
+durability, ie. the **with-fsync vs without-fsync** ratio that
+corresponds to our Visible→Durable comparison:
+
+| Config                                          |    tps |
+|-------------------------------------------------|-------:|
+| No fsync (`innodb=0`, no binlog) — baseline     | 36,332 |
+| `innodb=1`, no binlog (redo fsync on BBWC)      | 23,115 |
+| `innodb=1` + binlog (binlog not sync'd)         | 12,097 |
+| Full durability (`innodb=1`, `sync_binlog=1`)   |  3,086 |
+
+The clean comparison to us is first-row vs last-row — single-log no-fsync
+vs single-log with real fsync per commit:
+
+|                                   | No fsync     | Fsync per commit | Ratio |
+|-----------------------------------|-------------:|-----------------:|------:|
+| **MariaDB** (sysbench, fix on)    | 36,332 tps   |   3,086 tps      | **11.8×** |
+| **IngoDB** today                  | 387K (Visible @ 32t) | 34K (Durable @ 1024t) | **11.4×** |
+
+Both engines land at the same ~11× memory-vs-durable ratio. That ratio
+is set by the storage's durable-write IOPS divided by what one fsync can
+amortize — once group commit is working, the engine layer can't push the
+ratio further; it's a hardware fact.
+
+Notes on the comparison:
+- MariaDB's `innodb=1, no binlog` (23,115) ÷ baseline (36,332) ≈ **1.57×**
+  — only 60% slowdown — because InnoDB's redo log on their setup hits
+  battery-backed RAID where fsync returns in microseconds. Not comparable
+  to either of us without BBWC.
+- MariaDB's `sync_binlog=1` step (12,097 → 3,086, a **4× drop**) is the
+  binlog fsync hitting non-BBWC FusionIO. That's their real-fsync penalty.
+  We don't have a second log, so we skip this entirely.
+- We get more aggressive thread scaling (236× vs 78×) because of
+  pipelining: we release the WAL writer mutex *before* fsync, letting
+  batch N+1's append overlap batch N's fsync. MariaDB's 5.3/10.0 fix
+  holds its equivalent lock through fsync — the MDEV-232 work that
+  followed (reducing 3 fsyncs to 2) gave another 30–60%, still less than
+  full pipelining.
+
+Sources:
+- [Percona — Testing the Group Commit Fix](https://www.percona.com/blog/testing-the-group-commit-fix/)
+- [Percona — Maximal write throughput in MySQL](https://www.percona.com/blog/maximal-write-througput-in-mysql/)
+- [Kristian Nielsen — Fixing MySQL group commit](https://knielsen-hq.org/w/fixing-mysql-group-commit-part-1/)
+- [Kristian Nielsen — Even faster group commit](https://kristiannielsen.livejournal.com/16382.html)
+
 ---
 
 ## 2026-04-08 — 1M Products, batch writes + double-buffer memtable + adaptive W
