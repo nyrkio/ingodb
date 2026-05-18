@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ingodb",
     "crates/ingodb-blob",
+    "crates/ingodb-consistency",
     "crates/ingodb-wal",
     "crates/ingodb-memtable",
     "crates/ingodb-sstable",
@@ -16,6 +17,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+bitflags = "2"
 blake3 = "1"
 crc32fast = "1"
 lz4_flex = "0.11"
