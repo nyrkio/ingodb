@@ -38,6 +38,84 @@
 //! values inherit the model's partial order.
 //!
 //! Cluster scope is a placeholder today; IngoDB is single-node.
+//!
+//! ## Future direction: isolation as a second branch in the same lattice
+//!
+//! IngoDB doesn't have transactions yet, so the current `ConsistencyModel`
+//! flags only cover *consistency* properties (RYW, ordering, durability).
+//! When transactions land we expect to grow a second branch — *isolation*
+//! properties — into the **same** bitflags struct, not a separate type.
+//!
+//! Jepsen draws consistency and isolation as two branches of one lattice
+//! that converge at **Strict Serializable** = Serializable + Linearizable.
+//! Our bitflags map onto this directly: every level is just a set, so
+//! adding properties from a new branch is mechanical, and the existing
+//! `implies` (set containment) handles cross-branch comparisons for free.
+//!
+//! Sketch of how the type would grow:
+//!
+//! ```ignore
+//! bitflags! {
+//!     pub struct ConsistencyModel: u64 {
+//!         // ── Consistency branch (today) ──
+//!         const READ_YOUR_WRITES     = 1 << 0;
+//!         // ... (RYW, MR, MW, WFR, TOTAL_ORDER, REAL_TIME_ORDER, DURABLE)
+//!
+//!         // ── Isolation branch (future) ──
+//!         // Reserved bit range 24-31 keeps the two branches separate.
+//!         const READ_COMMITTED        = 1 << 24;
+//!         const CURSOR_STABILITY      = (1 << 25) | Self::READ_COMMITTED.bits();
+//!         const MONOTONIC_ATOMIC_VIEW = (1 << 26) | Self::READ_COMMITTED.bits();
+//!         const REPEATABLE_READ       = (1 << 27) | Self::CURSOR_STABILITY.bits();
+//!         const SNAPSHOT_ISOLATION    = (1 << 28) | Self::MONOTONIC_ATOMIC_VIEW.bits();
+//!         const SERIALIZABLE          = (1 << 29)
+//!                                     | Self::REPEATABLE_READ.bits()
+//!                                     | Self::SNAPSHOT_ISOLATION.bits();
+//!         // Note: SI and RR are both subsumed by Serializable but neither
+//!         // implies the other — RR allows phantoms, SI allows write skew.
+//!
+//!         // ── Top: both branches converge ──
+//!         const STRICT_SERIALIZABLE = Self::SERIALIZABLE.bits()
+//!                                   | Self::REAL_TIME_ORDER.bits();
+//!
+//!         // ── Bespoke hybrids drawn from real systems ──
+//!         /// MongoDB-style: causal consistency for sessions + snapshot reads.
+//!         /// Below STRICT_SERIALIZABLE, above PRAM and READ_COMMITTED;
+//!         /// incomparable to LINEARIZABLE (no real-time across writes) and to
+//!         /// SERIALIZABLE (no write-skew protection).
+//!         const MONGODB_COMPATIBLE = Self::CAUSAL.bits()
+//!                                  | Self::SNAPSHOT_ISOLATION.bits();
+//!     }
+//! }
+//! ```
+//!
+//! Why this matters:
+//!
+//! - **Compositionality is free.** Every level is a *set*, so a user
+//!   wanting both Snapshot Isolation and Causal Consistency just ORs them:
+//!   `SNAPSHOT_ISOLATION | CAUSAL`. No need for the API to accept a list of
+//!   levels — the bitflag IS the list.
+//! - **Hybrid named models are first-class.** `MONGODB_COMPATIBLE` sits in
+//!   the *middle* of the lattice, useful below the top of the Jepsen
+//!   pyramid where most real systems live. Adding new bespoke models is
+//!   just adding more constants.
+//! - **Cross-branch incomparability falls out.** A pure consistency claim
+//!   (e.g. `LINEARIZABLE`) and a pure isolation claim (e.g. `SERIALIZABLE`)
+//!   neither implies the other — they sit on incomparable branches until
+//!   you reach `STRICT_SERIALIZABLE`. The partial-order `partial_cmp`
+//!   already returns `None` for them.
+//!
+//! Caveats for when this lands:
+//!
+//! - The `Consistency` *type* doesn't need to change — just the flags inside
+//!   `ConsistencyModel` and what `LsmEngine` / `Transaction` does with them.
+//! - Isolation is a per-*transaction* claim; consistency in our current
+//!   design is per-*operation*. The unified `Consistency` value will need
+//!   to be interpreted by the caller (a transaction vs a bare put/get).
+//!   The `Scope` axis is unaffected — cluster vs single-node still applies.
+//! - Some isolation levels in real systems are stronger or weaker than the
+//!   strict ANSI definition (PostgreSQL's "Repeatable Read" is actually
+//!   Snapshot Isolation, etc.). Document the chosen definition per constant.
 
 use bitflags::bitflags;
 use std::cmp::Ordering;
