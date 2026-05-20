@@ -95,10 +95,60 @@ This validates the original hypothesis that pipelining alone doesn't
 saturate the available batch capacity — it spreads work across more,
 smaller fsyncs. The wait collapses those into fewer larger ones.
 
-Next step: adaptive `commit_wait_usec`. The right wait depends on recent
-arrival rate and observed batch size. With telemetry already in the
-engine (QueryStats), this is the same shape as the adaptive-W work for
-compaction.
+### Busy mode: automatic activation (default)
+
+Static `commit_wait_usec` is a knob — useful, but the user has to know
+when concurrency justifies the latency cost. We added a "busy mode" that
+auto-detects this:
+
+- Engine starts in *quiet mode* (wait=0).
+- Each Durable fsync measures the number of ops it durabilizes
+  (`ops_appended` snapshot at fsync start — `ops_durable` high-water
+  mark). This is the right metric because in pipelined mode each fsync
+  piggybacks on appends from other concurrent leaders, so it's larger
+  than `entries.len()` of any single leader's batch.
+- On the first fsync that covers `>= num_cpus × 8` ops, the booster
+  trips on permanently; the leader switches to a 100 µs wait per batch.
+- One-way switch — once tripped, stays on.
+
+This is now the default (`LsmConfig::commit_busy_mode = true`). An
+explicit `commit_wait_usec > 0` overrides it.
+
+| Level             |   1t |   2t |   4t |   8t |  16t |  32t |  64t | 128t | 256t | 512t | 1024t |
+|-------------------|-----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|------:|
+| Durable           |  163 |  167 |  332 |  714 |   1K |   3K |   6K |  13K |  22K |  30K |   33K |
+| Durable+wait100µs |  163 |  225 |  322 |  626 |   1K |   3K |   6K |  11K |  26K |  63K |  124K |
+| Durable+busy      |  166 |  167 |  327 |  617 |   1K |   3K |   7K |  12K |  26K |  58K |  **122K** |
+
+Read:
+- **Busy mode matches wait100 at peak** (122K vs 124K @ 1024t) — within
+  noise.
+- **No latency cost at low concurrency.** 1t busy is 166 vs plain 163;
+  4t busy is 327 vs plain 332; essentially identical. wait100 at 1t is
+  also fine (163) but wait100 at 2t (225) shows the kind of
+  per-thread noise the booster avoids.
+- **Trips at 128 threads on this machine** (num_cpus = 16 → threshold
+  = 128). Observed trip points: 137, 130, 130, 212 ops/fsync —
+  immediately above threshold once concurrency is high enough.
+- **One-way is sufficient.** Once a workload has demonstrated it can
+  fill batches above the threshold, it almost certainly will again; the
+  occasional quiet period doesn't justify ping-ponging back.
+
+The key implementation detail: the trigger measures *ops per fsync*,
+not ops per drained batch. In our pipelined design, multiple leaders'
+appends share each fsync (the kernel flushes everything that landed in
+the OS page cache by the time `sync_all()` is called), so the natural
+"how busy is this engine" signal is the rise in the durable high-water
+mark per fsync syscall.
+
+Next steps (not implemented):
+- Per-second throughput-based trigger as an alternative signal
+  (`ops_appended` rate over a sliding window) — might trip earlier under
+  variable workloads.
+- Configurable threshold / wait value (currently hardcoded
+  `num_cpus × 8` and 100 µs).
+- A reverse trigger to turn busy mode off when concurrency drops
+  sustainably (would need hysteresis to avoid oscillation).
 
 ### Cross-check against MariaDB's group commit work
 

@@ -91,6 +91,18 @@ pub struct LsmConfig {
     /// `0` means "always wait the full `commit_wait_usec`". Effective only
     /// when `commit_wait_usec > 0`.
     pub commit_wait_count: usize,
+    /// Group-commit "busy mode" (default: `true`). When enabled, the
+    /// Durable leader starts with wait=0 (quiet mode). On the first
+    /// fsync that durabilizes >= `num_cpus × 8` ops, the booster trips
+    /// on permanently and the leader uses a 100 µs wait per batch.
+    /// One-way switch.
+    ///
+    /// If `commit_wait_usec > 0` is explicitly configured, that static
+    /// value overrides busy mode entirely.
+    ///
+    /// Intent: near-free default that captures peak throughput under
+    /// real concurrency without paying the wait cost at low concurrency.
+    pub commit_busy_mode: bool,
 }
 
 impl Default for LsmConfig {
@@ -111,6 +123,7 @@ impl Default for LsmConfig {
             min_consistency: Consistency::default(),
             commit_wait_usec: 0,
             commit_wait_count: 0,
+            commit_busy_mode: true,
         }
     }
 }
@@ -259,6 +272,22 @@ pub struct LsmEngine {
     optimistic_batch: Mutex<Vec<IBlob>>,
     /// Derived from `config.min_consistency` at open() time.
     commit_mode: CommitMode,
+    /// Group-commit busy-mode flag: when set, the Durable leader uses a
+    /// 100 µs wait per batch. Set permanently on the first batch with
+    /// `>= commit_busy_threshold` entries. One-way.
+    commit_busy_active: AtomicBool,
+    /// `num_cpus × 8` cached at `open()`. Threshold above which busy mode
+    /// trips. Only consulted when `config.commit_busy_mode` is true.
+    commit_busy_threshold: usize,
+    /// Monotonic counter of ops appended to the WAL. Bumped under the WAL
+    /// lock right after each append. Used by busy mode to compute
+    /// "ops made durable per fsync" — which is larger than entries.len()
+    /// of a single leader's batch because fsyncs piggyback on other
+    /// concurrent leaders' appends.
+    ops_appended: AtomicU64,
+    /// Monotonic high-water mark of ops known durably committed. Updated
+    /// after each fsync via fetch_max with the appended snapshot.
+    ops_durable: AtomicU64,
     /// Background compaction signaling
     compaction_signal: Arc<CompactionSignal>,
     /// Background compaction thread handle
@@ -403,6 +432,13 @@ impl LsmEngine {
             commit_queue: Mutex::new(CommitQueue::new()),
             optimistic_batch: Mutex::new(Vec::new()),
             commit_mode,
+            commit_busy_active: AtomicBool::new(false),
+            commit_busy_threshold: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .saturating_mul(8),
+            ops_appended: AtomicU64::new(0),
+            ops_durable: AtomicU64::new(0),
             compaction_signal: Arc::new(CompactionSignal {
                 pending: Mutex::new(false),
                 notify: Condvar::new(),
@@ -586,8 +622,22 @@ impl LsmEngine {
     /// 5. **Self-regulate**: if more work is queued AND no other leader
     ///    stepped in, take leadership back and loop.
     fn run_leader_pipelined(&self) -> Result<(), LsmError> {
-        let wait_usec = self.config.commit_wait_usec;
-        let wait_count = self.config.commit_wait_count;
+        // Resolve wait_usec/count. Priority:
+        //   1. Explicit static wait (commit_wait_usec > 0): use it verbatim.
+        //   2. Busy mode (default): wait=0 quiet, wait=100 once tripped.
+        //   3. Off: no wait.
+        let static_usec = self.config.commit_wait_usec;
+        let (wait_usec, wait_count) = if static_usec > 0 {
+            (static_usec, self.config.commit_wait_count)
+        } else if self.config.commit_busy_mode {
+            if self.commit_busy_active.load(Ordering::Relaxed) {
+                (100, 0)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
 
         loop {
             // Phase 1: drain queue. Hold leadership so the wait below
@@ -602,6 +652,11 @@ impl LsmEngine {
                 }
                 entries
             };
+
+            // Note: the busy-mode trigger is evaluated *after* fsync, inside
+            // process_batch_durable, because the relevant signal is "ops made
+            // durable by this fsync" — which includes piggybacked appends
+            // from concurrent leaders, not just our own entries.len().
 
             // Phase 2: optional batch-growing wait. Skip if batch already
             // meets the count threshold.
@@ -654,17 +709,44 @@ impl LsmEngine {
             .iter_mut()
             .map(|e| e.blob.take().expect("entry blob not yet taken"))
             .collect();
+        let n = blobs.len();
 
         // Phase 1: append + push BufWriter to OS page cache (WAL lock).
-        let sync_handle = {
+        // Snapshot the global ops-appended counter while holding the lock —
+        // this is the file's high-water mark our upcoming fsync is guaranteed
+        // to cover. Other leaders may push it higher before our fsync, in
+        // which case our fsync will durabilize more than we counted.
+        let (sync_handle, ops_at_fsync_start) = {
             let mut wal = self.wal.lock();
             wal.append_batch(&mut blobs)?;
             wal.flush_buf()?;
-            wal.sync_handle()
+            // Bump appended counter atomically with the append (still under WAL lock).
+            let after_append = self.ops_appended.fetch_add(n as u64, Ordering::Relaxed)
+                + n as u64;
+            (wal.sync_handle(), after_append)
         };
 
         // Phase 2: fsync without WAL lock — pipelines with other leaders.
         sync_handle.sync_all()?;
+
+        // Compute "ops made durable by this fsync" = the rise in the
+        // ops_durable high-water mark. fetch_max returns the *previous*
+        // value; if our snapshot is higher, we durabilized the delta.
+        let prev_durable = self.ops_durable.fetch_max(ops_at_fsync_start, Ordering::Relaxed);
+        let ops_in_fsync = if ops_at_fsync_start > prev_durable {
+            (ops_at_fsync_start - prev_durable) as usize
+        } else {
+            0 // another leader's later fsync already covered our data
+        };
+
+        // Busy-mode trigger: if this fsync covered enough ops, flip the
+        // booster on (one-way).
+        if self.config.commit_busy_mode
+            && ops_in_fsync >= self.commit_busy_threshold
+            && !self.commit_busy_active.load(Ordering::Relaxed)
+        {
+            self.commit_busy_active.store(true, Ordering::Relaxed);
+        }
 
         // Phase 3: memtable + indexes. Must precede signaling.
         {
@@ -2072,7 +2154,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
         (engine, dir)
@@ -2131,7 +2213,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
         let blob = make_blob(42);
@@ -2258,7 +2340,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
         let id = DocumentId::new();
@@ -2646,7 +2728,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2685,7 +2767,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2713,7 +2795,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2753,7 +2835,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2813,7 +2895,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2951,7 +3033,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3035,7 +3117,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3106,7 +3188,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 1000,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3142,7 +3224,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3197,7 +3279,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3250,7 +3332,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
         let target_id = deterministic_id(0);
@@ -3318,7 +3400,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3364,7 +3446,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3420,6 +3502,7 @@ mod tests {
             min_consistency: c,
             commit_wait_usec: 0,
             commit_wait_count: 0,
+            commit_busy_mode: false,
         }
     }
 

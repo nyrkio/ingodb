@@ -34,45 +34,36 @@ fn ops_per_thread(threads: usize) -> usize {
     (TOTAL_OPS_TARGET / threads).clamp(200, 5_000)
 }
 
-/// One row of the benchmark: label + consistency level + wait_usec.
+/// One row of the benchmark: label + consistency level + wait_usec + busy_mode flag.
 struct Row {
     label: &'static str,
     level: Consistency,
     wait_usec: u64,
+    /// If true, ignore wait_usec and enable busy-mode (engine starts with
+    /// wait=0; flips to 100µs once a batch reaches num_cpus × 8 entries).
+    busy_mode: bool,
 }
 
 fn main() {
     let strict = Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE);
     let rows = vec![
         Row {
-            label: "Optimistic     ",
-            level: Consistency::default(),
-            wait_usec: 0,
-        },
-        Row {
-            label: "Visible        ",
-            level: Consistency::single_node(ConsistencyModel::LINEARIZABLE),
-            wait_usec: 0,
-        },
-        Row {
             label: "Durable        ",
             level: strict,
             wait_usec: 0,
+            busy_mode: false,
         },
         Row {
             label: "Durable+wait100",
             level: strict,
             wait_usec: 100,
+            busy_mode: false,
         },
         Row {
-            label: "Durable+wait500",
+            label: "Durable+busy   ",
             level: strict,
-            wait_usec: 500,
-        },
-        Row {
-            label: "Durable+wait1ms",
-            level: strict,
-            wait_usec: 1000,
+            wait_usec: 0,
+            busy_mode: true,
         },
     ];
 
@@ -92,7 +83,7 @@ fn main() {
         print!("{}", row.label);
         let _ = std::io::stdout().flush();
         for &threads in CONCURRENCIES {
-            let ops_per_sec = run_one(row.level, threads, row.wait_usec);
+            let ops_per_sec = run_one(row.level, threads, row.wait_usec, row.busy_mode);
             print!("{:>10}", format_kops(ops_per_sec));
             let _ = std::io::stdout().flush();
         }
@@ -107,7 +98,7 @@ fn main() {
     println!("   where many threads can join the same batch.");
 }
 
-fn run_one(level: Consistency, threads: usize, wait_usec: u64) -> f64 {
+fn run_one(level: Consistency, threads: usize, wait_usec: u64, busy_mode: bool) -> f64 {
     let dir = tempfile::tempdir().unwrap();
     let config = LsmConfig {
         data_dir: dir.path().to_path_buf(),
@@ -125,6 +116,7 @@ fn run_one(level: Consistency, threads: usize, wait_usec: u64) -> f64 {
         min_consistency: level,
         commit_wait_usec: wait_usec,
         commit_wait_count: 0, // always wait the full wait_usec
+        commit_busy_mode: busy_mode,
     };
     let engine = Arc::new(LsmEngine::open(config).unwrap());
 
