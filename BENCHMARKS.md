@@ -42,12 +42,63 @@ Self-regulation:
   At low contention this collapses to a single leader looping; at high
   fsync load it naturally fragments into many pipelined leaders.
 
-Headroom (not yet implemented):
-- `wait_count` / `wait_usec` knobs — deliberately delay the leader to
-  grow the batch at low concurrency where threads arrive faster than the
-  fsync rate.
+Headroom (partially implemented below):
+- `commit_wait_usec` / `commit_wait_count` knobs — deliberately delay the
+  leader to grow the batch. Implemented as static config; see the next
+  section for results.
 - An adaptive scheme: the engine could observe its own fsync latency and
   tune wait_usec from data (the IngoDB "liquid" thesis).
+
+### Batch-growing wait: commit_wait_usec
+
+MariaDB exposes two knobs (`binlog_commit_wait_usec`, `binlog_commit_wait_count`)
+that let the leader deliberately delay fsync to gather more writers into one
+batch. We added the same as `LsmConfig.commit_wait_usec` /
+`commit_wait_count`. Defaults are zero (no wait, preserving the prior
+behavior).
+
+When enabled (Durable mode only), the leader drains the queue, then if the
+batch is below `commit_wait_count` (or `commit_wait_count == 0` meaning
+"always wait"), sleeps for up to `commit_wait_usec` while still holding
+leadership. New arrivals during the wait join *this* batch as followers.
+After the wait, leadership is released for pipelining and the leader
+proceeds with append + fsync.
+
+| Level             |   1t |   2t |   4t |   8t |  16t |  32t |  64t | 128t | 256t | 512t |1024t |
+|-------------------|-----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|
+| Optimistic        | 213K | 289K | 202K | 219K | 205K | 207K | 198K | 170K | 154K | 141K | 143K |
+| Visible           | 274K | 267K | 264K | 308K | 367K | 335K | 326K | 343K | 382K | 358K | 279K |
+| Durable           |  162 |  169 |  356 |  708 |   1K |   3K |   6K |  11K |  25K |  27K |  27K |
+| Durable+wait100µs |  147 |  170 |  377 |  635 |   1K |   3K |   6K |  10K |  21K |  58K | **123K** |
+| Durable+wait500µs |  139 |  302 |  577 |   1K |   1K |   3K |   5K |  12K |  23K |  58K | 112K |
+| Durable+wait1ms   |  133 |  231 |  505 |  961 |   2K |   3K |   6K |  11K |  26K |  53K | 110K |
+
+Read:
+- **wait_usec=100 at 1024t turns 27K into 123K ops/sec — a 4.5× peak speedup.**
+  Without the wait, Durable plateaus at ~27K from 256t onward; with it,
+  throughput keeps scaling. The plateau was pipelining-limited (too many
+  small fsyncs); the wait converts those into fewer larger fsyncs.
+- **The sweet spot is 100µs.** Going to 500µs or 1ms doesn't go higher —
+  by 100µs the batches are already nearly full at that concurrency, and
+  longer waits just add latency.
+- **Crossover is ~256t.** Below that, the wait adds latency with no batch
+  growth (not enough writers to gather). At 256t it's roughly break-even;
+  above, the wait wins by progressively larger margins.
+- **Cost at low concurrency is bounded by wait_usec.** Single-thread
+  wait1ms drops 162 → 133 (~18%). For latency-sensitive workloads, use
+  `commit_wait_count` > 0 so the leader skips the wait when the batch is
+  already large.
+- **Per-fsync amortization at 1024t with wait100**: ~123K ÷ 143 fsync/s ≈
+  860 ops/fsync, vs ~190 before — closer to the 1024-thread ceiling.
+
+This validates the original hypothesis that pipelining alone doesn't
+saturate the available batch capacity — it spreads work across more,
+smaller fsyncs. The wait collapses those into fewer larger ones.
+
+Next step: adaptive `commit_wait_usec`. The right wait depends on recent
+arrival rate and observed batch size. With telemetry already in the
+engine (QueryStats), this is the same shape as the adaptive-W work for
+compaction.
 
 ### Cross-check against MariaDB's group commit work
 

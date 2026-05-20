@@ -81,6 +81,16 @@ pub struct LsmConfig {
     /// To additionally fsync per batch, use `STRICT_LINEARIZABLE`.
     /// Cluster scope is currently unsupported and errors at `open()`.
     pub min_consistency: Consistency,
+    /// Group-commit batch-growing knob: in Durable mode, if a freshly-drained
+    /// batch is smaller than `commit_wait_count`, the leader holds leadership
+    /// and waits up to this many microseconds to gather more arrivals into
+    /// the same fsync. Trades per-op latency for higher batch utilization.
+    /// `0` disables (default); typical values 100–1000.
+    pub commit_wait_usec: u64,
+    /// Above this many entries in the batch, skip the wait and fsync now.
+    /// `0` means "always wait the full `commit_wait_usec`". Effective only
+    /// when `commit_wait_usec > 0`.
+    pub commit_wait_count: usize,
 }
 
 impl Default for LsmConfig {
@@ -99,6 +109,8 @@ impl Default for LsmConfig {
             adaptive_w_min: -8,
             adaptive_w_max: 8,
             min_consistency: Consistency::default(),
+            commit_wait_usec: 0,
+            commit_wait_count: 0,
         }
     }
 }
@@ -559,34 +571,60 @@ impl LsmEngine {
 
     /// Durable-mode leader with pipelined fsync.
     ///
-    /// Releases `leader_active` immediately after draining the queue so a
-    /// new arrival can become leader of batch N+1 and start appending while
-    /// batch N is in fsync. The WAL writer mutex is held only for the brief
-    /// append + OS flush; `sync_all()` runs on a cloned file handle.
-    ///
-    /// Self-regulating: after each batch, if more work has piled up AND no
-    /// new leader has stepped in, the current leader takes leadership back
-    /// and continues. At low contention this collapses to one leader looping;
-    /// at high contention leadership naturally fragments and many fsyncs
-    /// pipeline.
+    /// Phases per batch:
+    /// 1. **Drain** the queue (under queue lock). Leadership is *not* released
+    ///    yet — new arrivals during the optional wait become followers of THIS
+    ///    batch instead of competing leaders.
+    /// 2. **Optional batch-growing wait.** If `commit_wait_usec > 0` and the
+    ///    batch is below `commit_wait_count` (or `commit_wait_count == 0`
+    ///    meaning "always wait"), sleep for up to `wait_usec` and drain again.
+    ///    This converts many small fsyncs into fewer larger ones at the cost
+    ///    of per-op latency.
+    /// 3. **Release leadership** so the next leader can begin appending while
+    ///    we fsync (pipelining).
+    /// 4. **Append + OS flush + fsync + memtable insert + signal followers.**
+    /// 5. **Self-regulate**: if more work is queued AND no other leader
+    ///    stepped in, take leadership back and loop.
     fn run_leader_pipelined(&self) -> Result<(), LsmError> {
+        let wait_usec = self.config.commit_wait_usec;
+        let wait_count = self.config.commit_wait_count;
+
         loop {
-            // Drain + release leadership. New arrivals can now become the
-            // next leader and append while we're in fsync below.
+            // Phase 1: drain queue. Hold leadership so the wait below
+            // captures new arrivals as followers of this batch.
             let mut entries = {
                 let mut q = self.commit_queue.lock();
                 let entries = std::mem::take(&mut q.entries);
-                q.leader_active = false;
+                if entries.is_empty() {
+                    // Nothing queued — release leadership and exit.
+                    q.leader_active = false;
+                    break;
+                }
                 entries
             };
-            if entries.is_empty() {
-                break;
+
+            // Phase 2: optional batch-growing wait. Skip if batch already
+            // meets the count threshold.
+            if wait_usec > 0 && (wait_count == 0 || entries.len() < wait_count) {
+                std::thread::sleep(std::time::Duration::from_micros(wait_usec));
+                let extras = {
+                    let mut q = self.commit_queue.lock();
+                    std::mem::take(&mut q.entries)
+                };
+                entries.extend(extras);
             }
 
+            // Phase 3: release leadership atomically. New arrivals can now
+            // form batch N+1 and pipeline against our fsync below.
+            {
+                let mut q = self.commit_queue.lock();
+                q.leader_active = false;
+            }
+
+            // Phase 4: WAL append + pipelined fsync + memtable + signal.
             self.process_batch_durable(&mut entries)?;
 
-            // Self-regulating: continue only if (a) work is pending and
-            // (b) no other leader has claimed it during our processing.
+            // Phase 5: self-regulating continue.
             let continue_as_leader = {
                 let mut q = self.commit_queue.lock();
                 if q.entries.is_empty() || q.leader_active {
@@ -2034,7 +2072,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
         (engine, dir)
@@ -2093,7 +2131,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
 
         let blob = make_blob(42);
@@ -2220,7 +2258,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
         let id = DocumentId::new();
@@ -2608,7 +2646,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2647,7 +2685,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2675,7 +2713,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2715,7 +2753,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2775,7 +2813,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2913,7 +2951,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -2997,7 +3035,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3068,7 +3106,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 1000,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3104,7 +3142,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3159,7 +3197,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3212,7 +3250,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
 
         let target_id = deterministic_id(0);
@@ -3280,7 +3318,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3326,7 +3364,7 @@ mod tests {
             scaling_parameter: 0,
             sort_spill_threshold: 5,
             compaction_threads: 1,
-            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(),
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
         };
         let engine = LsmEngine::open(config).unwrap();
 
@@ -3380,6 +3418,8 @@ mod tests {
             adaptive_w_min: -8,
             adaptive_w_max: 8,
             min_consistency: c,
+            commit_wait_usec: 0,
+            commit_wait_count: 0,
         }
     }
 

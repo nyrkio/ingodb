@@ -47,7 +47,7 @@ fn main() {
         adaptive_w_cooldown_secs: 1, // very short cooldown for benchmarks
         adaptive_w_max_step: 16, // effectively unlimited — jump to target immediately
         adaptive_w_min: -8,
-        adaptive_w_max: 8, min_consistency: Consistency::default(),
+        adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0,
     };
 
     let mode = match w.cmp(&0) {

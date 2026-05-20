@@ -17,41 +17,82 @@ use ingodb::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Target total ops per cell. ops_per_thread is derived so memory stays bounded
 // at high concurrency. Clamped to [200, 5000].
 const TOTAL_OPS_TARGET: usize = 200_000;
 const CONCURRENCIES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
 
+/// Per-cell wall-clock budget. Each writer thread checks the deadline per op
+/// and exits early if reached. Throughput is reported from ops actually
+/// completed and the actual elapsed time, so a timed-out cell still gives a
+/// valid (lower-bound) rate.
+const MAX_CELL_SECS: u64 = 180;
+
 fn ops_per_thread(threads: usize) -> usize {
     (TOTAL_OPS_TARGET / threads).clamp(200, 5_000)
 }
 
+/// One row of the benchmark: label + consistency level + wait_usec.
+struct Row {
+    label: &'static str,
+    level: Consistency,
+    wait_usec: u64,
+}
+
 fn main() {
-    let levels: Vec<(&str, Consistency)> = vec![
-        ("Optimistic   ", Consistency::default()),
-        ("Visible      ", Consistency::single_node(ConsistencyModel::LINEARIZABLE)),
-        ("Durable      ", Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE)),
+    let strict = Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE);
+    let rows = vec![
+        Row {
+            label: "Optimistic     ",
+            level: Consistency::default(),
+            wait_usec: 0,
+        },
+        Row {
+            label: "Visible        ",
+            level: Consistency::single_node(ConsistencyModel::LINEARIZABLE),
+            wait_usec: 0,
+        },
+        Row {
+            label: "Durable        ",
+            level: strict,
+            wait_usec: 0,
+        },
+        Row {
+            label: "Durable+wait100",
+            level: strict,
+            wait_usec: 100,
+        },
+        Row {
+            label: "Durable+wait500",
+            level: strict,
+            wait_usec: 500,
+        },
+        Row {
+            label: "Durable+wait1ms",
+            level: strict,
+            wait_usec: 1000,
+        },
     ];
 
     println!();
     println!("fsync benchmark — group commit under different consistency levels");
     println!("ops/thread varies: TOTAL_OPS_TARGET={TOTAL_OPS_TARGET}, clamped to [200, 5000]");
     println!();
-    print!("{:14}", "Level");
+    print!("{:16}", "Level");
     for c in CONCURRENCIES {
         print!("{:>10}", format!("{c}t"));
     }
     println!();
-    println!("{}", "─".repeat(14 + 10 * CONCURRENCIES.len()));
+    println!("{}", "─".repeat(16 + 10 * CONCURRENCIES.len()));
 
     use std::io::Write;
-    for (label, level) in &levels {
-        print!("{label}");
+    for row in &rows {
+        print!("{}", row.label);
         let _ = std::io::stdout().flush();
         for &threads in CONCURRENCIES {
-            let ops_per_sec = run_one(*level, threads);
+            let ops_per_sec = run_one(row.level, threads, row.wait_usec);
             print!("{:>10}", format_kops(ops_per_sec));
             let _ = std::io::stdout().flush();
         }
@@ -59,15 +100,14 @@ fn main() {
     }
     println!();
     println!("Notes:");
-    println!(" - Optimistic is the upper bound (no follower wait, no fsync).");
-    println!(" - Visible shows the cost of follower wait alone (no fsync).");
-    println!(" - Durable adds fsync — single-thread is fsync-bound, but with");
-    println!("   group commit, throughput grows as more threads share each fsync.");
-    println!(" - Per-thread amortization ratio (Durable / Optimistic) shows");
-    println!("   how close we are to fsync-limited steady state.");
+    println!(" - Optimistic / Visible / Durable: see crate docs.");
+    println!(" - Durable+waitX: commit_wait_usec=X, commit_wait_count=0 (always wait).");
+    println!("   Trades up to X µs of per-op latency for larger batches and");
+    println!("   fewer fsyncs per second — should help most at high concurrency");
+    println!("   where many threads can join the same batch.");
 }
 
-fn run_one(level: Consistency, threads: usize) -> f64 {
+fn run_one(level: Consistency, threads: usize, wait_usec: u64) -> f64 {
     let dir = tempfile::tempdir().unwrap();
     let config = LsmConfig {
         data_dir: dir.path().to_path_buf(),
@@ -83,6 +123,8 @@ fn run_one(level: Consistency, threads: usize) -> f64 {
         adaptive_w_min: -8,
         adaptive_w_max: 8,
         min_consistency: level,
+        commit_wait_usec: wait_usec,
+        commit_wait_count: 0, // always wait the full wait_usec
     };
     let engine = Arc::new(LsmEngine::open(config).unwrap());
 
@@ -93,23 +135,29 @@ fn run_one(level: Consistency, threads: usize) -> f64 {
 
     let per_thread = ops_per_thread(threads);
     let start = Instant::now();
+    let deadline = start + Duration::from_secs(MAX_CELL_SECS);
     let mut handles = Vec::with_capacity(threads);
     for t in 0..threads {
         let e = engine.clone();
-        handles.push(std::thread::spawn(move || {
+        handles.push(std::thread::spawn(move || -> usize {
             let base = (t * per_thread + 100_000) as u64;
+            let mut completed = 0usize;
             for i in 0..per_thread {
+                // Check deadline once per op. Instant::now() is ~50 ns —
+                // negligible relative to even a no-fsync put.
+                if Instant::now() >= deadline {
+                    break;
+                }
                 let id = deterministic_id(base + i as u64);
                 e.put(make_blob(id, base + i as u64)).unwrap();
+                completed += 1;
             }
+            completed
         }));
     }
-    for h in handles {
-        h.join().unwrap();
-    }
+    let total_ops: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
     let elapsed = start.elapsed();
-    let total_ops = (threads * per_thread) as f64;
-    total_ops / elapsed.as_secs_f64()
+    total_ops as f64 / elapsed.as_secs_f64()
 }
 
 fn format_kops(ops: f64) -> String {
