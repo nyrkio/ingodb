@@ -130,9 +130,11 @@ Read:
 - **Trips at 128 threads on this machine** (num_cpus = 16 → threshold
   = 128). Observed trip points: 137, 130, 130, 212 ops/fsync —
   immediately above threshold once concurrency is high enough.
-- **One-way is sufficient.** Once a workload has demonstrated it can
-  fill batches above the threshold, it almost certainly will again; the
-  occasional quiet period doesn't justify ping-ponging back.
+- **Two-way with hysteresis.** Busy mode now also turns off after 3
+  consecutive fsyncs each covering fewer than `num_cpus × 2` ops
+  (= `commit_busy_threshold / 4`). The gap between up-threshold
+  (`× 8`) and down-threshold (`× 2`) gives natural hysteresis: small
+  bursts of activity don't oscillate the flag.
 
 The key implementation detail: the trigger measures *ops per fsync*,
 not ops per drained batch. In our pipelined design, multiple leaders'
@@ -143,12 +145,10 @@ mark per fsync syscall.
 
 Next steps (not implemented):
 - Per-second throughput-based trigger as an alternative signal
-  (`ops_appended` rate over a sliding window) — might trip earlier under
-  variable workloads.
+  (`ops_appended` rate over a sliding window) — might trip earlier
+  under variable workloads.
 - Configurable threshold / wait value (currently hardcoded
-  `num_cpus × 8` and 100 µs).
-- A reverse trigger to turn busy mode off when concurrency drops
-  sustainably (would need hysteresis to avoid oscillation).
+  `num_cpus × 8` up, `num_cpus × 2` down, 100 µs wait).
 
 ### Cross-check against MariaDB's group commit work
 

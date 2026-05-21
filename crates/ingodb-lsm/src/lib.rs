@@ -15,7 +15,7 @@ use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -272,13 +272,19 @@ pub struct LsmEngine {
     optimistic_batch: Mutex<Vec<IBlob>>,
     /// Derived from `config.min_consistency` at open() time.
     commit_mode: CommitMode,
-    /// Group-commit busy-mode flag: when set, the Durable leader uses a
-    /// 100 µs wait per batch. Set permanently on the first batch with
-    /// `>= commit_busy_threshold` entries. One-way.
+    /// Group-commit busy-mode flag. When set, the Durable leader uses a
+    /// 100 µs wait per batch. Toggled by `maybe_toggle_busy` after each
+    /// fsync — trips on when ops/fsync ≥ `commit_busy_threshold` (upward
+    /// hysteresis), off after 3 consecutive fsyncs with ops/fsync below
+    /// `commit_busy_threshold / 4` (downward hysteresis).
     commit_busy_active: AtomicBool,
-    /// `num_cpus × 8` cached at `open()`. Threshold above which busy mode
-    /// trips. Only consulted when `config.commit_busy_mode` is true.
+    /// `num_cpus × 8` cached at `open()`. Upward threshold for busy mode.
+    /// Downward threshold is `commit_busy_threshold / 4` (= num_cpus × 2).
     commit_busy_threshold: usize,
+    /// Consecutive count of fsyncs with ops below the downward threshold.
+    /// Reset whenever a fsync covers ≥ down-threshold ops. Busy mode
+    /// turns off when this reaches 3.
+    consecutive_quiet_fsyncs: AtomicUsize,
     /// Monotonic counter of ops appended to the WAL. Bumped under the WAL
     /// lock right after each append. Used by busy mode to compute
     /// "ops made durable per fsync" — which is larger than entries.len()
@@ -437,6 +443,7 @@ impl LsmEngine {
                 .map(|n| n.get())
                 .unwrap_or(4)
                 .saturating_mul(8),
+            consecutive_quiet_fsyncs: AtomicUsize::new(0),
             ops_appended: AtomicU64::new(0),
             ops_durable: AtomicU64::new(0),
             compaction_signal: Arc::new(CompactionSignal {
@@ -622,24 +629,28 @@ impl LsmEngine {
     /// 5. **Self-regulate**: if more work is queued AND no other leader
     ///    stepped in, take leadership back and loop.
     fn run_leader_pipelined(&self) -> Result<(), LsmError> {
-        // Resolve wait_usec/count. Priority:
-        //   1. Explicit static wait (commit_wait_usec > 0): use it verbatim.
-        //   2. Busy mode (default): wait=0 quiet, wait=100 once tripped.
-        //   3. Off: no wait.
         let static_usec = self.config.commit_wait_usec;
-        let (wait_usec, wait_count) = if static_usec > 0 {
-            (static_usec, self.config.commit_wait_count)
-        } else if self.config.commit_busy_mode {
-            if self.commit_busy_active.load(Ordering::Relaxed) {
+        let static_count = self.config.commit_wait_count;
+
+        loop {
+            // Resolve wait_usec/count per iteration. Busy mode can toggle
+            // mid-stream (process_batch_durable updates `commit_busy_active`
+            // after each fsync), so we re-read it every loop.
+            //
+            // Priority:
+            //   1. Explicit static wait (commit_wait_usec > 0): use it verbatim.
+            //   2. Busy mode (default): wait=0 quiet, wait=100 when active.
+            //   3. Off: no wait.
+            let (wait_usec, wait_count) = if static_usec > 0 {
+                (static_usec, static_count)
+            } else if self.config.commit_busy_mode
+                && self.commit_busy_active.load(Ordering::Relaxed)
+            {
                 (100, 0)
             } else {
                 (0, 0)
-            }
-        } else {
-            (0, 0)
-        };
+            };
 
-        loop {
             // Phase 1: drain queue. Hold leadership so the wait below
             // captures new arrivals as followers of this batch.
             let mut entries = {
@@ -701,6 +712,48 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Busy-mode toggle logic, called after each Durable fsync.
+    ///
+    /// Hysteresis:
+    /// - **Up**: a single fsync covering ≥ `commit_busy_threshold` ops
+    ///   (= `num_cpus × 8`) flips busy mode on. Also resets the quiet
+    ///   counter so subsequent partial activity doesn't immediately
+    ///   start counting toward off.
+    /// - **Down**: 3 consecutive fsyncs each covering fewer than
+    ///   `commit_busy_threshold / 4` ops (= `num_cpus × 2`) flip it off.
+    /// - **Middle band** (between down-threshold and up-threshold):
+    ///   resets the quiet counter (these aren't quiet enough to count),
+    ///   doesn't change `commit_busy_active`.
+    ///
+    /// No-op when `config.commit_busy_mode` is false.
+    fn maybe_toggle_busy(&self, ops_in_fsync: usize) {
+        if !self.config.commit_busy_mode {
+            return;
+        }
+        let up = self.commit_busy_threshold;
+        let down = up / 4;
+        if ops_in_fsync >= up {
+            // Up trigger: trip on and reset the quiet counter.
+            self.consecutive_quiet_fsyncs.store(0, Ordering::Relaxed);
+            if !self.commit_busy_active.load(Ordering::Relaxed) {
+                self.commit_busy_active.store(true, Ordering::Relaxed);
+            }
+        } else if ops_in_fsync < down {
+            // Quiet fsync: count it. Turn off after 3 in a row.
+            let n = self
+                .consecutive_quiet_fsyncs
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if n >= 3 && self.commit_busy_active.load(Ordering::Relaxed) {
+                self.commit_busy_active.store(false, Ordering::Relaxed);
+                self.consecutive_quiet_fsyncs.store(0, Ordering::Relaxed);
+            }
+        } else {
+            // Middle band — not quiet, but not enough to trip on.
+            self.consecutive_quiet_fsyncs.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// One Durable batch with pipelined fsync. WAL writer mutex held only
     /// during append + OS flush; fsync runs without it so other leaders can
     /// append batch N+1 in parallel.
@@ -739,14 +792,9 @@ impl LsmEngine {
             0 // another leader's later fsync already covered our data
         };
 
-        // Busy-mode trigger: if this fsync covered enough ops, flip the
-        // booster on (one-way).
-        if self.config.commit_busy_mode
-            && ops_in_fsync >= self.commit_busy_threshold
-            && !self.commit_busy_active.load(Ordering::Relaxed)
-        {
-            self.commit_busy_active.store(true, Ordering::Relaxed);
-        }
+        // Busy-mode hysteresis: turn on above up-threshold, off after
+        // 3 consecutive fsyncs below down-threshold.
+        self.maybe_toggle_busy(ops_in_fsync);
 
         // Phase 3: memtable + indexes. Must precede signaling.
         {
@@ -3673,5 +3721,91 @@ mod tests {
         // Some or all writes may survive (BufWriter happens to flush on close).
         // The contract only guarantees that reopen doesn't error.
         let _ = engine.get(&deterministic_id(0));
+    }
+
+    /// Busy-mode hysteresis: large fsync flips it on; 3 consecutive small
+    /// fsyncs flip it off; middle-band fsyncs reset the quiet counter
+    /// without changing state.
+    #[test]
+    fn busy_mode_trips_up_and_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_consistency(
+            dir.path(),
+            Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE),
+        );
+        // The test_config helper sets commit_busy_mode=false explicitly;
+        // override to exercise the hysteresis.
+        let config = LsmConfig {
+            commit_busy_mode: true,
+            ..config
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        let up = engine.commit_busy_threshold;
+        let down = up / 4;
+        let mid = (down + up) / 2;
+
+        // Initially off.
+        assert!(!engine.commit_busy_active.load(Ordering::Relaxed));
+
+        // A single big fsync flips on.
+        engine.maybe_toggle_busy(up);
+        assert!(engine.commit_busy_active.load(Ordering::Relaxed));
+
+        // Middle-band fsyncs neither flip off nor reset on.
+        for _ in 0..5 {
+            engine.maybe_toggle_busy(mid);
+            assert!(engine.commit_busy_active.load(Ordering::Relaxed));
+        }
+
+        // Two consecutive quiet fsyncs — still on.
+        engine.maybe_toggle_busy(0);
+        assert!(engine.commit_busy_active.load(Ordering::Relaxed));
+        engine.maybe_toggle_busy(0);
+        assert!(engine.commit_busy_active.load(Ordering::Relaxed));
+
+        // Third consecutive quiet fsync flips off.
+        engine.maybe_toggle_busy(0);
+        assert!(!engine.commit_busy_active.load(Ordering::Relaxed));
+
+        // A middle-band fsync after off-state should reset quiet counter
+        // without flipping anything (still off).
+        engine.maybe_toggle_busy(mid);
+        assert!(!engine.commit_busy_active.load(Ordering::Relaxed));
+
+        // 2 quiets after a mid-band reset: should not flip off (it's already
+        // off) — really we're checking the counter was reset by mid.
+        engine.maybe_toggle_busy(0);
+        engine.maybe_toggle_busy(0);
+        // Mid-band again to reset.
+        engine.maybe_toggle_busy(mid);
+        engine.maybe_toggle_busy(0);
+        // Only 1 quiet since reset; if we trip on again, then need 3 more.
+        engine.maybe_toggle_busy(up);
+        assert!(engine.commit_busy_active.load(Ordering::Relaxed));
+
+        // Quiet counter was reset by the up-trip; needs 3 fresh quiets.
+        engine.maybe_toggle_busy(0);
+        assert!(engine.commit_busy_active.load(Ordering::Relaxed));
+        engine.maybe_toggle_busy(0);
+        assert!(engine.commit_busy_active.load(Ordering::Relaxed));
+        engine.maybe_toggle_busy(0);
+        assert!(!engine.commit_busy_active.load(Ordering::Relaxed));
+    }
+
+    /// When commit_busy_mode is disabled, maybe_toggle_busy is a no-op even
+    /// for large fsyncs.
+    #[test]
+    fn busy_mode_disabled_never_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_consistency(
+            dir.path(),
+            Consistency::single_node(ConsistencyModel::STRICT_LINEARIZABLE),
+        );
+        // test_config_with_consistency leaves commit_busy_mode=false.
+        let engine = LsmEngine::open(config).unwrap();
+        let up = engine.commit_busy_threshold;
+        engine.maybe_toggle_busy(up * 100);
+        assert!(!engine.commit_busy_active.load(Ordering::Relaxed));
     }
 }
