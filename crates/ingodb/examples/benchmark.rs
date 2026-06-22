@@ -41,8 +41,8 @@ fn main() {
         block_size: 4096,
         compaction_threshold: 4,
         scaling_parameter: w,
-        sort_spill_threshold: 1000,
         compaction_threads: 4,
+        max_ranges_per_field: 500,
         adaptive_w: w == 0, // enable adaptive W when starting from balanced
         adaptive_w_cooldown_secs: 1, // very short cooldown for benchmarks
         adaptive_w_max_step: 16, // effectively unlimited — jump to target immediately

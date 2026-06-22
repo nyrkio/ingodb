@@ -1,6 +1,7 @@
 mod compaction;
 mod database;
 mod secondary;
+pub mod unsorted;
 pub mod stats;
 
 pub use database::Database;
@@ -13,7 +14,7 @@ use ingodb_sstable::{MvccKeyExtractor, SSTableReader, SSTableWriter};
 use ingodb_wal::Wal;
 use stats::{extract_filter_fields, QueryPattern, QueryStats, QueryTimer};
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -59,8 +60,9 @@ pub struct LsmConfig {
     pub compaction_threshold: usize,
     /// UCS scaling parameter W: <0 leveled, 0 balanced, >0 tiered (default 0)
     pub scaling_parameter: i32,
-    /// Minimum result count before sort spills to disk as a partial index (default 1000)
-    pub sort_spill_threshold: usize,
+    /// Max materialized ranges kept per field — sorted partials and unsorted
+    /// blocks share this one unified LRU budget (default 500).
+    pub max_ranges_per_field: usize,
     /// Number of background compaction threads (default 4)
     pub compaction_threads: usize,
     /// Enable adaptive W (auto-tune scaling parameter from read/write ratio)
@@ -113,7 +115,7 @@ impl Default for LsmConfig {
             block_size: 4096,
             compaction_threshold: 4,
             scaling_parameter: 0,
-            sort_spill_threshold: secondary::SPILL_THRESHOLD,
+            max_ranges_per_field: secondary::MAX_RANGES_PER_FIELD,
             compaction_threads: 4,
             adaptive_w: false,
             adaptive_w_cooldown_secs: 900, // 15 minutes
@@ -260,6 +262,14 @@ pub struct LsmEngine {
     query_stats: QueryStats,
     /// Secondary indexes (sorted by non-_id fields)
     secondary_indexes: Mutex<Vec<secondary::SecondaryIndex>>,
+    /// Unsorted (materialized-subset) indexes, keyed by field. A reactive cache
+    /// of range-scan results; cold after restart in v1.
+    unsorted_indexes: Mutex<HashMap<String, unsorted::UnsortedIndex>>,
+    /// Directory holding unsorted block SSTables (kept out of the primary
+    /// SSTable load path, which only scans the top-level data dir).
+    unsorted_dir: PathBuf,
+    /// Count of scans served from an unsorted block (observability / tests).
+    unsorted_hits: AtomicU64,
     /// Newly built indexes awaiting persistence (collection_name not known here — Database handles it)
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
     /// Active snapshot versions — compaction preserves versions >= oldest snapshot
@@ -357,8 +367,9 @@ pub struct IndexMetadata {
     pub fields: Vec<String>,
     /// Path to the index SSTable file
     pub path: PathBuf,
-    /// Whether this is a full-range or partial index
-    pub is_full_range: bool,
+    /// The range the index covers (`None` = full range). Persisted so partial
+    /// coverage survives restart.
+    pub range: Option<Filter>,
 }
 
 impl LsmEngine {
@@ -424,6 +435,13 @@ impl LsmEngine {
         let ucs = UcsCompaction::new(initial_w, config.memtable_size as u64);
         sort_sstables_by_level(&mut sstables, &ucs);
 
+        // Unsorted-index block files live in a subdirectory so they are never
+        // picked up by the (non-recursive) primary SSTable loader above.
+        // v1 treats unsorted blocks as a cold cache: clear on open.
+        let unsorted_dir = config.data_dir.join("unsorted");
+        std::fs::remove_dir_all(&unsorted_dir).ok();
+        std::fs::create_dir_all(&unsorted_dir)?;
+
         Ok(LsmEngine {
             config,
             memtable: RwLock::new(memtable),
@@ -433,6 +451,9 @@ impl LsmEngine {
             next_sst_id: AtomicU64::new(max_id + 1),
             query_stats: QueryStats::new(),
             secondary_indexes: Mutex::new(Vec::new()),
+            unsorted_indexes: Mutex::new(HashMap::new()),
+            unsorted_dir,
+            unsorted_hits: AtomicU64::new(0),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
             commit_queue: Mutex::new(CommitQueue::new()),
@@ -510,6 +531,7 @@ impl LsmEngine {
                     idx.notify_put(&blob);
                 }
             }
+            self.notify_unsorted_put(&blob);
             memtable.insert(blob);
         }
         let should_flush = memtable.should_flush();
@@ -590,6 +612,7 @@ impl LsmEngine {
                     for idx in indexes.iter() {
                         idx.notify_put(&blob);
                     }
+                    self.notify_unsorted_put(&blob);
                     memtable.insert(blob);
                 }
             }
@@ -804,6 +827,7 @@ impl LsmEngine {
                 for idx in indexes.iter() {
                     idx.notify_put(&blob);
                 }
+                self.notify_unsorted_put(&blob);
                 memtable.insert(blob);
             }
         }
@@ -851,6 +875,9 @@ impl LsmEngine {
                     }
                 }
             }
+        }
+        for blob in blobs.iter() {
+            self.notify_unsorted_put(blob);
         }
 
         // Memtable: one lock, all inserts
@@ -1088,29 +1115,43 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Promote unsorted blocks into sorted partial indexes at compaction:
+    /// field-sort each non-empty block (the SSTable writer sorts by field key)
+    /// and hand it to the secondary-index pool, which then merges partial ranges
+    /// and extends to full coverage as usual. Empty negative-cache blocks stay.
+    fn promote_unsorted_blocks(&self) -> Result<(), LsmError> {
+        let drained: Vec<(String, Filter, Vec<IBlob>)> = {
+            let mut uindexes = self.unsorted_indexes.lock();
+            if uindexes.is_empty() {
+                return Ok(());
+            }
+            let mut all = Vec::new();
+            for u in uindexes.values_mut() {
+                let field = u.field.clone();
+                for (range, entries) in u.drain_all()? {
+                    all.push((field.clone(), range, entries));
+                }
+            }
+            uindexes.retain(|_, u| u.block_count() > 0);
+            all
+        };
+        for (field, range, mut entries) in drained {
+            // Skip if a covering single-field sorted index already exists.
+            if self.has_single_field_index(&field) {
+                continue;
+            }
+            let _ = self.spill_to_partial_index(&[field], Some(range), &mut entries);
+        }
+        Ok(())
+    }
+
     /// Compact secondary indexes: drop unused, merge partial ranges, rebuild.
     fn maybe_compact_indexes(&self) -> Result<(), LsmError> {
+        self.promote_unsorted_blocks()?;
+
         let mut indexes = self.secondary_indexes.lock();
         if indexes.is_empty() {
             return Ok(());
-        }
-
-        // Drop unused indexes
-        indexes.retain(|idx| {
-            if idx.should_drop() {
-                std::fs::remove_file(&idx.path).ok();
-                false
-            } else {
-                true
-            }
-        });
-
-        // Merge multiple partial ranges for the same sort fields
-        // Find field sets with >1 index and merge them
-        let mut field_groups: std::collections::HashMap<Vec<String>, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (i, idx) in indexes.iter().enumerate() {
-            field_groups.entry(idx.fields.clone()).or_default().push(i);
         }
 
         let sstables = self.sstables.read();
@@ -1120,46 +1161,127 @@ impl LsmEngine {
             * (self.config.memtable_size as u64 / 400)
             + self.memtable.read().len() as u64;
 
-        for (fields, group_indices) in &field_groups {
-            if group_indices.len() > 1 {
-                // Multiple partial indexes for the same fields — merge them
-                // Combine all entries, dedup, write as one index with combined range
+        // Consolidate multiple partial indexes for the same fields, tracking
+        // coverage honestly: a full-range index supersedes the partials it
+        // covers; partials whose ranges fold into a single interval merge into
+        // one partial over that union; disjoint partials stay separate (we never
+        // claim coverage we don't have).
+        {
+            let mut groups: HashMap<Vec<String>, Vec<secondary::SecondaryIndex>> = HashMap::new();
+            for idx in std::mem::take(&mut *indexes) {
+                groups.entry(idx.fields.clone()).or_default().push(idx);
+            }
+            let mut result: Vec<secondary::SecondaryIndex> = Vec::new();
+            for (fields, group) in groups {
+                if group.len() <= 1 {
+                    result.extend(group);
+                    continue;
+                }
+                if group.iter().any(|i| i.range.is_none()) {
+                    // A full-range index covers all partials → keep one full, drop the rest.
+                    let mut kept_full = false;
+                    for idx in group {
+                        if idx.range.is_none() && !kept_full {
+                            kept_full = true;
+                            result.push(idx);
+                        } else {
+                            std::fs::remove_file(&idx.path).ok();
+                        }
+                    }
+                    continue;
+                }
+                // All partial: try to fold every range into one interval.
+                let mut union = group[0].range.clone();
+                for idx in &group[1..] {
+                    union = match (union.as_ref(), idx.range.as_ref()) {
+                        (Some(a), Some(b)) => unsorted::union_filter(a, b),
+                        _ => None,
+                    };
+                    if union.is_none() {
+                        break;
+                    }
+                }
+                let union = match union {
+                    Some(u) => u,
+                    None => {
+                        // Disjoint / not foldable — leave separate (correct coverage).
+                        result.extend(group);
+                        continue;
+                    }
+                };
                 let mut all_entries: Vec<IBlob> = Vec::new();
-                for &i in group_indices {
-                    if let Ok(entries) = indexes[i].iter_sorted() {
+                for idx in &group {
+                    if let Ok(entries) = idx.iter_sorted() {
                         all_entries.extend(entries.into_iter().map(|(_, blob)| blob));
                     }
                 }
-
-                if !all_entries.is_empty() {
-                    let idx_name = fields.join("_");
-                    let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-                    let merged_path = self.config.data_dir.join(format!("idx_{idx_name}_{sst_id:012}.sst"));
-
-                    if let Ok(merged) = secondary::SecondaryIndex::build_partial(
-                        fields,
-                        None, // merged range becomes full rebuild from entries
-                        &mut all_entries,
-                        &merged_path,
-                        self.config.block_size,
-                    ) {
-                        // Remove old indexes (reverse order to keep indices valid)
-                        let mut to_remove: Vec<usize> = group_indices.clone();
-                        to_remove.sort_unstable_by(|a, b| b.cmp(a));
-                        for i in to_remove {
-                            let old = indexes.remove(i);
-                            std::fs::remove_file(&old.path).ok();
+                if all_entries.is_empty() {
+                    result.extend(group);
+                    continue;
+                }
+                let idx_name = fields.join("_");
+                let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+                let merged_path = self.config.data_dir.join(format!("idx_{idx_name}_{sst_id:012}.sst"));
+                match secondary::SecondaryIndex::build_partial(
+                    &fields,
+                    Some(union.clone()),
+                    &mut all_entries,
+                    &merged_path,
+                    self.config.block_size,
+                ) {
+                    Ok(merged) => {
+                        for idx in &group {
+                            std::fs::remove_file(&idx.path).ok();
                         }
-                        indexes.push(merged);
+                        self.pending_index_metadata.lock().push(IndexMetadata {
+                            fields: fields.clone(),
+                            path: merged_path,
+                            range: Some(union),
+                        });
+                        result.push(merged);
                     }
+                    Err(_) => result.extend(group),
                 }
             }
+            *indexes = result;
+        }
+
+        // LRU eviction: cap the number of partial indexes per field set, evicting
+        // the least-recently-used. (Promotion above drained all unsorted blocks
+        // into this tier, so this is the unified cross-tier cap at compaction
+        // time; the read path enforces the combined cap between compactions.)
+        // Full-range indexes are never evicted.
+        {
+            let mut by_field: HashMap<Vec<String>, Vec<secondary::SecondaryIndex>> = HashMap::new();
+            for idx in std::mem::take(&mut *indexes) {
+                by_field.entry(idx.fields.clone()).or_default().push(idx);
+            }
+            let mut result: Vec<secondary::SecondaryIndex> = Vec::new();
+            for (_fields, group) in by_field {
+                let (full, mut partial): (Vec<_>, Vec<_>) =
+                    group.into_iter().partition(|i| i.range.is_none());
+                let keep_partial = self.config.max_ranges_per_field.saturating_sub(full.len());
+                if partial.len() > keep_partial {
+                    partial.sort_by_key(|i| i.last_used()); // oldest first
+                    let drop_n = partial.len() - keep_partial;
+                    for idx in partial.drain(..drop_n) {
+                        std::fs::remove_file(&idx.path).ok();
+                    }
+                }
+                result.extend(full);
+                result.extend(partial);
+            }
+            *indexes = result;
         }
 
         // Compact individual indexes (merge buffer or full rebuild)
         for index in indexes.iter_mut() {
             let _ = index.compact(&sst_refs, estimated_doc_count, self.config.block_size);
         }
+
+        // Note: `promote_unsorted_blocks` above already drained every block into
+        // sorted partials (empty blocks → empty partials, absorbed into covering
+        // partials by the union merge), so no separate block pruning is needed.
 
         Ok(())
     }
@@ -1506,6 +1628,100 @@ impl LsmEngine {
         self.secondary_indexes.lock().iter().any(|idx| idx.matches_sort(sort_fields))
     }
 
+    /// Fan a write out to any unsorted-index blocks whose range it falls in.
+    /// Cheap no-op (early return) when no unsorted indexes exist.
+    fn notify_unsorted_put(&self, blob: &IBlob) {
+        let indexes = self.unsorted_indexes.lock();
+        if indexes.is_empty() {
+            return;
+        }
+        for idx in indexes.values() {
+            idx.notify_put(blob);
+        }
+    }
+
+    /// Materialize a scan's matching subset as a new unsorted block on `field`,
+    /// then enforce the unified per-field range budget.
+    fn materialize_unsorted_block(
+        &self,
+        field: &str,
+        range: Filter,
+        matching: &[IBlob],
+    ) {
+        {
+            let mut indexes = self.unsorted_indexes.lock();
+            let idx = indexes
+                .entry(field.to_string())
+                .or_insert_with(|| unsorted::UnsortedIndex::new(field.to_string(), self.unsorted_dir.clone()));
+            let _ = idx.materialize(range, matching, self.config.block_size);
+        }
+        self.enforce_combined_range_budget(field);
+    }
+
+    /// Whether a single-field sorted secondary index exists on `field`.
+    fn has_single_field_index(&self, field: &str) -> bool {
+        self.secondary_indexes
+            .lock()
+            .iter()
+            .any(|idx| idx.fields.len() == 1 && idx.fields[0] == field)
+    }
+
+    /// Enforce the unified LRU budget for a field: sorted partial indexes and
+    /// unsorted blocks share one cap of `MAX_RANGES_PER_FIELD`. When over, the
+    /// globally-least-recently-used range is dropped — whichever tier it's in
+    /// (full-range sorted indexes are never evicted). A range's `last_used` is
+    /// updated by every query that touches it, regardless of tier, so this is a
+    /// true cross-tier LRU.
+    fn enforce_combined_range_budget(&self, field: &str) {
+        let mut sec = self.secondary_indexes.lock();
+        let mut uns = self.unsorted_indexes.lock();
+
+        // Candidate evictable ranges (exclude full-range sorted indexes).
+        enum Ref {
+            Sorted(usize),
+            Block(usize),
+        }
+        let mut cands: Vec<(std::time::Instant, Ref)> = Vec::new();
+        for (i, idx) in sec.iter().enumerate() {
+            if idx.fields.len() == 1 && idx.fields[0] == field && idx.range.is_some() {
+                cands.push((idx.last_used(), Ref::Sorted(i)));
+            }
+        }
+        if let Some(u) = uns.get(field) {
+            for (j, b) in u.blocks.iter().enumerate() {
+                cands.push((b.last_used(), Ref::Block(j)));
+            }
+        }
+        if cands.len() <= self.config.max_ranges_per_field {
+            return;
+        }
+        let victims = cands.len() - self.config.max_ranges_per_field;
+        cands.sort_by_key(|(t, _)| *t); // oldest first
+
+        let mut drop_sorted: Vec<usize> = Vec::new();
+        let mut drop_blocks: Vec<usize> = Vec::new();
+        for (_, r) in cands.into_iter().take(victims) {
+            match r {
+                Ref::Sorted(i) => drop_sorted.push(i),
+                Ref::Block(j) => drop_blocks.push(j),
+            }
+        }
+        drop_sorted.sort_unstable_by(|a, b| b.cmp(a));
+        for i in drop_sorted {
+            let old = sec.remove(i);
+            std::fs::remove_file(&old.path).ok();
+        }
+        if let Some(u) = uns.get_mut(field) {
+            drop_blocks.sort_unstable_by(|a, b| b.cmp(a));
+            for j in drop_blocks {
+                u.blocks.remove(j).delete_file();
+            }
+            if u.block_count() == 0 {
+                uns.remove(field);
+            }
+        }
+    }
+
     /// Build a secondary index for the given sort fields from current SSTables.
     fn build_secondary_index(&self, sort_fields: &[String]) -> Result<(), LsmError> {
         let sstables = self.sstables.read();
@@ -1529,7 +1745,7 @@ impl LsmEngine {
         let meta = IndexMetadata {
             fields: sort_fields.to_vec(),
             path: idx_path,
-            is_full_range: true,
+            range: None,
         };
         self.pending_index_metadata.lock().push(meta);
         self.secondary_indexes.lock().push(index);
@@ -1665,7 +1881,7 @@ impl LsmEngine {
         let meta = IndexMetadata {
             fields: sort_fields.to_vec(),
             path: idx_path,
-            is_full_range: index.range.is_none(),
+            range: index.range.clone(),
         };
 
         // Add alongside existing indexes for the same fields (compaction will merge)
@@ -1709,10 +1925,15 @@ impl LsmEngine {
             _ => return None,
         };
 
-        // Check if we have an index on this field
+        // Find a single-field index on this field whose range *covers* the
+        // query (full-range, or a partial range that contains it). The coverage
+        // check is required for completeness: a partial index that does not
+        // contain the query would miss rows outside its stored range.
         let indexes = self.secondary_indexes.lock();
         let index = indexes.iter().find(|idx| {
-            idx.fields.len() == 1 && idx.fields[0] == field
+            idx.fields.len() == 1
+                && idx.fields[0] == field
+                && idx.range.as_ref().map_or(true, |r| unsorted::range_contains(r, filter))
         })?;
         index.mark_used();
 
@@ -1766,6 +1987,185 @@ impl LsmEngine {
         }
 
         Some(Ok(results))
+    }
+
+    /// Try to serve a filter-only scan from a single covering unsorted block.
+    /// Returns `None` if no block fully contains the query range (→ full scan,
+    /// which may then re-materialize a block over the whole range).
+    fn scan_with_unsorted_index(
+        &self,
+        filter: &Filter,
+        limit: Option<usize>,
+        snapshot: &DocumentId,
+    ) -> Option<Result<Vec<IBlob>, LsmError>> {
+        // Only single-field interval filters can be covered by a block.
+        let field = match filter {
+            Filter::Eq { field, .. }
+            | Filter::Gt { field, .. }
+            | Filter::Lt { field, .. }
+            | Filter::Range { field, .. } => field.clone(),
+            _ => return None,
+        };
+
+        // Collect candidate (id, _) pairs from the covering block, then drop the
+        // lock before resolving each against primary.
+        let candidates = {
+            let indexes = self.unsorted_indexes.lock();
+            let idx = indexes.get(&field)?;
+            let block = idx.find_covering(filter)?;
+            block.mark_used();
+            match block.scan(filter) {
+                Ok(c) => c,
+                Err(e) => return Some(Err(e)),
+            }
+        };
+
+        self.unsorted_hits.fetch_add(1, Ordering::Relaxed);
+
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (id, _projected) in candidates {
+            match self.get_at(&id, snapshot) {
+                Ok(Some(blob)) => {
+                    if blob.is_deleted() {
+                        continue;
+                    }
+                    // Stale check: re-verify the filter on the current document.
+                    if !filter.matches(&|f| blob.get_field(f)) {
+                        continue;
+                    }
+                    if seen.insert(*blob.id()) {
+                        results.push(blob);
+                    }
+                }
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Merge fresh memtable docs (in case any in-range write isn't buffered).
+        for (_, blob) in self.memtable.read().iter() {
+            if blob.is_deleted() || blob.version() > snapshot {
+                continue;
+            }
+            if filter.matches(&|f| blob.get_field(f)) && seen.insert(*blob.id()) {
+                results.push(blob);
+            }
+        }
+
+        if let Some(lim) = limit {
+            results.truncate(lim);
+        }
+        Some(Ok(results))
+    }
+
+    /// Serve a *sorted* scan whose single-field range filter is covered by an
+    /// unsorted block: scan the block, sort, expand the sorted partial index
+    /// with the result, then drop the now-redundant block range. Returns
+    /// ascending-sorted results (the caller reverses for descending), or `None`
+    /// if no block covers the filter. A sort query is demonstrated demand for a
+    /// sorted index, so this promotes the block instead of just reading it.
+    fn scan_sort_with_unsorted_block(
+        &self,
+        sort_fields: &[SortField],
+        field_names: &[String],
+        filter: &Filter,
+        limit: Option<usize>,
+    ) -> Option<Result<Vec<IBlob>, LsmError>> {
+        let field = match filter {
+            Filter::Eq { field, .. }
+            | Filter::Gt { field, .. }
+            | Filter::Lt { field, .. }
+            | Filter::Range { field, .. } => field.clone(),
+            _ => return None,
+        };
+
+        let candidates = {
+            let indexes = self.unsorted_indexes.lock();
+            let idx = indexes.get(&field)?;
+            let block = idx.find_covering(filter)?;
+            block.mark_used();
+            match block.scan(filter) {
+                Ok(c) => c,
+                Err(e) => return Some(Err(e)),
+            }
+        };
+        self.unsorted_hits.fetch_add(1, Ordering::Relaxed);
+
+        // Resolve full docs (stale-checked) plus any fresh memtable docs.
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (id, _proj) in candidates {
+            match self.get(&id) {
+                Ok(Some(blob)) => {
+                    if blob.is_deleted() || !filter.matches(&|f| blob.get_field(f)) {
+                        continue;
+                    }
+                    if seen.insert(*blob.id()) {
+                        results.push(blob);
+                    }
+                }
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        for (_, blob) in self.memtable.read().iter() {
+            if blob.is_deleted() {
+                continue;
+            }
+            if filter.matches(&|f| blob.get_field(f)) && seen.insert(*blob.id()) {
+                results.push(blob);
+            }
+        }
+
+        // Sort ascending by the sort fields.
+        results.sort_by(|a, b| {
+            for sf in sort_fields {
+                let va = a.get_field(&sf.field);
+                let vb = b.get_field(&sf.field);
+                let ord = match (&va, &vb) {
+                    (Some(va), Some(vb)) => compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        // Expand the sorted partial index with the full (un-limited) result, then
+        // drop the now-redundant block range.
+        let mut to_spill = results.clone();
+        if self
+            .spill_to_partial_index(field_names, Some(filter.clone()), &mut to_spill)
+            .is_ok()
+        {
+            let mut indexes = self.unsorted_indexes.lock();
+            if let Some(idx) = indexes.get_mut(&field) {
+                idx.remove_covering(filter);
+                if idx.block_count() == 0 {
+                    indexes.remove(&field);
+                }
+            }
+        }
+
+        if let Some(lim) = limit {
+            results.truncate(lim);
+        }
+        Some(Ok(results))
+    }
+
+    /// Number of unsorted blocks served from (observability / tests).
+    pub fn unsorted_hits(&self) -> u64 {
+        self.unsorted_hits.load(Ordering::Relaxed)
+    }
+
+    /// Total number of unsorted blocks across all columns.
+    pub fn unsorted_block_count(&self) -> usize {
+        self.unsorted_indexes.lock().values().map(|u| u.block_count()).sum()
     }
 
     /// Number of secondary indexes.
@@ -1840,7 +2240,16 @@ impl LsmEngine {
             let all_descending = sort_fields.iter().all(|sf| sf.direction == SortDirection::Descending);
 
             if all_ascending || all_descending {
-                if let Some(result) = self.scan_with_secondary_index(&field_names, filter, limit) {
+                // Prefer an existing sorted index; else promote a covering
+                // unsorted block into a sorted partial index and serve from it.
+                let via = self
+                    .scan_with_secondary_index(&field_names, filter, limit)
+                    .or_else(|| {
+                        filter.and_then(|f| {
+                            self.scan_sort_with_unsorted_block(sort_fields, &field_names, f, limit)
+                        })
+                    });
+                if let Some(result) = via {
                     let mut results = result?;
                     if all_descending {
                         results.reverse();
@@ -1863,6 +2272,17 @@ impl LsmEngine {
         if sort.is_none() {
             if let Some(filter) = filter {
                 if let Some(result) = self.scan_with_filter_index(filter, limit, snapshot) {
+                    let mut results = result?;
+                    if let Some(fields) = project {
+                        results = results.into_iter().map(|blob| blob.project(fields)).collect();
+                    }
+                    let docs_returned = results.len() as u64;
+                    timer.set_docs_scanned(docs_returned);
+                    self.query_stats.record(timer.finish(docs_returned));
+                    return Ok(results);
+                }
+                // No sorted index covered it — try a covering unsorted block.
+                if let Some(result) = self.scan_with_unsorted_index(filter, limit, snapshot) {
                     let mut results = result?;
                     if let Some(fields) = project {
                         results = results.into_iter().map(|blob| blob.project(fields)).collect();
@@ -1921,6 +2341,44 @@ impl LsmEngine {
             results.push(blob);
         }
 
+        // Reactive: materialize this filter's result subset. We are here only
+        // because no sorted index and no covering block served the query, so
+        // `results` is the full matching subset over `filter`.
+        if *snapshot == DocumentId::max() && sort.is_none() {
+            if let Some(f) = filter {
+                let field = match f {
+                    Filter::Eq { field, .. }
+                    | Filter::Gt { field, .. }
+                    | Filter::Lt { field, .. }
+                    | Filter::Range { field, .. } => Some(field.clone()),
+                    _ => None,
+                };
+                if let Some(field) = field {
+                    let matching = results.len() as u64;
+                    // Materialize when the result is at most half the collection
+                    // (which already implies it's a proper subset).
+                    let small_enough = (matching as f64)
+                        <= unsorted::UNSORTED_MATERIALIZE_MAX_FRACTION * docs_scanned as f64;
+                    // Trivially-sorted results go straight to a sorted partial
+                    // index (no deferred sort needed): an empty result (negative
+                    // cache), a single row, or an Eq filter (uniform values are
+                    // already sorted). Everything else becomes an unsorted block
+                    // whose field-sort is deferred to compaction.
+                    let already_sorted =
+                        matching <= 1 || matches!(f, Filter::Eq { .. });
+                    if small_enough {
+                        if already_sorted {
+                            let mut to_spill = results.clone();
+                            let _ = self.spill_to_partial_index(&[field.clone()], Some(f.clone()), &mut to_spill);
+                            self.enforce_combined_range_budget(&field);
+                        } else {
+                            self.materialize_unsorted_block(&field, f.clone(), &results);
+                        }
+                    }
+                }
+            }
+        }
+
         // Sort (before projection — sort fields may not be in the projection)
         if let Some(sort_fields) = sort {
             results.sort_by(|a, b| {
@@ -1947,15 +2405,13 @@ impl LsmEngine {
             });
         }
 
-        // Spill sorted results to disk as a partial index if above threshold.
-        // Index is always stored in ascending order (descending reads reverse it).
+        // A sort scan that fell to a full scan materializes its sorted result as
+        // a partial index — always (the scan is the cost; the sort is cheap, so
+        // there is no size threshold). Stored ascending; descending reads reverse.
         if let Some(sort_fields) = sort {
             let field_names: Vec<String> = sort_fields.iter().map(|sf| sf.field.clone()).collect();
             let all_same_direction = sort_fields.iter().all(|sf| sf.direction == sort_fields[0].direction);
-            if all_same_direction
-                && results.len() > self.config.sort_spill_threshold
-            {
-                // For descending, reverse results back to ascending before spilling
+            if all_same_direction {
                 let mut to_spill = results.clone();
                 if sort_fields[0].direction == SortDirection::Descending {
                     to_spill.reverse();
@@ -1982,57 +2438,9 @@ impl LsmEngine {
         let docs_returned = results.len() as u64;
         self.query_stats.record(timer.finish(docs_returned));
 
-        // Reactive: build filter index if warranted
-        if sort.is_none() && results.len() > self.config.sort_spill_threshold {
-            if let Some(filter) = filter {
-                // Extract the filter field for a simple single-field filter
-                let field = match filter {
-                    Filter::Eq { field, .. }
-                    | Filter::Gt { field, .. }
-                    | Filter::Lt { field, .. }
-                    | Filter::Range { field, .. } => Some(field.clone()),
-                    _ => None,
-                };
-                if let Some(field) = field {
-                    // Check if an index already exists for this field
-                    let has_index = self.secondary_indexes.lock().iter().any(|idx| {
-                        idx.fields.len() == 1 && idx.fields[0] == field
-                    });
-                    if !has_index {
-                        // Check stats: build only if low selectivity and repeated
-                        let pattern = QueryPattern {
-                            query_type: "scan".into(),
-                            filter_fields: vec![field.clone()],
-                            sort_fields: vec![],
-                            join_edge: None,
-                        };
-                        if let Some(stats) = self.query_stats.get_pattern(&pattern) {
-                            if stats.selectivity() <= 0.5 && stats.count >= 2 {
-                                // Build a full-range index sorted by this field
-                                // Re-scan all docs to build a complete index
-                                let all_docs: Vec<IBlob> = self.memtable.read().iter()
-                                    .map(|(_, b)| b)
-                                    .chain(
-                                        self.sstables.read().iter()
-                                            .flat_map(|sst| sst.iter().unwrap_or_default().into_iter().map(|(_, b)| b))
-                                    )
-                                    .collect();
-                                let mut deduped = all_docs;
-                                deduped.sort_by(|a, b| a.id().cmp(b.id()).then_with(|| b.version().cmp(a.version())));
-                                deduped.dedup_by(|a, b| a.id() == b.id());
-                                deduped.retain(|b| !b.is_deleted());
-
-                                let _ = self.spill_to_partial_index(
-                                    &[field],
-                                    None, // full range
-                                    &mut deduped,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Filter-only scans are served by unsorted blocks (materialized above)
+        // and promoted to sorted partial indexes at compaction — there is no
+        // separate "reactive full-range filter index" trigger.
 
         Ok(results)
     }
@@ -2200,8 +2608,8 @@ mod tests {
             block_size: 256,
             compaction_threshold: 4,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -2259,8 +2667,8 @@ mod tests {
             block_size: 256,
             compaction_threshold: 4,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
@@ -2386,8 +2794,8 @@ mod tests {
             block_size: 256,
             compaction_threshold: 100, // prevent auto-compaction
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -2774,8 +3182,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -2813,23 +3221,23 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
-        // Only 3 docs — below spill threshold (5)
         for i in 0..3 {
             engine.put(make_blob(i)).unwrap();
         }
         engine.flush_memtable().unwrap();
 
-        // Sorted scan with ≤threshold results stays in memory, no index created
+        // A sort scan always materializes its sorted result as an index — there
+        // is no size threshold (the scan is the cost, not the sort).
         let sort = [SortField { field: "n".into(), direction: SortDirection::Ascending }];
         engine.scan(None, Some(&sort), None, None).unwrap();
 
-        assert_eq!(engine.secondary_index_count(), 0, "should not build index below spill threshold");
+        assert_eq!(engine.secondary_index_count(), 1, "even a small sort materializes a sorted index");
     }
 
     #[test]
@@ -2841,8 +3249,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -2881,8 +3289,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -2941,8 +3349,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -2989,10 +3397,9 @@ mod tests {
     }
 
     #[test]
-    fn test_small_sort_stays_in_memory() {
+    fn test_small_sort_spills_to_index() {
         let (engine, _dir) = test_engine();
 
-        // Insert ≤5 docs (at or below threshold)
         for i in 0..5 {
             engine.put(make_blob(i)).unwrap();
         }
@@ -3002,7 +3409,7 @@ mod tests {
         let results = engine.scan(None, Some(&sort), None, None).unwrap();
         assert_eq!(results.len(), 5);
 
-        assert_eq!(engine.secondary_index_count(), 0, "small sort should stay in memory");
+        assert_eq!(engine.secondary_index_count(), 1, "a sort always materializes a sorted index");
     }
 
     #[test]
@@ -3079,8 +3486,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -3163,8 +3570,8 @@ mod tests {
             block_size: 256,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -3234,8 +3641,8 @@ mod tests {
             block_size: 256,
             compaction_threshold: 2, // low threshold to trigger compaction
             scaling_parameter: 0,
-            sort_spill_threshold: 1000,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -3270,8 +3677,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -3325,8 +3732,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -3378,8 +3785,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
@@ -3446,8 +3853,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
@@ -3482,9 +3889,10 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_index_created_reactively() {
-        // A filter-only query repeated with low selectivity should
-        // trigger reactive index creation — no sort needed.
+    fn test_filter_scan_creates_unsorted_block() {
+        // A filter-only scan that falls to a full scan materializes an unsorted
+        // block (not a sorted index); repeats are served from the block; the
+        // block is promoted to a sorted partial index at compaction.
         let dir = tempfile::tempdir().unwrap();
         let config = LsmConfig {
             data_dir: dir.path().to_path_buf(),
@@ -3492,40 +3900,41 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let engine = LsmEngine::open(config).unwrap();
 
-        // Insert 20 docs: 10 electronics, 10 books
+        // Insert 20 docs with distinct numeric values.
         for i in 0..20u64 {
-            let cat = if i % 2 == 0 { "electronics" } else { "books" };
-            engine.put(IBlob::from_pairs(vec![
-                ("category", Value::String(cat.into())),
-                ("n", Value::U64(i)),
-            ])).unwrap();
+            engine.put(IBlob::from_pairs(vec![("n", Value::U64(i))])).unwrap();
         }
         engine.flush_memtable().unwrap();
 
-        assert_eq!(engine.secondary_index_count(), 0, "no index initially");
+        // A multi-row RANGE filter (not Eq, not trivially sorted) → unsorted block.
+        let filter = Filter::Range { field: "n".into(), low: Value::U64(0), high: Value::U64(10) };
 
-        // First filter scan — records stats but doesn't build index (count=1)
-        let filter = Filter::Eq {
-            field: "category".into(),
-            value: Value::String("electronics".into()),
-        };
-        engine.scan(Some(&filter), None, None, None).unwrap();
-        assert_eq!(engine.secondary_index_count(), 0, "no index after first scan");
-
-        // Second filter scan — stats show count=2, selectivity=0.5 → build index
+        // First scan: full scan, materializes a block. No sorted index built.
         let results = engine.scan(Some(&filter), None, None, None).unwrap();
         assert_eq!(results.len(), 10);
-        assert_eq!(engine.secondary_index_count(), 1, "index created reactively after 2 scans");
+        assert_eq!(engine.secondary_index_count(), 0, "no sorted index from a range filter scan");
+        assert_eq!(engine.unsorted_block_count(), 1, "range filter scan materializes a block");
 
-        // Third scan should use the index
+        // Second scan: served by the block (no sorted index, no pre-emption gate).
         let results = engine.scan(Some(&filter), None, None, None).unwrap();
-        assert_eq!(results.len(), 10, "filter scan via index returns correct results");
+        assert_eq!(results.len(), 10);
+        assert_eq!(engine.unsorted_hits(), 1, "repeat served from the block");
+        assert_eq!(engine.secondary_index_count(), 0);
+
+        // Compaction promotes the block to a sorted partial index.
+        engine.maybe_compact_indexes().unwrap();
+        assert_eq!(engine.secondary_index_count(), 1, "block promoted to sorted partial index");
+        assert_eq!(engine.unsorted_block_count(), 0);
+
+        // Still correct, now served by the sorted index.
+        let results = engine.scan(Some(&filter), None, None, None).unwrap();
+        assert_eq!(results.len(), 10, "filter scan via promoted sorted index");
     }
 
     // ── Consistency level tests ──
@@ -3540,8 +3949,8 @@ mod tests {
             block_size: 4096,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 1000,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false,
             adaptive_w_cooldown_secs: 900,
             adaptive_w_max_step: 2,
@@ -3807,5 +4216,316 @@ mod tests {
         let up = engine.commit_busy_threshold;
         engine.maybe_toggle_busy(up * 100);
         assert!(!engine.commit_busy_active.load(Ordering::Relaxed));
+    }
+
+    // ── Unsorted (materialized-subset) index tests ──
+
+    fn unsorted_engine() -> (LsmEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024, // large: avoid auto-flush mid-test
+            block_size: 512,
+            compaction_threshold: 1000, // high: no background promotion mid-test
+            scaling_parameter: 0,
+            compaction_threads: 1,
+            max_ranges_per_field: 500,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
+        };
+        (LsmEngine::open(config).unwrap(), dir)
+    }
+
+    fn doc_x(id: u64, x: u64) -> IBlob {
+        IBlob::with_id(deterministic_id(id), [("x".into(), Value::U64(x))].into())
+    }
+
+    fn xs(blobs: &[IBlob]) -> Vec<u64> {
+        let mut v: Vec<u64> = blobs
+            .iter()
+            .filter_map(|b| match b.get("x") {
+                Some(Value::U64(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn range_x(low: u64, high: u64) -> Filter {
+        Filter::Range { field: "x".into(), low: Value::U64(low), high: Value::U64(high) }
+    }
+
+    fn eq_x(v: u64) -> Filter {
+        Filter::Eq { field: "x".into(), value: Value::U64(v) }
+    }
+
+    #[test]
+    fn test_unified_lru_evicts_coldest_across_tiers() {
+        // Sorted partials and unsorted blocks share one LRU budget. A range used
+        // recently survives even when it sits in a "full" tier, and the globally
+        // coldest range is evicted regardless of which tier it's in.
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 1000, // no background compaction mid-test
+            scaling_parameter: 0,
+            max_ranges_per_field: 3, // small cap to exercise eviction
+            compaction_threads: 1,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+        for i in 0..100u64 {
+            engine.put(doc_x(i, i * 10)).unwrap(); // x = 0,10,...,990
+        }
+        engine.flush_memtable().unwrap();
+
+        // Three Eq queries → three sorted partials (Eq is trivially sorted).
+        engine.scan(Some(&eq_x(10)), None, None, None).unwrap();
+        engine.scan(Some(&eq_x(20)), None, None, None).unwrap();
+        engine.scan(Some(&eq_x(30)), None, None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 3);
+        assert_eq!(engine.unsorted_block_count(), 0);
+
+        // Touch Eq(10) so it is the most-recently-used sorted partial.
+        engine.scan(Some(&eq_x(10)), None, None, None).unwrap();
+
+        // A multi-row range filter → a 4th range as an unsorted block. Total now
+        // exceeds the cap (3), so the globally-coldest range — Eq(20) — is evicted.
+        let r = engine.scan(Some(&range_x(40, 70)), None, None, None).unwrap();
+        assert_eq!(xs(&r), vec![40, 50, 60]);
+
+        let total = engine.secondary_index_count() + engine.unsorted_block_count();
+        assert_eq!(total, 3, "unified cap holds across both tiers");
+        assert_eq!(engine.unsorted_block_count(), 1, "the new block survives (most recent)");
+
+        let ranges: Vec<Filter> = engine
+            .secondary_indexes
+            .lock()
+            .iter()
+            .filter_map(|i| i.range.clone())
+            .collect();
+        assert!(ranges.contains(&eq_x(10)), "recently-used Eq(10) survives");
+        assert!(ranges.contains(&eq_x(30)));
+        assert!(!ranges.contains(&eq_x(20)), "coldest range Eq(20) evicted across tiers");
+    }
+
+    #[test]
+    fn test_unsorted_block_created_and_reused() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        let f = range_x(10, 13); // 10,11,12
+        // First scan: full scan, materializes a block.
+        let r1 = engine.scan(Some(&f), None, None, None).unwrap();
+        assert_eq!(xs(&r1), vec![10, 11, 12]);
+        assert_eq!(engine.unsorted_block_count(), 1, "block materialized");
+        assert_eq!(engine.unsorted_hits(), 0, "first scan was a full scan");
+
+        // Second scan (same range): served by the block, same results.
+        let r2 = engine.scan(Some(&f), None, None, None).unwrap();
+        assert_eq!(xs(&r2), vec![10, 11, 12]);
+        assert_eq!(engine.unsorted_hits(), 1, "second scan served by block");
+
+        // Contained sub-range [11,12) ⊆ [10,13): served by the same block.
+        let r3 = engine.scan(Some(&range_x(11, 12)), None, None, None).unwrap();
+        assert_eq!(xs(&r3), vec![11]);
+        assert_eq!(engine.unsorted_hits(), 2, "contained query served by block");
+        assert_eq!(engine.unsorted_block_count(), 1, "no new block for contained query");
+    }
+
+    #[test]
+    fn test_unsorted_block_update_and_delete() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        let f = range_x(10, 13); // 10,11,12
+        engine.scan(Some(&f), None, None, None).unwrap(); // materialize block
+
+        engine.put(doc_x(11, 99)).unwrap(); // move 11 out of range
+        engine.put(doc_x(40, 11)).unwrap(); // move 40 into range (x=11)
+        engine.delete(&deterministic_id(12)).unwrap(); // delete 12
+
+        let r = engine.scan(Some(&f), None, None, None).unwrap();
+        // 10 stays; 11(orig) moved out; 12 deleted; 40 moved in with x=11.
+        assert_eq!(xs(&r), vec![10, 11]);
+        assert!(engine.unsorted_hits() >= 1, "served via block");
+    }
+
+    #[test]
+    fn test_empty_filter_creates_negative_sorted_partial() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // An empty result is trivially sorted → an empty sorted partial index
+        // (the negative cache lives in the sorted index, not a block).
+        let f = range_x(100, 110); // empty
+        assert_eq!(engine.scan(Some(&f), None, None, None).unwrap().len(), 0);
+        assert_eq!(engine.secondary_index_count(), 1, "empty result → empty sorted partial");
+        assert_eq!(engine.unsorted_block_count(), 0);
+
+        // Repeat is served by the partial (range_scan over an empty range).
+        assert_eq!(engine.scan(Some(&f), None, None, None).unwrap().len(), 0);
+
+        // A later insert into the range shows up (the partial's buffer caught it).
+        engine.put(doc_x(105, 105)).unwrap();
+        let r = engine.scan(Some(&f), None, None, None).unwrap();
+        assert_eq!(r.len(), 1, "insert into the formerly-empty range is visible");
+    }
+
+    #[test]
+    fn test_sort_range_promotes_block() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        let f = range_x(10, 15); // 10..14
+        engine.scan(Some(&f), None, None, None).unwrap(); // materialize block
+        assert_eq!(engine.unsorted_block_count(), 1);
+        assert_eq!(engine.secondary_index_count(), 0);
+
+        // Sort+range scan: served by the block, promoted to a sorted partial
+        // index, then the block range is dropped.
+        let sort = [SortField { field: "x".into(), direction: SortDirection::Ascending }];
+        let r = engine.scan(Some(&f), Some(&sort), None, None).unwrap();
+        let got: Vec<u64> = r
+            .iter()
+            .filter_map(|b| match b.get("x") {
+                Some(Value::U64(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![10, 11, 12, 13, 14], "ascending-sorted results");
+        assert!(engine.unsorted_hits() >= 1, "served via block");
+        assert_eq!(engine.secondary_index_count(), 1, "promoted to sorted partial index");
+        assert_eq!(engine.unsorted_block_count(), 0, "block dropped after promotion");
+    }
+
+    #[test]
+    fn test_compaction_promotes_unsorted_blocks() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        let f = range_x(10, 13);
+        engine.scan(Some(&f), None, None, None).unwrap(); // materialize block
+        assert_eq!(engine.unsorted_block_count(), 1);
+        assert_eq!(engine.secondary_index_count(), 0);
+
+        engine.maybe_compact_indexes().unwrap(); // promotes block → sorted partial
+
+        assert_eq!(engine.unsorted_block_count(), 0, "non-empty block promoted away");
+        assert_eq!(engine.secondary_index_count(), 1, "promoted to sorted partial index");
+
+        // Results still correct, now served by the sorted partial index.
+        let r = engine.scan(Some(&f), None, None, None).unwrap();
+        assert_eq!(xs(&r), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn test_sorted_index_reports_empty_gap() {
+        // A sorted index that covers a range encodes emptiness as the gap
+        // between adjacent keys — no negative block is needed.
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i * 10)).unwrap(); // x = 0,10,...,490 (sparse)
+        }
+        engine.flush_memtable().unwrap();
+
+        // Build a partial sorted index covering (0,200) via a sort+range scan.
+        let sort = [SortField { field: "x".into(), direction: SortDirection::Ascending }];
+        engine.scan(Some(&range_x(0, 200)), Some(&sort), None, None).unwrap();
+        assert!(engine.secondary_index_count() >= 1, "partial sorted index built");
+        let hits_before = engine.unsorted_hits();
+
+        // Empty gap (101,109) ⊆ (0,200): served by the sorted index, returns empty.
+        let r = engine.scan(Some(&range_x(101, 109)), None, None, None).unwrap();
+        assert!(r.is_empty(), "gap between adjacent keys is known-empty via the sorted index");
+        assert_eq!(engine.unsorted_block_count(), 0, "no negative block needed — sorted index covers it");
+        assert_eq!(engine.unsorted_hits(), hits_before, "served by sorted index, not a block");
+    }
+
+    #[test]
+    fn test_empty_partial_absorbed_by_covering() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i * 10)).unwrap(); // x = 0,10,...,490
+        }
+        engine.flush_memtable().unwrap();
+
+        // Empty gap (101,109) → an empty sorted partial (negative cache).
+        let gap = range_x(101, 109);
+        assert_eq!(engine.scan(Some(&gap), None, None, None).unwrap().len(), 0);
+        // A covering partial (0,200), via a sort+range scan.
+        let sort = [SortField { field: "x".into(), direction: SortDirection::Ascending }];
+        engine.scan(Some(&range_x(0, 200)), Some(&sort), None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 2, "empty partial + covering partial");
+
+        // At compaction the overlapping partials merge into one (the empty one is
+        // absorbed — its emptiness is encoded as the gap in the covering partial).
+        engine.maybe_compact_indexes().unwrap();
+        assert_eq!(engine.secondary_index_count(), 1, "partials merged into one");
+
+        // The gap still correctly reads empty via the merged sorted partial.
+        assert!(engine.scan(Some(&gap), None, None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_compaction_merges_contiguous_partials_with_union_range() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Two contiguous partial sorted indexes via sort+range scans.
+        let sort = [SortField { field: "x".into(), direction: SortDirection::Ascending }];
+        engine.scan(Some(&range_x(0, 20)), Some(&sort), None, None).unwrap();
+        engine.scan(Some(&range_x(20, 40)), Some(&sort), None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 2, "two partial indexes spilled");
+
+        engine.maybe_compact_indexes().unwrap();
+
+        let idxs = engine.secondary_indexes.lock();
+        assert_eq!(idxs.len(), 1, "contiguous partials merged into one");
+        assert_eq!(
+            idxs[0].range,
+            Some(range_x(0, 40)),
+            "merged index records the UNION range, not a false full-range claim"
+        );
+    }
+
+    #[test]
+    fn test_compaction_keeps_disjoint_partials_separate() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        let sort = [SortField { field: "x".into(), direction: SortDirection::Ascending }];
+        engine.scan(Some(&range_x(0, 10)), Some(&sort), None, None).unwrap();
+        engine.scan(Some(&range_x(30, 40)), Some(&sort), None, None).unwrap();
+        assert_eq!(engine.secondary_index_count(), 2);
+
+        engine.maybe_compact_indexes().unwrap();
+
+        let idxs = engine.secondary_indexes.lock();
+        assert_eq!(idxs.len(), 2, "disjoint partials are not falsely merged");
+        assert!(idxs.iter().all(|i| i.range.is_some()), "neither claims full coverage");
     }
 }

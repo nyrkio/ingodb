@@ -24,8 +24,8 @@ fn test_engine() -> (LsmEngine, tempfile::TempDir) {
         block_size: 512,
         compaction_threshold: 4,
         scaling_parameter: 0,
-        sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
     };
     let engine = LsmEngine::open(config).unwrap();
@@ -140,8 +140,8 @@ fn test_survive_restart() {
         block_size: 512,
         compaction_threshold: 4,
         scaling_parameter: 0,
-        sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
     };
 
@@ -174,8 +174,8 @@ fn test_flush_and_recover_from_sstable() {
         block_size: 512,
         compaction_threshold: 4,
         scaling_parameter: 0,
-        sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
     };
 
@@ -319,8 +319,8 @@ fn test_delete_survives_restart() {
         block_size: 512,
         compaction_threshold: 100,
         scaling_parameter: 0,
-        sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
     };
 
@@ -531,28 +531,35 @@ fn test_query_stats_recorded() {
         engine.put(make_user(&format!("User{i}"), i)).unwrap();
     }
 
-    // Run a filtered scan several times
-    for _ in 0..5 {
-        engine.execute(&Query::Scan {
-            filter: Some(Filter::Gt { field: "age".into(), value: Value::U64(15) }),
-            sort: None,
-            project: None,
-            limit: None,
-        }).unwrap();
-    }
+    let scan = Query::Scan {
+        filter: Some(Filter::Gt { field: "age".into(), value: Value::U64(15) }),
+        sort: None,
+        project: None,
+        limit: None,
+    };
+    let age_stats = |engine: &ingodb::LsmEngine| {
+        engine.query_stats().all_patterns().into_iter()
+            .find(|(p, _)| p.query_type == "scan" && p.filter_fields.contains(&"age".into()))
+            .map(|(_, ps)| ps)
+    };
 
-    let stats = engine.query_stats().all_patterns();
-    // Should have at least one "scan" pattern
-    let scan_stats: Vec<_> = stats.iter()
-        .filter(|(p, _)| p.query_type == "scan" && p.filter_fields.contains(&"age".into()))
-        .collect();
-    assert!(!scan_stats.is_empty(), "scan pattern should be recorded");
-
-    let (_, ps) = &scan_stats[0];
-    assert_eq!(ps.count, 5, "should record 5 executions");
-    assert_eq!(ps.total_scanned, 100, "20 docs scanned × 5 runs");
-    assert_eq!(ps.total_returned, 20, "4 docs returned × 5 runs (age 16,17,18,19)");
+    // First scan: a full scan over all 20 docs (4 returned: age 16,17,18,19).
+    engine.execute(&scan).unwrap();
+    let ps = age_stats(&engine).expect("scan pattern should be recorded");
+    assert_eq!(ps.count, 1);
+    assert_eq!(ps.total_scanned, 20, "first scan reads all 20 docs");
+    assert_eq!(ps.total_returned, 4);
     assert!(ps.selectivity() < 0.25, "low selectivity — index candidate");
+
+    // Four more identical scans: now served from the reactive unsorted block,
+    // so they scan only the cached subset, not the full collection.
+    for _ in 0..4 {
+        engine.execute(&scan).unwrap();
+    }
+    let ps = age_stats(&engine).unwrap();
+    assert_eq!(ps.count, 5, "all five executions recorded");
+    assert_eq!(ps.total_returned, 20, "4 returned each run");
+    assert!(ps.total_scanned < 100, "repeats served from block, not full scans (got {})", ps.total_scanned);
 }
 
 #[test]
@@ -588,18 +595,17 @@ fn test_query_stats_low_selectivity_detection() {
         ])).unwrap();
     }
 
-    // Query that scans 100 docs but returns only ~10 (category = "cat0")
-    // After 2 scans with low selectivity, a reactive index is created.
-    // Check stats after just 2 scans (before index changes the stats).
-    for _ in 0..2 {
-        engine.scan(
-            Some(&Filter::Eq { field: "category".into(), value: Value::String("cat0".into()) }),
-            None, None, None,
-        ).unwrap();
-    }
+    // A single full scan over 100 docs returns only ~10 (category = "cat0").
+    // The full scan's measured stats expose it as a low-selectivity candidate.
+    // (Repeats would be served from the reactive unsorted block, so the real
+    // selectivity signal comes from this first full scan.)
+    engine.scan(
+        Some(&Filter::Eq { field: "category".into(), value: Value::String("cat0".into()) }),
+        None, None, None,
+    ).unwrap();
 
     // Detect index candidates — selectivity=0.1 (10 returned / 100 scanned)
-    let candidates = engine.query_stats().low_selectivity(0.15, 2);
+    let candidates = engine.query_stats().low_selectivity(0.15, 1);
     assert!(!candidates.is_empty(), "should detect low-selectivity pattern");
     assert!(candidates[0].0.filter_fields.contains(&"category".into()));
 }

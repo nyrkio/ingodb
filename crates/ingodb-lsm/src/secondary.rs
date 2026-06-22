@@ -8,14 +8,10 @@ use std::time::Instant;
 
 use crate::LsmError;
 
-/// Minimum number of results before sorting spills to disk as a partial index.
-pub const SPILL_THRESHOLD: usize = 1000;
-
-/// Number of compaction cycles before considering dropping an unused index.
-pub const DROP_COMPACTION_CYCLES: u32 = 10;
-
-/// Hours of wall-clock time before considering dropping an unused index.
-pub const DROP_HOURS: u64 = 720; // 30 days
+/// Maximum number of materialized ranges kept per field — counting sorted
+/// partial indexes AND unsorted blocks together (one unified LRU budget across
+/// both tiers). Over this, the least-recently-used range is evicted.
+pub const MAX_RANGES_PER_FIELD: usize = 500;
 
 /// A secondary index: an SSTable sorted by field values instead of _id.
 ///
@@ -31,16 +27,15 @@ pub struct SecondaryIndex {
     pub fields: Vec<String>,
     /// The filter range this index covers. None = full range.
     pub range: Option<Filter>,
-    /// The index SSTable (on-disk portion)
-    pub reader: SSTableReader,
+    /// The index SSTable (on-disk portion). `None` for an empty index — a
+    /// partial range proven to contain zero keys (the negative cache).
+    pub reader: Option<SSTableReader>,
     /// Path to the index SSTable
     pub path: PathBuf,
     /// In-memory buffer of new index entries from put()
     buffer: Mutex<BTreeMap<Vec<u8>, IBlob>>,
-    /// Last time this index was used for a query
+    /// Last time this index was used for a query (LRU eviction).
     pub last_used: Mutex<Instant>,
-    /// Number of compaction cycles since last use
-    pub compactions_since_use: Mutex<u32>,
 }
 
 impl SecondaryIndex {
@@ -82,7 +77,7 @@ impl SecondaryIndex {
         SSTableWriter::with_block_size(block_size)
             .write(&output_path, &mut projected, &extractor)?;
 
-        let reader = SSTableReader::open(&output_path)?;
+        let reader = Some(SSTableReader::open(&output_path)?);
         Ok(SecondaryIndex {
             fields: fields.to_vec(),
             range: None, // full range by default
@@ -90,7 +85,6 @@ impl SecondaryIndex {
             path: output_path,
             buffer: Mutex::new(BTreeMap::new()),
             last_used: Mutex::new(Instant::now()),
-            compactions_since_use: Mutex::new(0),
         })
     }
 
@@ -103,22 +97,23 @@ impl SecondaryIndex {
         output_path: impl AsRef<Path>,
         block_size: usize,
     ) -> Result<Self, LsmError> {
-        if sorted_blobs.is_empty() {
-            return Err(LsmError::SSTable(ingodb_sstable::SSTableError::Empty));
-        }
-
-        // Project to indexed fields
+        // Project to indexed fields. An empty result is allowed: it yields an
+        // empty index (no file) — a partial range known to hold zero keys.
         let mut projected: Vec<IBlob> = sorted_blobs
             .iter()
             .map(|blob| blob.project(fields))
             .collect();
 
-        let extractor = FieldKeyExtractor::new(fields.to_vec());
         let output_path = output_path.as_ref().to_path_buf();
-        SSTableWriter::with_block_size(block_size)
-            .write(&output_path, &mut projected, &extractor)?;
-
-        let reader = SSTableReader::open(&output_path)?;
+        let reader = if projected.is_empty() {
+            std::fs::remove_file(&output_path).ok();
+            None
+        } else {
+            let extractor = FieldKeyExtractor::new(fields.to_vec());
+            SSTableWriter::with_block_size(block_size)
+                .write(&output_path, &mut projected, &extractor)?;
+            Some(SSTableReader::open(&output_path)?)
+        };
         Ok(SecondaryIndex {
             fields: fields.to_vec(),
             range,
@@ -126,14 +121,18 @@ impl SecondaryIndex {
             path: output_path,
             buffer: Mutex::new(BTreeMap::new()),
             last_used: Mutex::new(Instant::now()),
-            compactions_since_use: Mutex::new(0),
         })
     }
 
-    /// Open an existing secondary index from disk.
+    /// Open an existing secondary index from disk. A missing file means an empty
+    /// index (negative-cache partial range).
     pub fn open(fields: Vec<String>, range: Option<Filter>, path: impl AsRef<Path>) -> Result<Self, LsmError> {
         let path = path.as_ref().to_path_buf();
-        let reader = SSTableReader::open(&path)?;
+        let reader = if path.exists() {
+            Some(SSTableReader::open(&path)?)
+        } else {
+            None
+        };
         Ok(SecondaryIndex {
             fields: fields.to_vec(),
             range,
@@ -141,7 +140,6 @@ impl SecondaryIndex {
             path,
             buffer: Mutex::new(BTreeMap::new()),
             last_used: Mutex::new(Instant::now()),
-            compactions_since_use: Mutex::new(0),
         })
     }
 
@@ -170,8 +168,11 @@ impl SecondaryIndex {
     /// Iterate the index in sorted order, yielding (_id, projected IBlob) pairs.
     /// Merges on-disk SSTable entries with in-memory buffer.
     pub fn iter_sorted(&self) -> Result<Vec<(DocumentId, IBlob)>, LsmError> {
-        // On-disk entries
-        let mut entries: Vec<(Vec<u8>, IBlob)> = self.reader.iter()?;
+        // On-disk entries (empty index has no reader)
+        let mut entries: Vec<(Vec<u8>, IBlob)> = match &self.reader {
+            Some(r) => r.iter()?,
+            None => Vec::new(),
+        };
         // Merge in-memory buffer
         let buffer = self.buffer.lock();
         for (key, blob) in buffer.iter() {
@@ -204,7 +205,10 @@ impl SecondaryIndex {
             .unwrap_or_else(|| vec![0xFF; 32]); // max possible key
 
         // SSTable range scan — binary search to start, scan to end
-        let sst_entries = self.reader.range_scan(&start_key, &end_key)?;
+        let sst_entries = match &self.reader {
+            Some(r) => r.range_scan(&start_key, &end_key)?,
+            None => Vec::new(),
+        };
 
         // Also include matching buffer entries
         let buffer = self.buffer.lock();
@@ -241,28 +245,24 @@ impl SecondaryIndex {
         self.fields == sort_fields
     }
 
-    /// Mark this index as used (resets drop timer).
+    /// Mark this index as used (for LRU eviction).
     pub fn mark_used(&self) {
         *self.last_used.lock() = Instant::now();
-        *self.compactions_since_use.lock() = 0;
     }
 
-    /// Mark a compaction cycle (for drop decisions).
-    pub fn mark_compaction(&self) {
-        *self.compactions_since_use.lock() += 1;
-    }
-
-    /// Should this index be dropped? True if unused for too long.
-    pub fn should_drop(&self) -> bool {
-        let cycles = *self.compactions_since_use.lock();
-        let elapsed = self.last_used.lock().elapsed();
-        cycles >= DROP_COMPACTION_CYCLES
-            && elapsed >= std::time::Duration::from_secs(DROP_HOURS * 3600)
+    /// When this index was last used (for LRU eviction).
+    pub fn last_used(&self) -> Instant {
+        *self.last_used.lock()
     }
 
     /// Total entry count (on-disk SSTable entries + in-memory buffer).
     pub fn entry_count(&self) -> u64 {
-        let on_disk = self.reader.iter().map(|e| e.len() as u64).unwrap_or(0);
+        let on_disk = self
+            .reader
+            .as_ref()
+            .and_then(|r| r.iter().ok())
+            .map(|e| e.len() as u64)
+            .unwrap_or(0);
         let buffer = self.buffer.lock().len() as u64;
         on_disk + buffer
     }
@@ -282,8 +282,6 @@ impl SecondaryIndex {
         primary_doc_count: u64,
         block_size: usize,
     ) -> Result<(), LsmError> {
-        self.mark_compaction();
-
         let index_entries = self.entry_count();
 
         if should_full_rebuild(index_entries, primary_doc_count) {
@@ -332,6 +330,11 @@ impl SecondaryIndex {
             .collect();
 
         if projected.is_empty() {
+            // The range now holds no live docs — become an empty index.
+            std::fs::remove_file(&self.path).ok();
+            self.reader = None;
+            self.buffer.lock().clear();
+            self.range = range;
             return Ok(());
         }
 
@@ -341,7 +344,7 @@ impl SecondaryIndex {
             .write(&tmp_path, &mut projected, &extractor)?;
 
         std::fs::rename(&tmp_path, &self.path)?;
-        self.reader = SSTableReader::open(&self.path)?;
+        self.reader = Some(SSTableReader::open(&self.path)?);
         self.buffer.lock().clear();
         self.range = range;
         Ok(())
@@ -354,8 +357,11 @@ impl SecondaryIndex {
             return Ok(());
         }
 
-        // Read existing entries
-        let mut entries: Vec<(Vec<u8>, IBlob)> = self.reader.iter()?;
+        // Read existing entries (empty index has no reader)
+        let mut entries: Vec<(Vec<u8>, IBlob)> = match &self.reader {
+            Some(r) => r.iter()?,
+            None => Vec::new(),
+        };
 
         // Add buffer entries
         for (key, blob) in buffer {
@@ -369,6 +375,8 @@ impl SecondaryIndex {
         let mut blobs: Vec<IBlob> = entries.into_iter().map(|(_, blob)| blob).collect();
 
         if blobs.is_empty() {
+            std::fs::remove_file(&self.path).ok();
+            self.reader = None;
             return Ok(());
         }
 
@@ -378,7 +386,7 @@ impl SecondaryIndex {
             .write(&tmp_path, &mut blobs, &extractor)?;
 
         std::fs::rename(&tmp_path, &self.path)?;
-        self.reader = SSTableReader::open(&self.path)?;
+        self.reader = Some(SSTableReader::open(&self.path)?);
         Ok(())
     }
 }
@@ -683,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_drop_unused() {
+    fn test_mark_used_updates_lru() {
         let dir = tempfile::tempdir().unwrap();
         let mut blobs = vec![
             IBlob::from_pairs(vec![("x", Value::U64(1))]),
@@ -695,16 +703,9 @@ mod tests {
             &["x".into()], &[&primary], dir.path().join("idx.sst"), 4096,
         ).unwrap();
 
-        // Fresh index should not be dropped
-        assert!(!index.should_drop());
-
-        // After many compaction cycles but recently used — don't drop
-        for _ in 0..DROP_COMPACTION_CYCLES + 1 {
-            index.mark_compaction();
-        }
-        assert!(!index.should_drop(), "recently used — don't drop despite many compactions");
-
-        // Note: can't easily test the time-based drop in a unit test without
-        // mocking time. The important thing is both conditions must be met.
+        let before = index.last_used();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        index.mark_used();
+        assert!(index.last_used() > before, "mark_used advances the LRU timestamp");
     }
 }

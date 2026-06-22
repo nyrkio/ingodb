@@ -1,6 +1,7 @@
 use crate::{LsmConfig, LsmEngine, LsmError};
 use ingodb_blob::{IBlob, Value};
 use ingodb_consistency::Consistency;
+use ingodb_query::Filter;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,10 +71,13 @@ impl Database {
                 };
 
                 let fields: Vec<String> = fields_str.split(',').map(|s| s.to_string()).collect();
+                // Restore the partial range (None = full range) so partial
+                // coverage survives restart.
+                let range = doc.get("range").and_then(Filter::from_value);
 
                 if let Some(engine) = collections.get(&coll_name) {
                     if idx_path.exists() {
-                        if let Err(e) = engine.load_secondary_index(fields, None, &idx_path) {
+                        if let Err(e) = engine.load_secondary_index(fields, range, &idx_path) {
                             eprintln!("warning: failed to load index {}: {e}", idx_path.display());
                         }
                     }
@@ -122,13 +126,18 @@ impl Database {
                 for meta in pending {
                     let fields_str = meta.fields.join(",");
                     let path_str = meta.path.to_string_lossy().to_string();
-                    let blob = IBlob::from_pairs(vec![
+                    let mut pairs = vec![
                         ("type", Value::String("index".into())),
                         ("collection", Value::String(name.to_string())),
                         ("fields", Value::String(fields_str)),
                         ("path", Value::String(path_str)),
-                    ]);
-                    system.put(blob)?;
+                    ];
+                    // Persist the partial range so coverage survives restart
+                    // (absent = full range).
+                    if let Some(range) = &meta.range {
+                        pairs.push(("range", range.to_value()));
+                    }
+                    system.put(IBlob::from_pairs(pairs))?;
                 }
             }
         }
@@ -193,8 +202,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 4,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
         let db = Database::open(config).unwrap();
@@ -249,8 +258,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 4,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
@@ -302,8 +311,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 4,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
@@ -336,8 +345,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
@@ -401,6 +410,58 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_index_range_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 100,
+            scaling_parameter: 0,
+            compaction_threads: 1,
+            max_ranges_per_field: 500,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
+        };
+        let xq = |lo: u64, hi: u64| Filter::Range { field: "x".into(), low: Value::U64(lo), high: Value::U64(hi) };
+
+        {
+            let db = Database::open(config.clone()).unwrap();
+            db.with_collection("c", |e| {
+                for i in 0..50u64 {
+                    e.put(IBlob::from_pairs(vec![("x", Value::U64(i * 10))]))?; // 0,10,...,490
+                }
+                e.flush_memtable()?;
+                // Sort+range scan spills a PARTIAL sorted index covering (0,200).
+                let sort = [SortField { field: "x".into(), direction: SortDirection::Ascending }];
+                e.scan(Some(&xq(0, 200)), Some(&sort), None, None)?;
+                Ok(())
+            }).unwrap();
+            let cnt = db.with_collection("c", |e| Ok(e.secondary_index_count())).unwrap();
+            assert_eq!(cnt, 1, "partial index built");
+        }
+
+        // Restart — the partial's range must be restored, not collapsed to full.
+        {
+            let db = Database::open(config).unwrap();
+            assert_eq!(
+                db.with_collection("c", |e| Ok(e.secondary_index_count())).unwrap(),
+                1,
+                "partial index survives restart"
+            );
+
+            // A query INSIDE (0,200) — served correctly by the partial index.
+            let inside = db.with_collection("c", |e| e.scan(Some(&xq(50, 100)), None, None, None)).unwrap();
+            assert_eq!(inside.len(), 5, "x = 50,60,70,80,90");
+
+            // A query OUTSIDE (0,200) must return COMPLETE results. If the range
+            // had been collapsed to full-range on reload, the partial index would
+            // be used and return 0 (it holds no x>=200) — the bug we fixed.
+            let outside = db.with_collection("c", |e| e.scan(Some(&xq(300, 400)), None, None, None)).unwrap();
+            assert_eq!(outside.len(), 10, "x = 300..390 — complete despite the partial index");
+        }
+    }
+
+    #[test]
     fn test_index_buffer_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         let config = LsmConfig {
@@ -409,8 +470,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5,
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
@@ -468,11 +529,6 @@ mod tests {
         // BUG TEST: After restart, a sorted scan through a secondary index
         // must find docs that were updated+flushed before the crash.
         // The index on disk must contain entries for the flushed data.
-        //
-        // To truly test the index path (not full-scan fallback), we set
-        // sort_spill_threshold very high so the post-restart scan doesn't
-        // create a NEW index from a full scan. This forces it to use the
-        // existing index loaded from disk.
         let dir = tempfile::tempdir().unwrap();
         let config = LsmConfig {
             data_dir: dir.path().to_path_buf(),
@@ -480,8 +536,8 @@ mod tests {
             block_size: 512,
             compaction_threshold: 100,
             scaling_parameter: 0,
-            sort_spill_threshold: 5, // low: creates index on first scan
             compaction_threads: 1,
+            max_ranges_per_field: 500,
             adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
         };
 
@@ -529,15 +585,9 @@ mod tests {
             }).unwrap();
         }
 
-        // Restart — but with HIGH spill threshold so the scan doesn't create
-        // a new index from full scan results. Forces use of the existing index.
-        let config_high_spill = LsmConfig {
-            sort_spill_threshold: 1_000_000, // won't spill
-            ..config
-        };
-
+        // Restart and verify the sorted scan reflects the flushed update.
         {
-            let db = Database::open(config_high_spill).unwrap();
+            let db = Database::open(config).unwrap();
 
             // Verify index exists after restart
             let idx_count = db.with_collection("products", |engine| {
