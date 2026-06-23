@@ -1136,8 +1136,10 @@ impl LsmEngine {
             all
         };
         for (field, range, mut entries) in drained {
-            // Skip if a covering single-field sorted index already exists.
-            if self.has_single_field_index(&field) {
+            // Skip only if an existing sorted index actually *covers* this range
+            // (full-range, or a partial range that contains it). An index keyed
+            // by the same field but covering an unrelated range must not block us.
+            if self.has_covering_index(&field, &range) {
                 continue;
             }
             let _ = self.spill_to_partial_index(&[field], Some(range), &mut entries);
@@ -1658,12 +1660,17 @@ impl LsmEngine {
         self.enforce_combined_range_budget(field);
     }
 
-    /// Whether a single-field sorted secondary index exists on `field`.
-    fn has_single_field_index(&self, field: &str) -> bool {
-        self.secondary_indexes
-            .lock()
-            .iter()
-            .any(|idx| idx.fields.len() == 1 && idx.fields[0] == field)
+    /// Whether a single-field sorted index on `field` already *covers* `range`
+    /// — i.e. it is full-range, or its partial range contains `range`. Used to
+    /// skip promoting a block that is genuinely redundant. (Range-aware: an index
+    /// keyed by `field` but covering an unrelated range, e.g. a sort-spill keyed
+    /// by the sort field with a filter on another column, does NOT count.)
+    fn has_covering_index(&self, field: &str, range: &Filter) -> bool {
+        self.secondary_indexes.lock().iter().any(|idx| {
+            idx.fields.len() == 1
+                && idx.fields[0] == field
+                && idx.range.as_ref().map_or(true, |r| unsorted::range_contains(r, range))
+        })
     }
 
     /// Enforce the unified LRU budget for a field: sorted partial indexes and
@@ -4434,6 +4441,47 @@ mod tests {
         // Results still correct, now served by the sorted partial index.
         let r = engine.scan(Some(&f), None, None, None).unwrap();
         assert_eq!(xs(&r), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn test_block_promoted_despite_unrelated_same_field_index() {
+        // Regression for the range-blind guard (found by the ClickBench bench):
+        // a sort query `WHERE b=0 ORDER BY a` spills a sorted index keyed by [a]
+        // but covering range Eq(b=0). A later [a]-range block must still promote
+        // — the old guard skipped it because an [a]-keyed index existed, ignoring
+        // that its range covers an unrelated column.
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(IBlob::with_id(deterministic_id(i), [
+                ("a".into(), Value::U64(i)),
+                ("b".into(), Value::U64(i % 5)),
+            ].into())).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Sort query → sorted index fields=[a], range=Eq(b=0).
+        let sort = [SortField { field: "a".into(), direction: SortDirection::Ascending }];
+        engine.scan(Some(&Filter::Eq { field: "b".into(), value: Value::U64(0) }), Some(&sort), None, None).unwrap();
+        assert!(engine.secondary_indexes.lock().iter().any(|i| i.fields == ["a"]));
+
+        // Filter-only range scan on `a` → materializes an [a]-range block (the
+        // b-ranged [a] index can't serve it, so it full-scans).
+        let arange = Filter::Range { field: "a".into(), low: Value::U64(10), high: Value::U64(20) };
+        engine.scan(Some(&arange), None, None, None).unwrap();
+        assert_eq!(engine.unsorted_block_count(), 1, "a-range block materialized");
+
+        // Compaction must PROMOTE the a-range block (not drop it).
+        engine.maybe_compact_indexes().unwrap();
+        assert_eq!(engine.unsorted_block_count(), 0, "block promoted, not dropped");
+        let covered = engine.secondary_indexes.lock().iter().any(|idx| {
+            idx.fields == ["a"]
+                && idx.range.as_ref().map_or(true, |r| unsorted::range_contains(r, &arange))
+        });
+        assert!(covered, "a-range block promoted to a sorted index that covers it");
+
+        // A contained query is now served correctly.
+        let r = engine.scan(Some(&Filter::Range { field: "a".into(), low: Value::U64(12), high: Value::U64(18) }), None, None, None).unwrap();
+        assert_eq!(r.len(), 6, "a = 12..17");
     }
 
     #[test]
