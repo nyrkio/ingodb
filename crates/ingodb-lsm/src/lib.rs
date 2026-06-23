@@ -270,6 +270,8 @@ pub struct LsmEngine {
     unsorted_dir: PathBuf,
     /// Count of scans served from an unsorted block (observability / tests).
     unsorted_hits: AtomicU64,
+    /// Count of scans served from a sorted (secondary/partial) index.
+    sorted_hits: AtomicU64,
     /// Newly built indexes awaiting persistence (collection_name not known here — Database handles it)
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
     /// Active snapshot versions — compaction preserves versions >= oldest snapshot
@@ -454,6 +456,7 @@ impl LsmEngine {
             unsorted_indexes: Mutex::new(HashMap::new()),
             unsorted_dir,
             unsorted_hits: AtomicU64::new(0),
+            sorted_hits: AtomicU64::new(0),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
             commit_queue: Mutex::new(CommitQueue::new()),
@@ -1770,6 +1773,7 @@ impl LsmEngine {
         let indexes = self.secondary_indexes.lock();
         let index = indexes.iter().find(|idx| idx.matches_query(sort_fields, filter))?;
         index.mark_used();
+        self.sorted_hits.fetch_add(1, Ordering::Relaxed);
 
         // Read sorted entries and clone fields before dropping the lock
         let sorted_entries = match index.iter_sorted() {
@@ -1943,6 +1947,7 @@ impl LsmEngine {
                 && idx.range.as_ref().map_or(true, |r| unsorted::range_contains(r, filter))
         })?;
         index.mark_used();
+        self.sorted_hits.fetch_add(1, Ordering::Relaxed);
 
         // Range scan on the index — O(log N + R) instead of O(N)
         let range_entries = match index.range_scan(
@@ -2168,6 +2173,11 @@ impl LsmEngine {
     /// Number of unsorted blocks served from (observability / tests).
     pub fn unsorted_hits(&self) -> u64 {
         self.unsorted_hits.load(Ordering::Relaxed)
+    }
+
+    /// Number of scans served from a sorted (secondary/partial) index.
+    pub fn sorted_hits(&self) -> u64 {
+        self.sorted_hits.load(Ordering::Relaxed)
     }
 
     /// Total number of unsorted blocks across all columns.

@@ -6,6 +6,61 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-06-23 — ClickBench reactive-index benchmark (real `hits` data)
+
+`cargo run --release --example clickbench [rows]`. Runs the IngoDB-expressible
+subset of ClickBench (point / equality / range / top-N / filtered-count) against
+the **real ClickBench `hits_0` partition** and watches the reactive index system
+create indexes and either help or correctly decline. Query params are derived from
+the data. Prepare the data:
+
+```
+curl -sO https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
+uv run --with pyarrow python prep_clickbench.py   # -> clickbench_hits.tsv (gitignored)
+```
+
+Run: 200,000 rows of `hits_0`, `--release`, single dev machine,
+`max_ranges_per_field=50`. Illustrative (one machine/partition), not a score.
+
+**Reactive indexing helps selective queries** (cold = first run / full scan +
+materialize; warm = served by the reactive index):
+
+| Query | Cold | Warm (med) | Speedup |
+|---|---:|---:|---:|
+| `UserID = <id>` — point lookup by field (2 rows) | 745 ms | **39 µs** | **~18900×** |
+| `RegionID = x ORDER BY EventTime DESC LIMIT 10` | 1.34 s | 72 ms | **18.5×** |
+| `AdvEngineID > 0` — selective (~2.9%) | 747 ms | 105 ms | 7.1× |
+| `EventTime ∈ [lo,hi)` — range (~10%, ~20k rows) | 774 ms | 360 ms | 2.2× |
+
+**…and correctly declines where it can't help:** `CounterID = <dominant value>`
+returns 99.99% of rows → over the 50% threshold → **not materialized**, 574 ms cold
+≈ 569 ms warm (1.0×). No wasted index.
+
+**Containment:** a sub-range of a materialized range is served by the promoted
+sorted partial via interval containment — `EventTime` sub-range, 10,405 rows in
+**193 ms** (`served_by=sorted index`), vs ~774 ms cold.
+
+**Drift / LRU:** 70 distinct high-cardinality `UserID` queries against a cap of 50 →
+materialized ranges settle at ~50 (one unified LRU budget across both index tiers).
+
+**Writes:** 10k single inserts interleaved with a warm read pattern → ~5k ins/sec;
+warm `AdvEngineID>0` stays flat (108 ms → 133 ms) — maintenance doesn't regress reads.
+
+Findings:
+- **Per-doc `get()`-back-to-primary is the warm-path ceiling.** Serving ~20k rows via
+  an index does ~20k primary lookups (`get` pattern: ~285k calls @ ~17 µs). That caps
+  `AdvEngineID>0` at 7× and the `EventTime` range at 2.2×, vs ~18900× for a 2-row point
+  lookup. This is the "covering index" work — now quantified.
+- **Range-blind promotion guard — FIXED (commit before this entry).** A sort query
+  `WHERE b=x ORDER BY a` spills an index keyed by `a` but covering `Eq(b=x)`; the old
+  guard then dropped genuine `a`-*range* blocks. Now coverage-aware (`has_covering_index`),
+  so the `EventTime` range block promotes and containment reuse works (above).
+- **Query-language gaps** (drive future work): ClickBench is ~70% aggregation. Unsupported
+  today: aggregation, GROUP BY, DISTINCT, `LIKE` substring, scalar functions. Joins/traverse
+  would be exercised by a relational benchmark (TPC-C/H), not single-table ClickBench.
+
+---
+
 ## 2026-05-18 — fsync amortization via pipelined group commit
 
 `cargo run --release --example fsync_bench` — TOTAL_OPS_TARGET=200K per cell,

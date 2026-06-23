@@ -243,8 +243,9 @@ fn run(engine: &LsmEngine, q: &Query) -> (usize, Duration) {
 }
 
 fn idx_state(engine: &LsmEngine) -> String {
-    format!("sorted={} blocks={} hits={}",
-        engine.secondary_index_count(), engine.unsorted_block_count(), engine.unsorted_hits())
+    format!("sorted_idx={} blocks={} sorted_hits={} block_hits={}",
+        engine.secondary_index_count(), engine.unsorted_block_count(),
+        engine.sorted_hits(), engine.unsorted_hits())
 }
 
 fn measure(engine: &LsmEngine, name: &str, build: impl Fn() -> Query, warm_reps: usize) {
@@ -296,13 +297,19 @@ fn phase_containment(engine: &Arc<LsmEngine>, p: &Params) {
     let q = (p.et_hi - p.et_lo) / 4;
     let lo = p.et_lo + q;
     let hi = p.et_hi - q;
-    let hits_before = engine.unsorted_hits();
+    let (sh, bh) = (engine.sorted_hits(), engine.unsorted_hits());
     let (n, d) = run(engine, &Query::Scan {
         filter: Some(Filter::Range { field: "EventTime".into(), low: Value::U64(lo), high: Value::U64(hi) }),
         sort: None, project: None, limit: None,
     });
-    let served = engine.unsorted_hits() > hits_before;
-    println!("  EventTime in [{lo},{hi}) ⊆ [{},{}): rows={n} in {d:?}  served_from_block={served}\n", p.et_lo, p.et_hi);
+    let served_by = if engine.sorted_hits() > sh {
+        "sorted index (containment)"
+    } else if engine.unsorted_hits() > bh {
+        "unsorted block (containment)"
+    } else {
+        "FULL SCAN (not served by any materialized range)"
+    };
+    println!("  EventTime in [{lo},{hi}) ⊆ [{},{}): rows={n} in {d:?}  served_by={served_by}\n", p.et_lo, p.et_hi);
 }
 
 fn phase_drift_and_lru(engine: &Arc<LsmEngine>, p: &Params) {
