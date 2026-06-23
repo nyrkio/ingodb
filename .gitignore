@@ -6,3 +6,7 @@ Cargo.lock
 *.wal
 ingodb_data/
 /data/
+
+# ClickBench benchmark data (not committed; regenerate via prep_clickbench.py)
+clickbench_hits.tsv
+*.parquet
