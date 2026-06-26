@@ -1,0 +1,142 @@
+# Equality index (Eq / In) — design
+
+Status: **design converged 2026-06-27**, supersedes the in-memory v0 landed the
+same day (`crates/ingodb-lsm/src/equality.rs`, which used write-side `notify_put`
+maintenance — see "Migration" below). Reactive, lazy, LSM-native.
+
+## Purpose
+
+Serve `Eq` and `In` predicates (the latter as `Or(Eq, Eq, …)` on one field — no
+AST node) without a full collection scan, as a sibling to the sorted/unsorted
+*range* indexes.
+
+**Routing:** `Eq`/`In` never *populate* range indexes (an Eq result no longer
+mints a sorted partial / unsorted block). But they may still be *served* by an
+existing range index that covers the value — Eq is a reader of range indexes, not
+a writer. A full sorted index, in particular, answers `Eq(col=v)` directly (and
+once one exists, compaction drops that column's Eq postings as redundant).
+
+## Core idea: postings follow the data through LSM levels
+
+An equality posting is an inverted list `value → [_id]` storing **only `_id`
+references** (16 bytes each), **scoped to a single immutable SSTable**.
+
+Because an SSTable is immutable until compaction, a posting derived from it is
+**exact and stable until that SSTable is compacted** — there is no within-SSTable
+staleness, and therefore **no write-side maintenance** (`notify_put`) is needed:
+
+- Writes only touch the **memtable** (always live-scanned) and later flush to a
+  **new** L0 SSTable (indexed lazily on first read). No write invalidates an
+  existing posting.
+- At **compaction**, postings are rebuilt/merged alongside the data they describe
+  (the morph-on-compaction extension point).
+
+This is *why* "materialize on reads" is correct: a global read-built posting
+would suffer false negatives on later writes; a per-SSTable one cannot.
+
+## Data model
+
+Per `(SSTable S, value V)`: `Posting { ids: Vec<DocumentId>, complete: bool }`.
+
+Two independent knobs:
+- **R** — completeness threshold (selectivity fraction, default **0.20**,
+  configurable). Decides *whether to fully index a value*. Bounds *complete*
+  posting size (≤ R·|S|).
+- **K** — overflow retention (**16**). How many ids to keep once we give up on
+  completeness. Bounds *incomplete* postings.
+
+### Build rules (lazy, on read scan of S for V)
+
+| count | complete | meaning | how it got here |
+|---:|:--|:--|:--|
+| k | `true` | exact: exactly k matches in S, selective (k < R·\|S\|) | scan exhausted S, under R |
+| **16** | `false` | **overflow**: V is ≥ R in S; excess seen-and-discarded | scan exhausted S, hit R |
+| k < 16 | `false` | **stopped early**: ≥ k here, true count unknown, *refinable* | LIMIT satisfied before S exhausted |
+
+Invariant: **`count==16 ∧ ¬complete ⟺ overflow (≥R)`**. Preserved by capping
+early-stop postings at **K−1 = 15**, so an early-stop can never masquerade as an
+overflow. (`count==16 ∧ complete` is fine — exactly 16, selective.)
+
+The 16-vs-<16 distinction is a reactive signal: overflow is a *final* fact about
+immutable S (exhaustive `Eq(V)` should just scan); stopped-early is *provisional*
+and a later exhaustive scan **upgrades** it to `complete` or to overflow.
+
+Negative cache is the degenerate exact row: `{ [], complete:true }` (m=0 < R·|S|).
+
+## Serve path: `Eq(V)` (optionally `LIMIT n`)
+
+1. Live-scan the **memtable** for V (mutable, never indexed).
+2. For each SSTable S, consult its posting for V:
+   - `complete` → exhaustive contribution (verify ids).
+   - overflow (16,false) → ≥16 candidates; serve `LIMIT ≤ survivors`, else scan S.
+   - stopped-early (<16,false) → k candidates; if more needed, scan S (refines).
+   - no posting yet → an existing range index covering V (sorted partial /
+     unsorted block / full sorted index) may serve it; otherwise scan S, building
+     the posting per the rules above. Eq reads range indexes but never creates them.
+3. **Verify-on-read**: resolve each candidate via `get_at(id, snapshot)` and
+   re-check the predicate. With per-SSTable immutability this is no longer about
+   within-SSTable staleness — it now resolves **cross-level MVCC** (an id with V
+   in L2 but a newer version in L0 where field≠V) and applies the snapshot.
+4. Union, dedup by `_id`, apply limit.
+
+A **global negative** for V means *every* SSTable's V-posting is complete-empty
+**and** the memtable has no V.
+
+### LIMIT-1 corner
+
+`Eq(X) LIMIT 1` against an incomplete posting can't just return `ids[0]` (it may
+be superseded cross-level). Verify candidates until one survives — bounded by the
+stored count (≤16); only if *all* fail do we scan S. K=16 is the buffer that lets
+small-LIMIT queries absorb verification misses without rescanning.
+
+## MVCC
+
+Postings are version-agnostic; `get_at` is the version oracle. Consulted only for
+latest reads (`snapshot == max`) in v1, matching the other indexes; snapshot reads
+bypass and full-scan. The per-SSTable read path is forward-compatible with serving
+older snapshots (it already threads `snapshot` into the verify step).
+
+## Compaction
+
+Postings follow the data:
+1. **Keep + rebuild/refresh.** Recompute carried-forward postings exactly from the
+   merged output rows (free — compaction already streams every row), so warm
+   indexes survive compaction instead of cold-starting.
+2. **Drop a column** whose compaction output includes a **sorted full-range
+   index** — that index already answers `Eq(col=v)`, so the postings are
+   redundant. (Promotion ladder: Eq postings → sorted partials → full sorted
+   index subsumes Eq.)
+3. **Drop** postings the field-granularity LRU marks cold.
+
+## Budget / LRU
+
+Field-granularity LRU, separate budget from the range indexes
+(`MAX_EQUALITY_FIELDS`). Touching any value marks the field used; eviction drops a
+whole field's postings. No per-value or per-version recency.
+
+## Migration from v0 (in-memory, landed 2026-06-27)
+
+v0 is a single global `EqualityIndexSet` with write-side `notify_put` and a 50%
+build guard. The redesign:
+- **Remove** write-side maintenance: the 4 `notify_equality_put` call sites and
+  `EqualityIndexSet::notify_put`.
+- **Move** postings from one global set to **per-SSTable** (a side map keyed by
+  SSTable id; needs `SSTableReader` to expose row count |S| for R·|S|).
+- **Build on read** per-SSTable during the scan (the scan path must attribute
+  matches to their source SSTable, not merge-then-filter globally).
+- **Replace** the 50% global guard with **R (per-SSTable) + K + complete** rules.
+- **Add** compaction refresh + redundancy/LRU drops.
+- **Keep**: value-keyed-by-encoding, verify-on-read via `get_at`, `Or(Eq…)`→In,
+  field-LRU, negative cache.
+
+## Staged implementation
+
+- **A.** Posting data model (`{ids, complete}`, R/K rules, truth-table invariant) +
+  unit tests. Pure, no engine wiring.
+- **B.** Per-SSTable read-built postings + serve path + verify-on-read; remove v0
+  write-side maintenance. Simplest compaction handling: drop a posting when its
+  SSTable is compacted (rebuild on next read).
+- **C.** Compaction refresh (rebuild postings from merged output) + redundancy
+  drop (sorted full-range index) + LRU drop.
+- **D.** Re-run ClickBench; confirm UserID still fast, CounterID `LIMIT k` now
+  served from overflow, exhaustive CounterID still scans.
