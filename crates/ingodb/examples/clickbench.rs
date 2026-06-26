@@ -243,9 +243,10 @@ fn run(engine: &LsmEngine, q: &Query) -> (usize, Duration) {
 }
 
 fn idx_state(engine: &LsmEngine) -> String {
-    format!("sorted_idx={} blocks={} sorted_hits={} block_hits={}",
+    format!("sorted_idx={} blocks={} eq_fields={} sorted_hits={} block_hits={} eq_hits={}",
         engine.secondary_index_count(), engine.unsorted_block_count(),
-        engine.sorted_hits(), engine.unsorted_hits())
+        engine.equality_field_count(), engine.sorted_hits(),
+        engine.unsorted_hits(), engine.equality_hits())
 }
 
 fn measure(engine: &LsmEngine, name: &str, build: impl Fn() -> Query, warm_reps: usize) {
@@ -313,7 +314,7 @@ fn phase_containment(engine: &Arc<LsmEngine>, p: &Params) {
 }
 
 fn phase_drift_and_lru(engine: &Arc<LsmEngine>, p: &Params) {
-    println!("--- Drift + LRU (many distinct ranges; cap=50) ---");
+    println!("--- Drift (many distinct UserID Eq queries → equality index) ---");
     let n = p.drift_users.len();
     let start = Instant::now();
     for &u in &p.drift_users {
@@ -323,7 +324,10 @@ fn phase_drift_and_lru(engine: &Arc<LsmEngine>, p: &Params) {
         });
     }
     println!("  queried {n} distinct UserID values in {:?}", start.elapsed());
-    println!("  {}  (UserID ranges capped at ~50 despite {n} distinct queries)\n", idx_state(engine));
+    // These are point-equality predicates: they now land in the equality index
+    // (one "UserID" field holding many in-memory value postings) instead of
+    // minting and LRU-evicting up-to-50 projected sorted-partial SSTables.
+    println!("  {}  ({n} distinct UserID Eq queries → 1 equality field, no range-index churn)\n", idx_state(engine));
 }
 
 fn phase_writes(engine: &Arc<LsmEngine>, next_id: u64) {

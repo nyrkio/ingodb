@@ -6,6 +6,44 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-06-27 — Lazy equality (Eq/In) index added; ClickBench re-run
+
+New reactive index: a **lazy equality index** for `Eq` / `In` predicates (the
+latter expressed as `Or(Eq, Eq, …)` on one field — no new AST node). It's an
+inverted posting list `field=value → [_id]` storing **only `_id` references**;
+reads resolve each candidate against the primary via `get_at(id, snapshot)` and
+re-verify the predicate, so staleness (updated/deleted docs) and MVCC fall out of
+the verify step — the posting list itself is version-agnostic. Maintenance is
+additive (`notify_put` appends to already-materialized values only); LRU is at
+**field granularity** with its own budget; in-memory in v1. `Eq`/`In` now route
+here and **no longer promote sorted/unsorted *range* indexes**.
+
+Same setup as the 2026-06-23 run: 200,000 rows of real `hits_0`, `--release`,
+`max_ranges_per_field=50`. Illustrative, not a score.
+
+| Query | Cold | Warm (med) | Speedup | Served by |
+|---|---:|---:|---:|---|
+| `UserID = <id>` — point Eq by field (2 rows) | 715 ms | **32.7 µs** | **~21800×** | equality index (in-memory posting) |
+| `CounterID = <dominant>` (99.99% of rows) | 555 ms | 573 ms | 1.0× | **not materialized** (>50% guard applies to Eq too) |
+
+The `UserID` point-Eq warm path is now an in-memory `_id` posting (was a
+projected sorted-partial SSTable: 39 µs / 18,900× on 2026-06-23) — marginally
+faster, but both are dominated by the 2 `get()`-backs to primary.
+
+**Drift, where the structural win is:** 70 distinct high-cardinality `UserID` Eq
+queries now collapse into **one equality field** holding 70 in-memory value
+postings — `sorted_idx` stays at 3 (the `EventTime`/`RegionID`/`AdvEngineID`
+ranges), **zero** UserID range-index files minted or LRU-evicted. The old path
+churned up to 50 projected sorted-partial SSTables under the unified range
+budget; high-cardinality point lookups now cost `_id`-list memory instead of
+files, and all 70 are retained (better warm-hit rate on re-query) rather than
+capped at 50.
+
+Unchanged from 2026-06-23: range/top-N/containment paths (Eq removal doesn't
+touch them), and the per-doc `get()`-back ceiling on wide warm scans.
+
+---
+
 ## 2026-06-23 — ClickBench reactive-index benchmark (real `hits` data)
 
 `cargo run --release --example clickbench [rows]`. Runs the IngoDB-expressible

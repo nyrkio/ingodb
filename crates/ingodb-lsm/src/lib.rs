@@ -1,5 +1,6 @@
 mod compaction;
 mod database;
+mod equality;
 mod secondary;
 pub mod unsorted;
 pub mod stats;
@@ -272,6 +273,11 @@ pub struct LsmEngine {
     unsorted_hits: AtomicU64,
     /// Count of scans served from a sorted (secondary/partial) index.
     sorted_hits: AtomicU64,
+    /// Lazy equality (Eq/In) index: per-field inverted posting lists of `_id`s,
+    /// verified against the main collection at read time. Its own field-LRU budget.
+    equality_indexes: Mutex<equality::EqualityIndexSet>,
+    /// Count of scans served from the equality index (observability / tests).
+    equality_hits: AtomicU64,
     /// Newly built indexes awaiting persistence (collection_name not known here — Database handles it)
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
     /// Active snapshot versions — compaction preserves versions >= oldest snapshot
@@ -457,6 +463,10 @@ impl LsmEngine {
             unsorted_dir,
             unsorted_hits: AtomicU64::new(0),
             sorted_hits: AtomicU64::new(0),
+            equality_indexes: Mutex::new(equality::EqualityIndexSet::new(
+                equality::MAX_EQUALITY_FIELDS,
+            )),
+            equality_hits: AtomicU64::new(0),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
             commit_queue: Mutex::new(CommitQueue::new()),
@@ -535,6 +545,7 @@ impl LsmEngine {
                 }
             }
             self.notify_unsorted_put(&blob);
+            self.notify_equality_put(&blob);
             memtable.insert(blob);
         }
         let should_flush = memtable.should_flush();
@@ -616,6 +627,7 @@ impl LsmEngine {
                         idx.notify_put(&blob);
                     }
                     self.notify_unsorted_put(&blob);
+                    self.notify_equality_put(&blob);
                     memtable.insert(blob);
                 }
             }
@@ -831,6 +843,7 @@ impl LsmEngine {
                     idx.notify_put(&blob);
                 }
                 self.notify_unsorted_put(&blob);
+                self.notify_equality_put(&blob);
                 memtable.insert(blob);
             }
         }
@@ -881,6 +894,7 @@ impl LsmEngine {
         }
         for blob in blobs.iter() {
             self.notify_unsorted_put(blob);
+            self.notify_equality_put(blob);
         }
 
         // Memtable: one lock, all inserts
@@ -1645,6 +1659,16 @@ impl LsmEngine {
         }
     }
 
+    /// Append a write to the equality index (additive, materialized-values-only).
+    /// Cheap no-op when no equality indexes exist.
+    fn notify_equality_put(&self, blob: &IBlob) {
+        let mut set = self.equality_indexes.lock();
+        if set.is_empty() {
+            return;
+        }
+        set.notify_put(blob);
+    }
+
     /// Materialize a scan's matching subset as a new unsorted block on `field`,
     /// then enforce the unified per-field range budget.
     fn materialize_unsorted_block(
@@ -2001,6 +2025,67 @@ impl LsmEngine {
         Some(Ok(results))
     }
 
+    /// Try to serve an `Eq` / `In` filter from the equality index.
+    ///
+    /// Returns `None` (→ full scan, which then materializes the postings) when
+    /// the filter isn't an equality term, the field is untracked, or any
+    /// requested value is unmaterialized. On a hit, resolves each candidate `_id`
+    /// against the main collection at `snapshot` and re-checks the predicate, so
+    /// stale postings (updated/deleted docs) and MVCC are handled by the verify
+    /// step — the posting list itself is version-agnostic.
+    fn scan_with_equality_index(
+        &self,
+        filter: &Filter,
+        limit: Option<usize>,
+        snapshot: &DocumentId,
+    ) -> Option<Result<Vec<IBlob>, LsmError>> {
+        let (field, values) = equality::equality_terms(filter)?;
+
+        let candidate_ids = {
+            let mut set = self.equality_indexes.lock();
+            set.candidates(&field, &values)?
+        };
+
+        self.equality_hits.fetch_add(1, Ordering::Relaxed);
+
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in candidate_ids {
+            match self.get_at(&id, snapshot) {
+                Ok(Some(blob)) => {
+                    if blob.is_deleted() {
+                        continue;
+                    }
+                    // Verify against the authoritative doc: drops stale positives.
+                    if !filter.matches(&|f| blob.get_field(f)) {
+                        continue;
+                    }
+                    if seen.insert(*blob.id()) {
+                        results.push(blob);
+                    }
+                }
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Merge fresh memtable docs the postings may not have caught yet (RYW
+        // race / writes between materialization and now). Bounded by memtable size.
+        for (_, blob) in self.memtable.read().iter() {
+            if blob.is_deleted() || blob.version() > snapshot {
+                continue;
+            }
+            if filter.matches(&|f| blob.get_field(f)) && seen.insert(*blob.id()) {
+                results.push(blob);
+            }
+        }
+
+        if let Some(lim) = limit {
+            results.truncate(lim);
+        }
+        Some(Ok(results))
+    }
+
     /// Try to serve a filter-only scan from a single covering unsorted block.
     /// Returns `None` if no block fully contains the query range (→ full scan,
     /// which may then re-materialize a block over the whole range).
@@ -2180,6 +2265,16 @@ impl LsmEngine {
         self.sorted_hits.load(Ordering::Relaxed)
     }
 
+    /// Number of scans served from the equality (Eq/In) index.
+    pub fn equality_hits(&self) -> u64 {
+        self.equality_hits.load(Ordering::Relaxed)
+    }
+
+    /// Number of fields currently tracked by the equality index.
+    pub fn equality_field_count(&self) -> usize {
+        self.equality_indexes.lock().field_count()
+    }
+
     /// Total number of unsorted blocks across all columns.
     pub fn unsorted_block_count(&self) -> usize {
         self.unsorted_indexes.lock().values().map(|u| u.block_count()).sum()
@@ -2288,6 +2383,17 @@ impl LsmEngine {
         // Try secondary index for filter-only scans (no sort required)
         if sort.is_none() {
             if let Some(filter) = filter {
+                // Equality (Eq/In) is served by the dedicated equality index.
+                if let Some(result) = self.scan_with_equality_index(filter, limit, snapshot) {
+                    let mut results = result?;
+                    if let Some(fields) = project {
+                        results = results.into_iter().map(|blob| blob.project(fields)).collect();
+                    }
+                    let docs_returned = results.len() as u64;
+                    timer.set_docs_scanned(docs_returned);
+                    self.query_stats.record(timer.finish(docs_returned));
+                    return Ok(results);
+                }
                 if let Some(result) = self.scan_with_filter_index(filter, limit, snapshot) {
                     let mut results = result?;
                     if let Some(fields) = project {
@@ -2363,33 +2469,41 @@ impl LsmEngine {
         // `results` is the full matching subset over `filter`.
         if *snapshot == DocumentId::max() && sort.is_none() {
             if let Some(f) = filter {
-                let field = match f {
-                    Filter::Eq { field, .. }
-                    | Filter::Gt { field, .. }
-                    | Filter::Lt { field, .. }
-                    | Filter::Range { field, .. } => Some(field.clone()),
-                    _ => None,
-                };
-                if let Some(field) = field {
-                    let matching = results.len() as u64;
-                    // Materialize when the result is at most half the collection
-                    // (which already implies it's a proper subset).
-                    let small_enough = (matching as f64)
-                        <= unsorted::UNSORTED_MATERIALIZE_MAX_FRACTION * docs_scanned as f64;
-                    // Trivially-sorted results go straight to a sorted partial
-                    // index (no deferred sort needed): an empty result (negative
-                    // cache), a single row, or an Eq filter (uniform values are
-                    // already sorted). Everything else becomes an unsorted block
-                    // whose field-sort is deferred to compaction.
-                    let already_sorted =
-                        matching <= 1 || matches!(f, Filter::Eq { .. });
+                let matching = results.len() as u64;
+                // Materialize when the result is at most half the collection
+                // (which already implies it's a proper subset).
+                let small_enough = (matching as f64)
+                    <= unsorted::UNSORTED_MATERIALIZE_MAX_FRACTION * docs_scanned as f64;
+
+                if let Some((field, values)) = equality::equality_terms(f) {
+                    // Eq / In → equality index. These no longer promote sorted or
+                    // unsorted *range* indexes; the result is materialized here.
                     if small_enough {
-                        if already_sorted {
-                            let mut to_spill = results.clone();
-                            let _ = self.spill_to_partial_index(&[field.clone()], Some(f.clone()), &mut to_spill);
-                            self.enforce_combined_range_budget(&field);
-                        } else {
-                            self.materialize_unsorted_block(&field, f.clone(), &results);
+                        self.equality_indexes
+                            .lock()
+                            .materialize(&field, &values, &results);
+                    }
+                } else {
+                    let field = match f {
+                        Filter::Gt { field, .. }
+                        | Filter::Lt { field, .. }
+                        | Filter::Range { field, .. } => Some(field.clone()),
+                        _ => None,
+                    };
+                    if let Some(field) = field {
+                        // Trivially-sorted results (empty → negative cache, or a
+                        // single row) go straight to a sorted partial index;
+                        // everything else becomes an unsorted block whose
+                        // field-sort is deferred to compaction.
+                        let already_sorted = matching <= 1;
+                        if small_enough {
+                            if already_sorted {
+                                let mut to_spill = results.clone();
+                                let _ = self.spill_to_partial_index(&[field.clone()], Some(f.clone()), &mut to_spill);
+                                self.enforce_combined_range_budget(&field);
+                            } else {
+                                self.materialize_unsorted_block(&field, f.clone(), &results);
+                            }
                         }
                     }
                 }
@@ -4277,6 +4391,113 @@ mod tests {
     }
 
     #[test]
+    fn test_equality_index_serves_eq() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i % 5)).unwrap(); // x in 0..5, ten docs each
+        }
+        engine.flush_memtable().unwrap();
+
+        // First Eq scan: full scan, materializes the posting (no equality hit yet).
+        let r1 = engine.scan(Some(&eq_x(3)), None, None, None).unwrap();
+        assert_eq!(xs(&r1), vec![3; 10]);
+        assert_eq!(engine.equality_hits(), 0, "first scan was a full scan");
+        assert_eq!(engine.equality_field_count(), 1, "posting materialized for field x");
+        // Eq must NOT promote a sorted or unsorted range index.
+        assert_eq!(engine.secondary_index_count(), 0, "Eq no longer promotes sorted partials");
+        assert_eq!(engine.unsorted_block_count(), 0, "Eq no longer promotes unsorted blocks");
+
+        // Second Eq scan: served by the equality index, same results.
+        let r2 = engine.scan(Some(&eq_x(3)), None, None, None).unwrap();
+        assert_eq!(xs(&r2), vec![3; 10]);
+        assert_eq!(engine.equality_hits(), 1, "second scan served by equality index");
+    }
+
+    #[test]
+    fn test_equality_index_serves_in() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..50u64 {
+            engine.put(doc_x(i, i % 5)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // In = Or(Eq, Eq) over the same field — no dedicated AST node.
+        let in_filter = Filter::Or(vec![eq_x(1), eq_x(4)]);
+        let r1 = engine.scan(Some(&in_filter), None, None, None).unwrap();
+        assert_eq!(r1.len(), 20, "ten docs each for x=1 and x=4");
+        assert_eq!(engine.equality_hits(), 0, "first scan was a full scan");
+
+        let r2 = engine.scan(Some(&in_filter), None, None, None).unwrap();
+        assert_eq!(r2.len(), 20);
+        assert_eq!(engine.equality_hits(), 1, "In served by equality index");
+    }
+
+    #[test]
+    fn test_equality_verify_drops_stale_after_update() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..20u64 {
+            engine.put(doc_x(i, 7)).unwrap(); // all x=7
+        }
+        engine.flush_memtable().unwrap();
+
+        // Materialize the posting for x=7 (20 ids).
+        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 20);
+
+        // Update one doc's x away from 7 (same _id, new version).
+        engine.put(doc_x(5, 99)).unwrap();
+
+        // The posting still lists id 5, but verifying against the latest doc
+        // (now x=99) drops it. 19 survive — no stale positive leaks through.
+        let r = engine.scan(Some(&eq_x(7)), None, None, None).unwrap();
+        assert_eq!(r.len(), 19, "updated doc dropped by verify-on-read");
+    }
+
+    #[test]
+    fn test_equality_negative_cache_self_heals() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..10u64 {
+            engine.put(doc_x(i, 1)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Eq(42): no match → a negative posting is materialized and reused.
+        assert_eq!(engine.scan(Some(&eq_x(42)), None, None, None).unwrap().len(), 0);
+        assert_eq!(engine.scan(Some(&eq_x(42)), None, None, None).unwrap().len(), 0);
+        assert_eq!(engine.equality_hits(), 1, "negative cache served the repeat");
+
+        // A later matching insert self-heals the negative posting via notify_put.
+        engine.put(doc_x(100, 42)).unwrap();
+        let r = engine.scan(Some(&eq_x(42)), None, None, None).unwrap();
+        assert_eq!(xs(&r), vec![42], "negative cache self-healed on insert");
+    }
+
+    #[test]
+    fn test_equality_index_snapshot_reads_bypass_and_stay_correct() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..10u64 {
+            engine.put(doc_x(i, 5)).unwrap(); // x=5
+        }
+        engine.flush_memtable().unwrap();
+
+        // Materialize posting for x=5 at the latest version.
+        assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 10);
+
+        // Snapshot, then move every doc to x=6.
+        let snap = engine.snapshot();
+        for i in 0..10u64 {
+            engine.put(doc_x(i, 6)).unwrap();
+        }
+
+        // Latest read: all docs now verify to x=6, so Eq(5) matches nothing.
+        assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 0);
+
+        // Snapshot read bypasses the equality index (latest-only) and full-scans
+        // with MVCC version filtering, so it still sees the pre-update x=5 values.
+        let via_snapshot = snap.scan(Some(&eq_x(5)), None, None, None).unwrap();
+        assert_eq!(via_snapshot.len(), 10, "snapshot sees pre-update values");
+    }
+
+    #[test]
     fn test_unified_lru_evicts_coldest_across_tiers() {
         // Sorted partials and unsorted blocks share one LRU budget. A range used
         // recently survives even when it sits in a "full" tier, and the globally
@@ -4298,18 +4519,21 @@ mod tests {
         }
         engine.flush_memtable().unwrap();
 
-        // Three Eq queries → three sorted partials (Eq is trivially sorted).
-        engine.scan(Some(&eq_x(10)), None, None, None).unwrap();
-        engine.scan(Some(&eq_x(20)), None, None, None).unwrap();
-        engine.scan(Some(&eq_x(30)), None, None, None).unwrap();
+        // Three single-row range filters → three sorted partials (a 1-row result
+        // is trivially sorted, so it spills straight to a sorted partial). NB: Eq
+        // filters now route to the equality index, not the range indexes, so we
+        // use degenerate single-value ranges to exercise the unified range LRU.
+        engine.scan(Some(&range_x(10, 11)), None, None, None).unwrap(); // x=10
+        engine.scan(Some(&range_x(20, 21)), None, None, None).unwrap(); // x=20
+        engine.scan(Some(&range_x(30, 31)), None, None, None).unwrap(); // x=30
         assert_eq!(engine.secondary_index_count(), 3);
         assert_eq!(engine.unsorted_block_count(), 0);
 
-        // Touch Eq(10) so it is the most-recently-used sorted partial.
-        engine.scan(Some(&eq_x(10)), None, None, None).unwrap();
+        // Touch range(10,11) so it is the most-recently-used sorted partial.
+        engine.scan(Some(&range_x(10, 11)), None, None, None).unwrap();
 
         // A multi-row range filter → a 4th range as an unsorted block. Total now
-        // exceeds the cap (3), so the globally-coldest range — Eq(20) — is evicted.
+        // exceeds the cap (3), so the globally-coldest range — range(20,21) — is evicted.
         let r = engine.scan(Some(&range_x(40, 70)), None, None, None).unwrap();
         assert_eq!(xs(&r), vec![40, 50, 60]);
 
@@ -4323,9 +4547,9 @@ mod tests {
             .iter()
             .filter_map(|i| i.range.clone())
             .collect();
-        assert!(ranges.contains(&eq_x(10)), "recently-used Eq(10) survives");
-        assert!(ranges.contains(&eq_x(30)));
-        assert!(!ranges.contains(&eq_x(20)), "coldest range Eq(20) evicted across tiers");
+        assert!(ranges.contains(&range_x(10, 11)), "recently-used range(10,11) survives");
+        assert!(ranges.contains(&range_x(30, 31)));
+        assert!(!ranges.contains(&range_x(20, 21)), "coldest range(20,21) evicted across tiers");
     }
 
     #[test]
