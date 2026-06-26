@@ -223,6 +223,193 @@ impl EqualityIndexSet {
     }
 }
 
+// ===========================================================================
+// v1: per-SSTable posting model (Phase A — pure, not yet wired)
+//
+// See docs/equality-index.md. This replaces the v0 global, write-maintained
+// `EqualityIndexSet` above; the two live side by side until Phase B swaps the
+// engine wiring and deletes v0.
+// ===========================================================================
+
+// `allow(dead_code)`: the v1 model is pure in Phase A and not yet reachable from
+// engine code; the attributes come off in Phase B when the wiring lands.
+
+/// Completeness threshold **R**: a value occupying < R of an SSTable is fully
+/// indexed (`Exact`); at/above R, if it *also* has more than `EQUALITY_K`
+/// matches, only a K-sized sample is kept (`Overflow`). Configurable later.
+#[allow(dead_code)]
+pub const EQUALITY_R: f64 = 0.20;
+
+/// Sample/overflow retention **K**: ids kept for an incomplete posting.
+#[allow(dead_code)]
+pub const EQUALITY_K: usize = 16;
+
+/// What the engine knows about which `_id`s in *one immutable SSTable* hold a
+/// given field value. Because the SSTable is immutable until compaction, a
+/// posting is exact and stable for that data — no within-SSTable staleness.
+///
+/// The three variants are the truth table from `docs/equality-index.md`. Using
+/// an explicit enum (rather than `{ids, complete}` + a "len == K" inference)
+/// makes `Overflow` unambiguous and removes two sharp edges: the `K−1` cap on
+/// early-stop postings, and a small-SSTable case where an `Overflow` keeps < K
+/// ids and would be misread as provisional.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Posting {
+    /// Every matching `_id` in the SSTable — absence from the list is
+    /// authoritative. The empty vector is the negative cache. Built by an
+    /// exhaustive scan whose match count is under R (or fits within K).
+    Exact(Vec<DocumentId>),
+    /// The value is ≥ R of the SSTable **and** has more than K matches: a K-sized
+    /// sample, rest discarded. A *final* fact about the immutable SSTable —
+    /// exhaustive queries on this value should just scan it, never re-sample.
+    Overflow(Vec<DocumentId>),
+    /// A scan stopped early (a LIMIT was satisfied before the SSTable was
+    /// exhausted): a sample of unknown completeness. *Provisional* — a later
+    /// exhaustive scan upgrades it to `Exact` or `Overflow`.
+    Partial(Vec<DocumentId>),
+}
+
+#[allow(dead_code)]
+impl Posting {
+    /// Build from an **exhaustive** scan of one SSTable for one value. `matches`
+    /// = every matching id found; `sstable_rows` = |S|.
+    ///
+    /// A value over R but with ≤ K matches is still `Exact`: we kept everything,
+    /// so completeness is free and strictly better than a pessimistic overflow.
+    pub fn from_exhaustive(mut matches: Vec<DocumentId>, sstable_rows: usize) -> Posting {
+        let m = matches.len();
+        let exceeds_r = sstable_rows > 0 && (m as f64) >= EQUALITY_R * sstable_rows as f64;
+        if exceeds_r && m > EQUALITY_K {
+            matches.truncate(EQUALITY_K);
+            Posting::Overflow(matches)
+        } else {
+            Posting::Exact(matches) // m == 0 is the negative cache
+        }
+    }
+
+    /// Build from a scan that **stopped early** (query LIMIT hit before the
+    /// SSTable was exhausted). Keeps at most K ids.
+    pub fn from_stopped_early(mut found: Vec<DocumentId>) -> Posting {
+        found.truncate(EQUALITY_K);
+        Posting::Partial(found)
+    }
+
+    /// Stored candidate ids: a superset to verify (for `Exact`, the exact set).
+    pub fn ids(&self) -> &[DocumentId] {
+        match self {
+            Posting::Exact(v) | Posting::Overflow(v) | Posting::Partial(v) => v,
+        }
+    }
+
+    /// Is absence from [`Self::ids`] authoritative ("not in this SSTable")? Only
+    /// `Exact` — and `Exact([])` is the negative cache.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Posting::Exact(_))
+    }
+
+    /// A *final* incomplete posting: the value is ≥ R, re-scanning won't complete it.
+    pub fn is_overflow(&self) -> bool {
+        matches!(self, Posting::Overflow(_))
+    }
+
+    /// A *provisional* incomplete posting a future exhaustive scan can upgrade.
+    pub fn is_refinable(&self) -> bool {
+        matches!(self, Posting::Partial(_))
+    }
+
+    /// Can this single SSTable's contribution be answered from the posting alone,
+    /// given how many of its candidates survived verification and the query's
+    /// optional LIMIT? `Exact` always can; an incomplete posting can only when a
+    /// LIMIT is already met by the survivors (otherwise the SSTable must be
+    /// scanned). Per-source rule; Phase B composes it across SSTables + memtable.
+    pub fn satisfies(&self, survivors: usize, limit: Option<usize>) -> bool {
+        match self {
+            Posting::Exact(_) => true,
+            Posting::Overflow(_) | Posting::Partial(_) => {
+                matches!(limit, Some(n) if survivors >= n)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod posting_tests {
+    use super::*;
+
+    fn ids(n: usize) -> Vec<DocumentId> {
+        (0..n).map(|i| DocumentId::from_bytes([i as u8; 16])).collect()
+    }
+
+    #[test]
+    fn exhaustive_under_r_is_exact() {
+        // 5 matches in a 100-row SSTable (5%) → Exact, complete, all kept.
+        let p = Posting::from_exhaustive(ids(5), 100);
+        assert_eq!(p, Posting::Exact(ids(5)));
+        assert!(p.is_complete() && !p.is_overflow() && !p.is_refinable());
+        assert_eq!(p.ids().len(), 5);
+    }
+
+    #[test]
+    fn empty_is_negative_cache() {
+        let p = Posting::from_exhaustive(vec![], 100);
+        assert_eq!(p, Posting::Exact(vec![]));
+        assert!(p.is_complete(), "empty Exact is the authoritative negative");
+    }
+
+    #[test]
+    fn exhaustive_over_r_and_over_k_is_overflow() {
+        // 30 matches in a 100-row SSTable (30% ≥ R) and > K → Overflow, K sample.
+        let p = Posting::from_exhaustive(ids(30), 100);
+        assert!(p.is_overflow() && !p.is_complete());
+        assert_eq!(p.ids().len(), EQUALITY_K, "kept exactly K");
+    }
+
+    #[test]
+    fn over_r_but_within_k_stays_exact() {
+        // 3 matches in a 10-row SSTable: 30% ≥ R, but only 3 ≤ K, so we have
+        // them all → Exact, not a < K Overflow that would loop on re-scan.
+        let p = Posting::from_exhaustive(ids(3), 10);
+        assert_eq!(p, Posting::Exact(ids(3)));
+        assert!(p.is_complete());
+    }
+
+    #[test]
+    fn exactly_k_under_r_is_exact_not_overflow() {
+        // 16 matches in a 1000-row SSTable (1.6% < R): Exact with K ids — the
+        // `len == K ∧ complete` case the inference-based encoding couldn't tell
+        // apart from an overflow.
+        let p = Posting::from_exhaustive(ids(EQUALITY_K), 1000);
+        assert_eq!(p, Posting::Exact(ids(EQUALITY_K)));
+        assert!(p.is_complete() && !p.is_overflow());
+    }
+
+    #[test]
+    fn stopped_early_is_partial_capped_at_k() {
+        let p = Posting::from_stopped_early(ids(50));
+        assert!(p.is_refinable() && !p.is_complete() && !p.is_overflow());
+        assert_eq!(p.ids().len(), EQUALITY_K, "Partial keeps at most K");
+    }
+
+    #[test]
+    fn satisfies_rules() {
+        let exact = Posting::Exact(ids(3));
+        let overflow = Posting::Overflow(ids(EQUALITY_K));
+        let partial = Posting::Partial(ids(4));
+
+        // Exact answers any query (limit or not).
+        assert!(exact.satisfies(3, None));
+        assert!(exact.satisfies(3, Some(10)));
+
+        // Incomplete: only when a LIMIT is already met by survivors.
+        assert!(!overflow.satisfies(16, None), "exhaustive over overflow must scan");
+        assert!(overflow.satisfies(10, Some(10)), "LIMIT 10 met by 10 survivors");
+        assert!(!overflow.satisfies(3, Some(10)), "LIMIT 10, only 3 survivors → scan");
+        assert!(partial.satisfies(4, Some(4)));
+        assert!(!partial.satisfies(4, None));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

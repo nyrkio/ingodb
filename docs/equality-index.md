@@ -36,7 +36,8 @@ would suffer false negatives on later writes; a per-SSTable one cannot.
 
 ## Data model
 
-Per `(SSTable S, value V)`: `Posting { ids: Vec<DocumentId>, complete: bool }`.
+Per `(SSTable S, value V)`: a `Posting` enum — `Exact` | `Overflow` | `Partial`
+(see Build rules).
 
 Two independent knobs:
 - **R** — completeness threshold (selectivity fraction, default **0.20**,
@@ -47,29 +48,37 @@ Two independent knobs:
 
 ### Build rules (lazy, on read scan of S for V)
 
-| count | complete | meaning | how it got here |
-|---:|:--|:--|:--|
-| k | `true` | exact: exactly k matches in S, selective (k < R·\|S\|) | scan exhausted S, under R |
-| **16** | `false` | **overflow**: V is ≥ R in S; excess seen-and-discarded | scan exhausted S, hit R |
-| k < 16 | `false` | **stopped early**: ≥ k here, true count unknown, *refinable* | LIMIT satisfied before S exhausted |
+The three truth-table states are encoded as an **enum** (Phase A,
+`equality.rs::Posting`), not `{ids, complete}` + a "`len == K`" inference — the
+explicit variant makes overflow unambiguous and removes two sharp edges (below).
 
-Invariant: **`count==16 ∧ ¬complete ⟺ overflow (≥R)`**. Preserved by capping
-early-stop postings at **K−1 = 15**, so an early-stop can never masquerade as an
-overflow. (`count==16 ∧ complete` is fine — exactly 16, selective.)
+| variant | meaning | how it got here |
+|:--|:--|:--|
+| `Exact(ids)` | every match in S; absence authoritative. `Exact([])` = negative cache | scan exhausted S, and `m < R·\|S\|` **or** `m ≤ K` |
+| `Overflow(ids)` | V is ≥ R in S **and** `m > K`; K-sized sample, rest discarded; *final* | scan exhausted S, hit R, more than K matches |
+| `Partial(ids)` | sample of unknown completeness; *refinable* | LIMIT satisfied before S exhausted |
 
-The 16-vs-<16 distinction is a reactive signal: overflow is a *final* fact about
-immutable S (exhaustive `Eq(V)` should just scan); stopped-early is *provisional*
-and a later exhaustive scan **upgrades** it to `complete` or to overflow.
+Two refinements vs. the original `{ids, complete}` sketch, both from implementing it:
+- **Over-R but `m ≤ K` stays `Exact`.** If a value clears R but we still captured
+  *all* of its matches (≤ K), completeness is free and beats a pessimistic
+  overflow — and it avoids a `< K` overflow that would loop on re-scan. So
+  `Overflow` requires `m > K`, i.e. it always holds exactly K ids.
+- **No `K−1` cap on `Partial`.** That hack only existed to keep `len==16 ∧
+  ¬complete` meaning overflow under the inference encoding; the explicit `Partial`
+  variant makes it unnecessary (`Partial` keeps up to K).
 
-Negative cache is the degenerate exact row: `{ [], complete:true }` (m=0 < R·|S|).
+`Exact` vs `Overflow` vs `Partial` is the reactive signal: `Overflow` is a *final*
+fact about immutable S (exhaustive `Eq(V)` should just scan, never re-sample);
+`Partial` is *provisional* and a later exhaustive scan **upgrades** it to `Exact`
+or `Overflow`.
 
 ## Serve path: `Eq(V)` (optionally `LIMIT n`)
 
 1. Live-scan the **memtable** for V (mutable, never indexed).
 2. For each SSTable S, consult its posting for V:
-   - `complete` → exhaustive contribution (verify ids).
-   - overflow (16,false) → ≥16 candidates; serve `LIMIT ≤ survivors`, else scan S.
-   - stopped-early (<16,false) → k candidates; if more needed, scan S (refines).
+   - `Exact` → exhaustive contribution (verify ids).
+   - `Overflow` → K candidates; serve `LIMIT ≤ survivors`, else scan S.
+   - `Partial` → k candidates; if more needed, scan S (refines the posting).
    - no posting yet → an existing range index covering V (sorted partial /
      unsorted block / full sorted index) may serve it; otherwise scan S, building
      the posting per the rules above. Eq reads range indexes but never creates them.
@@ -131,8 +140,9 @@ build guard. The redesign:
 
 ## Staged implementation
 
-- **A.** Posting data model (`{ids, complete}`, R/K rules, truth-table invariant) +
-  unit tests. Pure, no engine wiring.
+- **A. ✅ DONE** (`equality.rs::Posting` enum — `Exact`/`Overflow`/`Partial`, R/K
+  build rules, `satisfies` serve rule, 7 unit tests; pure, `#[allow(dead_code)]`
+  until wired). Coexists with v0 in the same file.
 - **B.** Per-SSTable read-built postings + serve path + verify-on-read; remove v0
   write-side maintenance. Simplest compaction handling: drop a posting when its
   SSTable is compacted (rebuild on next read).
