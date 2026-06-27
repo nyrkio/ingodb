@@ -45,6 +45,21 @@ Resolved in Phase D: the field-count cap is replaced by a memory-byte capacity
 (`EQUALITY_RAM_BUDGET_BYTES`) with field-granularity LRU eviction, and postings
 now persist to disk so eviction reloads instead of rebuilding.
 
+## 7. (observed) Unify the two compaction trigger paths
+
+There are two schedulers over the same `run_compaction` merge core: inline
+`maybe_compact` (synchronous, on flush, single job via `pick_compaction`, used by
+tests) and the background coordinator loop (`pick_all_compactions` + worker
+threads). Cross-cutting maintenance (sidecar flush, index promotion, adaptive W)
+must be wired into both, and it's easy to cover one and miss the other — that's
+how the equality-sidecar persistence gap happened (inline test passed; background
+read-heavy workload never flushed + `Drop` never runs because the worker holds an
+engine `Arc`). Unify into one driver with a run-here-vs-dispatch strategy and a
+single hook set. (Related: the worker's `Arc` clone means `Drop`-based shutdown
+flush never fires under background compaction — persistence relies on the periodic
+loop flush instead, losing ≤ one wake interval of read-built postings on a hard
+exit.)
+
 ## 6. (observed) Equality RAM budget should be configurable
 
 `EQUALITY_RAM_BUDGET_BYTES` is a module const. It should be an `LsmConfig` field

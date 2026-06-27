@@ -1589,6 +1589,12 @@ impl LsmEngine {
                     // Flush any immutable memtables first
                     let _ = engine.flush_immutable_memtables();
 
+                    // Persist read-built equality postings off the read path. This
+                    // loop is the reliable flush point under background compaction:
+                    // a read-heavy workload may never trigger a memtable flush, and
+                    // Drop doesn't run while this worker holds an engine ref.
+                    engine.flush_equality_sidecars();
+
                     // Adaptive W: adjust based on recent read/write ratio
                     engine.maybe_adjust_w();
 
@@ -4828,6 +4834,31 @@ mod tests {
         assert_eq!(engine.scan(Some(&eq_x(25)), None, None, None).unwrap().len(), 1);
         assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0,
             "absent value → negative posting, no match");
+    }
+
+    #[test]
+    fn test_equality_sidecar_written_on_flush() {
+        let (engine, dir) = unsorted_engine();
+        for i in 0..20u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Build a posting (dirty), then flush — the flush point both the inline
+        // path and the background loop call.
+        engine.scan(Some(&eq_x(5)), None, None, None).unwrap();
+        let eq_before = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "eq"))
+            .count();
+        engine.flush_equality_sidecars();
+        let eq_after = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "eq"))
+            .count();
+
+        assert_eq!(eq_before, 0, "no sidecar before flush");
+        assert!(eq_after >= 1, "sidecar written on flush");
     }
 
     #[test]
