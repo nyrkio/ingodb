@@ -34,7 +34,7 @@ pub const EQUALITY_K: usize = 16;
 /// (an `F64` variant rules out `Eq`/`Hash`/`Ord`), so we key posting lists by
 /// the value's wire encoding — which is canonical per variant and therefore
 /// consistent with `Value`'s equality for all non-float cases.
-fn value_key(v: &Value) -> Vec<u8> {
+pub(crate) fn value_key(v: &Value) -> Vec<u8> {
     let mut b = Vec::new();
     v.encode(&mut b);
     b
@@ -180,12 +180,33 @@ impl EqualityPostings {
 
     /// Record the posting for `(sstable, field, value)`.
     pub fn insert(&mut self, sstable: &Path, field: &str, value: &Value, posting: Posting) {
+        self.insert_raw(sstable, field, value_key(value), posting);
+    }
+
+    /// Record the posting under a raw value key. Used by compaction rebuild,
+    /// which works in encoded-key space (it derives keys from merged rows rather
+    /// than from `Value`s).
+    pub fn insert_raw(&mut self, sstable: &Path, field: &str, vkey: Vec<u8>, posting: Posting) {
         self.by_sstable
             .entry(sstable.to_path_buf())
             .or_default()
             .entry(field.to_string())
             .or_default()
-            .insert(value_key(value), posting);
+            .insert(vkey, posting);
+    }
+
+    /// Union of tracked `field → {value keys}` across the given SSTables — the
+    /// set of postings to carry forward when those SSTables are compacted.
+    pub fn tracked_keys(&self, sstables: &[PathBuf]) -> HashMap<String, HashSet<Vec<u8>>> {
+        let mut out: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+        for s in sstables {
+            let Some(per_field) = self.by_sstable.get(s) else { continue };
+            for (field, per_vkey) in per_field {
+                let set = out.entry(field.clone()).or_default();
+                set.extend(per_vkey.keys().cloned());
+            }
+        }
+        out
     }
 
     /// Drop every posting for an SSTable being compacted away.
@@ -205,7 +226,6 @@ impl EqualityPostings {
     }
 
     /// Total postings across all SSTables (observability / tests).
-    #[allow(dead_code)]
     pub fn posting_count(&self) -> usize {
         self.by_sstable
             .values()
@@ -347,5 +367,26 @@ mod postings_tests {
         assert!(p.get(&a, "f", &Value::U64(1)).is_none());
         assert_eq!(p.get(&b, "f", &Value::U64(1)), Some(&Posting::Exact(vec![id(2)])));
         assert_eq!(p.posting_count(), 1);
+    }
+
+    #[test]
+    fn tracked_keys_unions_across_sstables_and_insert_raw_round_trips() {
+        let mut p = EqualityPostings::new();
+        let (a, b) = (PathBuf::from("a.sst"), PathBuf::from("b.sst"));
+        p.insert(&a, "country", &sv("FI"), Posting::Exact(vec![id(1)]));
+        p.insert(&a, "country", &sv("US"), Posting::Exact(vec![]));
+        p.insert(&b, "country", &sv("FI"), Posting::Overflow(vec![id(2)]));
+        p.insert(&b, "city", &sv("NYC"), Posting::Exact(vec![id(3)]));
+
+        let tracked = p.tracked_keys(&[a.clone(), b.clone()]);
+        assert_eq!(tracked.len(), 2); // country, city
+        assert_eq!(tracked["country"].len(), 2); // FI, US unioned across a+b
+        assert_eq!(tracked["city"].len(), 1);
+        assert!(tracked["country"].contains(&value_key(&sv("FI"))));
+
+        // insert_raw lands where get() (Value-keyed) can read it back.
+        let out = PathBuf::from("merged.sst");
+        p.insert_raw(&out, "country", value_key(&sv("FI")), Posting::Exact(vec![id(1), id(2)]));
+        assert_eq!(p.get(&out, "country", &sv("FI")), Some(&Posting::Exact(vec![id(1), id(2)])));
     }
 }

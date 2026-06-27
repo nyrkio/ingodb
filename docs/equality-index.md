@@ -155,7 +155,11 @@ build guard. The redesign:
   `Partial`/early-stop and LIMIT-from-`Overflow`-sample (built, `allow(dead_code)`);
   per-SSTable scan once per value for `In` (currently once per value); field-LRU
   budget (postings currently bounded only by live SSTables × queried values).
-- **C.** Compaction refresh (rebuild postings from merged output) + redundancy
-  drop (sorted full-range index) + LRU drop.
+- **C. (in progress)** Compaction **refresh ✅ DONE** — `rebuild_equality_postings`
+  carries each input SSTable's tracked `(field, value)` postings forward onto the
+  merged output, recomputed exactly from the merged rows (Exact/Overflow/negative,
+  no cold read). Replaces Phase B's drop-on-compact. Remaining C: redundancy drop
+  (a sorted full-range index subsumes a column's Eq postings), field-LRU budget,
+  and the `Partial`/LIMIT-from-`Overflow`-sample fast path.
 - **D.** Re-run ClickBench; confirm UserID still fast, CounterID `LIMIT k` now
   served from overflow, exhaustive CounterID still scans.

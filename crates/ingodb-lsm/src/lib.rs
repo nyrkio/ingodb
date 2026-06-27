@@ -1456,9 +1456,11 @@ impl LsmEngine {
         self.compaction_stats.sstables_read.fetch_add(num_inputs, Ordering::Relaxed);
         self.compaction_stats.sstables_written.fetch_add(1, Ordering::Relaxed);
 
-        // Swap old SSTables for new one. The merged output starts with no
-        // equality postings — they rebuild lazily on the next read (Phase B
-        // stepping stone; Phase C will rebuild/refresh them during the merge).
+        // Snapshot the inputs' tracked equality keys before the swap drops them,
+        // so we can carry their postings forward onto the merged output.
+        let tracked_eq = self.equality_postings.lock().tracked_keys(inputs);
+
+        // Swap old SSTables for new one.
         let mut sstables = self.sstables.write();
         for path in inputs {
             sstables.retain(|s| s.path() != path);
@@ -1470,6 +1472,12 @@ impl LsmEngine {
         // Re-sort by level for correct read ordering
         let ucs = self.ucs();
         sort_sstables_by_level(&mut sstables, &ucs);
+        drop(sstables);
+
+        // Carry equality postings forward onto the merged output, rebuilt exactly
+        // from the merged rows (free — we already have them). Keeps warm indexes
+        // warm across compaction instead of cold-starting them.
+        self.rebuild_equality_postings(&output_path, &merged, tracked_eq);
 
         Ok(())
     }
@@ -2134,6 +2142,58 @@ impl LsmEngine {
         Ok(equality::Posting::from_exhaustive(ids, rows))
     }
 
+    /// Rebuild the equality postings for a freshly-compacted `output` SSTable from
+    /// its merged rows, for exactly the `(field, value)` keys that the input
+    /// SSTables tracked (`tracked`). Each key is recomputed exhaustively, so the
+    /// result is `Exact`/`Overflow`/negative just as a fresh read would produce —
+    /// but with no read needed. Keys that match nothing become `Exact([])`
+    /// (negative cache carried forward).
+    fn rebuild_equality_postings(
+        &self,
+        output: &Path,
+        merged: &[IBlob],
+        tracked: HashMap<String, std::collections::HashSet<Vec<u8>>>,
+    ) {
+        if tracked.is_empty() {
+            return;
+        }
+        let rows = merged.len();
+
+        // field → vkey → (ids, dedup set). Seed every tracked key so a zero-match
+        // key still produces a negative posting.
+        let mut buckets: HashMap<&str, HashMap<Vec<u8>, (Vec<DocumentId>, std::collections::HashSet<DocumentId>)>> =
+            HashMap::new();
+        for (field, vkeys) in &tracked {
+            let m = buckets.entry(field.as_str()).or_default();
+            for vk in vkeys {
+                m.entry(vk.clone()).or_default();
+            }
+        }
+
+        for blob in merged {
+            if blob.is_deleted() {
+                continue;
+            }
+            for field in tracked.keys() {
+                if let Some(val) = blob.get_field(field) {
+                    let vk = equality::value_key(&val);
+                    if let Some(slot) = buckets.get_mut(field.as_str()).and_then(|m| m.get_mut(&vk)) {
+                        if slot.1.insert(*blob.id()) {
+                            slot.0.push(*blob.id());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut postings = self.equality_postings.lock();
+        for (field, m) in buckets {
+            for (vk, (ids, _)) in m {
+                postings.insert_raw(output, field, vk, equality::Posting::from_exhaustive(ids, rows));
+            }
+        }
+    }
+
     /// Try to serve a filter-only scan from a single covering unsorted block.
     /// Returns `None` if no block fully contains the query range (→ full scan,
     /// which may then re-materialize a block over the whole range).
@@ -2321,6 +2381,11 @@ impl LsmEngine {
     /// Number of distinct fields with at least one equality posting.
     pub fn equality_field_count(&self) -> usize {
         self.equality_postings.lock().field_count()
+    }
+
+    /// Total equality postings across all SSTables (observability / tests).
+    pub fn equality_posting_count(&self) -> usize {
+        self.equality_postings.lock().posting_count()
     }
 
     /// Total number of unsorted blocks across all columns.
@@ -4591,6 +4656,55 @@ mod tests {
         assert_eq!(engine.scan(Some(&eq_x(25)), None, None, None).unwrap().len(), 1);
         assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0,
             "absent value → negative posting, no match");
+    }
+
+    #[test]
+    fn test_equality_postings_rebuilt_not_dropped_on_compaction() {
+        // No auto-compaction (threshold 1000); we compact explicitly so the test
+        // is deterministic.
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..10u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        for i in 10..20u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        assert_eq!(engine.sstable_count(), 2);
+
+        // Build postings (two selective values + one negative) across both SSTables.
+        engine.scan(Some(&eq_x(5)), None, None, None).unwrap();
+        engine.scan(Some(&eq_x(15)), None, None, None).unwrap();
+        engine.scan(Some(&eq_x(99)), None, None, None).unwrap(); // negative cache
+        let before = engine.equality_posting_count();
+        assert!(before > 0, "postings built");
+
+        // Compact both SSTables into one. drop-on-compact would zero the postings
+        // (until a future read); rebuild carries them forward immediately.
+        let inputs: Vec<PathBuf> = engine
+            .sstables
+            .read()
+            .iter()
+            .map(|s| s.path().to_path_buf())
+            .collect();
+        engine.run_compaction(&inputs, None).unwrap();
+        assert_eq!(engine.sstable_count(), 1);
+
+        // Carried forward *without any intervening read* — this is the Phase C
+        // refresh, not the Phase B drop-and-rebuild-lazily.
+        assert!(
+            engine.equality_posting_count() > 0,
+            "postings rebuilt onto the merged SSTable during compaction, not dropped"
+        );
+
+        // And the carried-forward postings serve correct, warm results.
+        assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.scan(Some(&eq_x(15)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0);
+        let hits = engine.equality_hits();
+        engine.scan(Some(&eq_x(5)), None, None, None).unwrap();
+        assert_eq!(engine.equality_hits(), hits + 1, "served warm from the carried-forward Exact posting");
     }
 
     #[test]
