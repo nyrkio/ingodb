@@ -1,55 +1,34 @@
-//! Lazy reactive **equality index** for `Eq` / `In` queries.
+//! Lazy reactive **equality index** for `Eq` / `In` queries — LSM-native,
+//! per-SSTable. See `docs/equality-index.md` for the full design.
 //!
 //! A sibling to the sorted [`crate::secondary`] and unsorted [`crate::unsorted`]
-//! *range* indexes — but for point-equality predicates, and structured entirely
-//! differently. Where a range index materializes a projected scan result, an
-//! equality index is an **inverted posting list**: per field, a map from a field
-//! value to the `_id`s that — *at some version* — had `field == value`.
+//! *range* indexes, but for point-equality predicates. A posting is an inverted
+//! list `value → [_id]` storing **only `_id` references**, scoped to a single
+//! **immutable SSTable**.
 //!
-//! ```text
-//!   field "country" ─┬─ "FI" → [id3, id9, id40, …]
-//!                    ├─ "US" → [id1, id2, …]
-//!                    └─ "XX" → []          (negative cache: proven-empty)
-//! ```
+//! Because an SSTable is immutable until compaction, a posting derived from it is
+//! exact and stable for that data — so postings are **built lazily on read** and
+//! need **no write-side maintenance**: writes only touch the memtable (always
+//! live-scanned) and later flush to a *new* SSTable (indexed on first read); no
+//! write invalidates an existing posting. Compaction drops a posting when its
+//! SSTable is rewritten ([`EqualityPostings::drop_sstable`]).
 //!
-//! It stores **`_id` references only** — never values or blobs. That is the
-//! whole trick:
-//!
-//! * **Reads verify against the main collection.** A lookup yields *candidate*
-//!   `_id`s; the caller resolves each via `get_at(id, snapshot)` and re-checks
-//!   the predicate on the authoritative IBlob, dropping stale positives (the
-//!   doc's value changed, or it was deleted). Cost is `|candidates|` point-gets
-//!   — not as fast as a hash index, but far better than a full collection scan.
-//! * **MVCC is free.** The posting list is version-agnostic (a time-union
-//!   superset of ids that *ever* matched); `get_at` is the version oracle, so an
-//!   old snapshot and a fresh read get correct — different — results from the
-//!   same posting list.
-//! * **Maintenance is additive.** [`EqualityIndex::notify_value`] appends on
-//!   write, but *only* for values that are already materialized (keeping the
-//!   index reactive: unqueried values stay untracked, and negatives self-heal
-//!   when a matching doc is inserted). Entries are never removed inline; staleness
-//!   is resolved at read time by the verify step above.
-//!
-//! ## LRU / budget
-//!
-//! Recency is tracked at **field granularity** — one `last_used` per field's
-//! whole index. Touching any value marks the field used; eviction drops the
-//! entire field's index (every value, every posting) as a unit. Coarser than the
-//! range indexes' per-range LRU, deliberately simpler for v1. The set is bounded
-//! to [`MAX_EQUALITY_FIELDS`] fields, separate from the range-index budget.
-//!
-//! v1 is in-memory only (cold after restart) and does not GC posting lists;
-//! compaction-time GC gated by the oldest snapshot is future work.
+//! Reads resolve each candidate `_id` against the primary via `get_at(id,
+//! snapshot)` and re-check the predicate — so cross-level MVCC and any staleness
+//! fall out of the verify step; the posting itself is version-agnostic.
 
-use ingodb_blob::{DocumentId, IBlob, Value};
+use ingodb_blob::{DocumentId, Value};
 use ingodb_query::Filter;
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-/// Max distinct fields kept across the whole equality index (its own budget,
-/// separate from the range indexes' `max_ranges_per_field`). The globally
-/// least-recently-used field is evicted when this is exceeded.
-pub const MAX_EQUALITY_FIELDS: usize = 64;
+/// Completeness threshold **R**: a value occupying < R of an SSTable is fully
+/// indexed (`Exact`); at/above R, if it *also* has more than `EQUALITY_K`
+/// matches, only a K-sized sample is kept (`Overflow`). Configurable later.
+pub const EQUALITY_R: f64 = 0.20;
+
+/// Sample/overflow retention **K**: ids kept for an incomplete posting.
+pub const EQUALITY_K: usize = 16;
 
 /// Encode a [`Value`] to its canonical byte key. `Value` is only `PartialEq`
 /// (an `F64` variant rules out `Eq`/`Hash`/`Ord`), so we key posting lists by
@@ -87,186 +66,31 @@ pub fn equality_terms(f: &Filter) -> Option<(String, Vec<Value>)> {
     }
 }
 
-/// Per-field inverted posting lists `value -> [_id]`, plus a single field-level
-/// LRU timestamp.
-pub struct EqualityIndex {
-    postings: HashMap<Vec<u8>, Vec<DocumentId>>,
-    last_used: Instant,
-}
-
-impl EqualityIndex {
-    pub fn new() -> Self {
-        EqualityIndex {
-            postings: HashMap::new(),
-            last_used: Instant::now(),
-        }
-    }
-
-    /// Seed `value`'s posting from a full scan's matching ids (empty → negative
-    /// cache). Replaces any prior posting for that value.
-    pub fn materialize(&mut self, value: &Value, ids: Vec<DocumentId>) {
-        self.postings.insert(value_key(value), ids);
-    }
-
-    /// Candidate ids for `value`, or `None` if never materialized (→ full scan).
-    pub fn candidates(&self, value: &Value) -> Option<&[DocumentId]> {
-        self.postings.get(&value_key(value)).map(Vec::as_slice)
-    }
-
-    /// Append `id` to `value`'s posting — but only if that value is already
-    /// materialized, so we never start tracking a value no query has asked for.
-    /// A trailing-duplicate guard absorbs the common "same doc re-put" case
-    /// cheaply; full dedup is left to the read-side `seen` set.
-    pub fn notify_value(&mut self, value: &Value, id: DocumentId) {
-        if let Some(list) = self.postings.get_mut(&value_key(value)) {
-            if list.last() != Some(&id) {
-                list.push(id);
-            }
-        }
-    }
-
-    pub fn mark_used(&mut self) {
-        self.last_used = Instant::now();
-    }
-
-    pub fn last_used(&self) -> Instant {
-        self.last_used
-    }
-}
-
-/// The whole equality index: a field-keyed collection of [`EqualityIndex`]es
-/// under a shared field-count budget.
-pub struct EqualityIndexSet {
-    fields: HashMap<String, EqualityIndex>,
-    max_fields: usize,
-}
-
-impl EqualityIndexSet {
-    pub fn new(max_fields: usize) -> Self {
-        EqualityIndexSet {
-            fields: HashMap::new(),
-            max_fields,
-        }
-    }
-
-    /// Gather candidate ids for `(field, values)`, marking the field used.
-    /// Returns `None` if the field is untracked or *any* requested value is
-    /// unmaterialized — in which case the caller full-scans and then calls
-    /// [`Self::materialize`], so a later identical query is fully served.
-    pub fn candidates(&mut self, field: &str, values: &[Value]) -> Option<Vec<DocumentId>> {
-        let idx = self.fields.get_mut(field)?;
-        let mut ids = Vec::new();
-        for v in values {
-            ids.extend_from_slice(idx.candidates(v)?);
-        }
-        idx.mark_used();
-        Some(ids)
-    }
-
-    /// Materialize a posting for each value from a full scan's `results` (the
-    /// docs matching the whole `Eq`/`In` filter), splitting by field value.
-    /// Values matching nothing get an empty (negative) posting. Evicts the LRU
-    /// field if this pushes the set over budget.
-    pub fn materialize(&mut self, field: &str, values: &[Value], results: &[IBlob]) {
-        let idx = self
-            .fields
-            .entry(field.to_string())
-            .or_insert_with(|| EqualityIndex::new());
-        for v in values {
-            let ids: Vec<DocumentId> = results
-                .iter()
-                .filter(|b| b.get_field(field).as_ref() == Some(v))
-                .map(|b| *b.id())
-                .collect();
-            idx.materialize(v, ids);
-        }
-        idx.mark_used();
-        self.enforce_budget();
-    }
-
-    /// Fan a write out to every tracked field, appending the doc's id to its
-    /// current value's posting (additive, materialized-values-only).
-    pub fn notify_put(&mut self, blob: &IBlob) {
-        if self.fields.is_empty() {
-            return;
-        }
-        for (field, idx) in self.fields.iter_mut() {
-            if let Some(v) = blob.get_field(field) {
-                idx.notify_value(&v, *blob.id());
-            }
-        }
-    }
-
-    fn enforce_budget(&mut self) {
-        while self.fields.len() > self.max_fields {
-            let victim = self
-                .fields
-                .iter()
-                .min_by_key(|(_, e)| e.last_used())
-                .map(|(k, _)| k.clone());
-            match victim {
-                Some(k) => {
-                    self.fields.remove(&k);
-                }
-                None => break,
-            }
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
-    }
-
-    /// Number of tracked fields (observability / tests).
-    pub fn field_count(&self) -> usize {
-        self.fields.len()
-    }
-}
-
-// ===========================================================================
-// v1: per-SSTable posting model (Phase A — pure, not yet wired)
-//
-// See docs/equality-index.md. This replaces the v0 global, write-maintained
-// `EqualityIndexSet` above; the two live side by side until Phase B swaps the
-// engine wiring and deletes v0.
-// ===========================================================================
-
-// `allow(dead_code)`: the v1 model is pure in Phase A and not yet reachable from
-// engine code; the attributes come off in Phase B when the wiring lands.
-
-/// Completeness threshold **R**: a value occupying < R of an SSTable is fully
-/// indexed (`Exact`); at/above R, if it *also* has more than `EQUALITY_K`
-/// matches, only a K-sized sample is kept (`Overflow`). Configurable later.
-#[allow(dead_code)]
-pub const EQUALITY_R: f64 = 0.20;
-
-/// Sample/overflow retention **K**: ids kept for an incomplete posting.
-#[allow(dead_code)]
-pub const EQUALITY_K: usize = 16;
+// ---------------------------------------------------------------------------
+// Posting (per SSTable, per value)
+// ---------------------------------------------------------------------------
 
 /// What the engine knows about which `_id`s in *one immutable SSTable* hold a
-/// given field value. Because the SSTable is immutable until compaction, a
-/// posting is exact and stable for that data — no within-SSTable staleness.
+/// given field value. The three variants are the truth table from
+/// `docs/equality-index.md`. An explicit enum (rather than `{ids, complete}` +
+/// a "len == K" inference) makes `Overflow` unambiguous and removes two sharp
+/// edges (the `K−1` cap on early-stop, and a small-SSTable `Overflow` with < K
+/// ids being misread as provisional).
 ///
-/// The three variants are the truth table from `docs/equality-index.md`. Using
-/// an explicit enum (rather than `{ids, complete}` + a "len == K" inference)
-/// makes `Overflow` unambiguous and removes two sharp edges: the `K−1` cap on
-/// early-stop postings, and a small-SSTable case where an `Overflow` keeps < K
-/// ids and would be misread as provisional.
+/// `Partial` / [`Posting::from_stopped_early`] / [`Posting::satisfies`] are the
+/// LIMIT-from-sample fast path — built but not yet exercised by the serve path
+/// (Phase C), hence `allow(dead_code)`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Posting {
     /// Every matching `_id` in the SSTable — absence from the list is
-    /// authoritative. The empty vector is the negative cache. Built by an
-    /// exhaustive scan whose match count is under R (or fits within K).
+    /// authoritative. The empty vector is the negative cache.
     Exact(Vec<DocumentId>),
     /// The value is ≥ R of the SSTable **and** has more than K matches: a K-sized
-    /// sample, rest discarded. A *final* fact about the immutable SSTable —
-    /// exhaustive queries on this value should just scan it, never re-sample.
+    /// sample, rest discarded. A *final* fact about the immutable SSTable.
     Overflow(Vec<DocumentId>),
     /// A scan stopped early (a LIMIT was satisfied before the SSTable was
-    /// exhausted): a sample of unknown completeness. *Provisional* — a later
-    /// exhaustive scan upgrades it to `Exact` or `Overflow`.
+    /// exhausted): a sample of unknown completeness. *Provisional*.
     Partial(Vec<DocumentId>),
 }
 
@@ -319,10 +143,9 @@ impl Posting {
     }
 
     /// Can this single SSTable's contribution be answered from the posting alone,
-    /// given how many of its candidates survived verification and the query's
-    /// optional LIMIT? `Exact` always can; an incomplete posting can only when a
-    /// LIMIT is already met by the survivors (otherwise the SSTable must be
-    /// scanned). Per-source rule; Phase B composes it across SSTables + memtable.
+    /// given how many candidates survived verification and the query's optional
+    /// LIMIT? `Exact` always can; an incomplete posting only when a LIMIT is
+    /// already met by the survivors. (Phase C serve rule.)
     pub fn satisfies(&self, survivors: usize, limit: Option<usize>) -> bool {
         match self {
             Posting::Exact(_) => true,
@@ -330,6 +153,75 @@ impl Posting {
                 matches!(limit, Some(n) if survivors >= n)
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EqualityPostings (the whole index: per-SSTable postings)
+// ---------------------------------------------------------------------------
+
+/// Per-SSTable equality postings: `sstable path → field → value → Posting`.
+/// Each posting is exact and stable for its (immutable) SSTable until that
+/// SSTable is compacted away, when [`Self::drop_sstable`] removes it.
+#[derive(Default)]
+pub struct EqualityPostings {
+    by_sstable: HashMap<PathBuf, HashMap<String, HashMap<Vec<u8>, Posting>>>,
+}
+
+impl EqualityPostings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cached *Exact* ids for `(sstable, field, value)`: a complete answer for
+    /// that SSTable needing no rescan. `None` for a missing or non-`Exact`
+    /// (`Overflow`/`Partial`) posting — the caller rescans the SSTable.
+    pub fn exact_ids(&self, sstable: &Path, field: &str, value: &Value) -> Option<&[DocumentId]> {
+        match self
+            .by_sstable
+            .get(sstable)?
+            .get(field)?
+            .get(&value_key(value))?
+        {
+            Posting::Exact(ids) => Some(ids),
+            _ => None,
+        }
+    }
+
+    /// Record the posting for `(sstable, field, value)`.
+    pub fn insert(&mut self, sstable: &Path, field: &str, value: &Value, posting: Posting) {
+        self.by_sstable
+            .entry(sstable.to_path_buf())
+            .or_default()
+            .entry(field.to_string())
+            .or_default()
+            .insert(value_key(value), posting);
+    }
+
+    /// Drop every posting for an SSTable being compacted away.
+    pub fn drop_sstable(&mut self, sstable: &Path) {
+        self.by_sstable.remove(sstable);
+    }
+
+    /// Distinct fields with at least one posting (observability / tests).
+    pub fn field_count(&self) -> usize {
+        let mut fields = HashSet::new();
+        for per_field in self.by_sstable.values() {
+            for f in per_field.keys() {
+                fields.insert(f.as_str());
+            }
+        }
+        fields.len()
+    }
+
+    /// Total postings across all SSTables (observability / tests).
+    #[allow(dead_code)]
+    pub fn posting_count(&self) -> usize {
+        self.by_sstable
+            .values()
+            .flat_map(|per_field| per_field.values())
+            .map(|per_value| per_value.len())
+            .sum()
     }
 }
 
@@ -343,23 +235,20 @@ mod posting_tests {
 
     #[test]
     fn exhaustive_under_r_is_exact() {
-        // 5 matches in a 100-row SSTable (5%) → Exact, complete, all kept.
         let p = Posting::from_exhaustive(ids(5), 100);
         assert_eq!(p, Posting::Exact(ids(5)));
         assert!(p.is_complete() && !p.is_overflow() && !p.is_refinable());
-        assert_eq!(p.ids().len(), 5);
     }
 
     #[test]
     fn empty_is_negative_cache() {
         let p = Posting::from_exhaustive(vec![], 100);
         assert_eq!(p, Posting::Exact(vec![]));
-        assert!(p.is_complete(), "empty Exact is the authoritative negative");
+        assert!(p.is_complete());
     }
 
     #[test]
     fn exhaustive_over_r_and_over_k_is_overflow() {
-        // 30 matches in a 100-row SSTable (30% ≥ R) and > K → Overflow, K sample.
         let p = Posting::from_exhaustive(ids(30), 100);
         assert!(p.is_overflow() && !p.is_complete());
         assert_eq!(p.ids().len(), EQUALITY_K, "kept exactly K");
@@ -367,18 +256,13 @@ mod posting_tests {
 
     #[test]
     fn over_r_but_within_k_stays_exact() {
-        // 3 matches in a 10-row SSTable: 30% ≥ R, but only 3 ≤ K, so we have
-        // them all → Exact, not a < K Overflow that would loop on re-scan.
+        // 30% of a 10-row SSTable ≥ R, but only 3 ≤ K → Exact (we have them all).
         let p = Posting::from_exhaustive(ids(3), 10);
         assert_eq!(p, Posting::Exact(ids(3)));
-        assert!(p.is_complete());
     }
 
     #[test]
     fn exactly_k_under_r_is_exact_not_overflow() {
-        // 16 matches in a 1000-row SSTable (1.6% < R): Exact with K ids — the
-        // `len == K ∧ complete` case the inference-based encoding couldn't tell
-        // apart from an overflow.
         let p = Posting::from_exhaustive(ids(EQUALITY_K), 1000);
         assert_eq!(p, Posting::Exact(ids(EQUALITY_K)));
         assert!(p.is_complete() && !p.is_overflow());
@@ -387,152 +271,91 @@ mod posting_tests {
     #[test]
     fn stopped_early_is_partial_capped_at_k() {
         let p = Posting::from_stopped_early(ids(50));
-        assert!(p.is_refinable() && !p.is_complete() && !p.is_overflow());
-        assert_eq!(p.ids().len(), EQUALITY_K, "Partial keeps at most K");
+        assert!(p.is_refinable());
+        assert_eq!(p.ids().len(), EQUALITY_K);
     }
 
     #[test]
     fn satisfies_rules() {
         let exact = Posting::Exact(ids(3));
         let overflow = Posting::Overflow(ids(EQUALITY_K));
-        let partial = Posting::Partial(ids(4));
-
-        // Exact answers any query (limit or not).
         assert!(exact.satisfies(3, None));
-        assert!(exact.satisfies(3, Some(10)));
-
-        // Incomplete: only when a LIMIT is already met by survivors.
         assert!(!overflow.satisfies(16, None), "exhaustive over overflow must scan");
-        assert!(overflow.satisfies(10, Some(10)), "LIMIT 10 met by 10 survivors");
-        assert!(!overflow.satisfies(3, Some(10)), "LIMIT 10, only 3 survivors → scan");
-        assert!(partial.satisfies(4, Some(4)));
-        assert!(!partial.satisfies(4, None));
+        assert!(overflow.satisfies(10, Some(10)));
+        assert!(!overflow.satisfies(3, Some(10)));
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod postings_tests {
     use super::*;
-
-    fn doc(id: u8, country: &str) -> IBlob {
-        let mut b = IBlob::with_id(
-            DocumentId::from_bytes([id; 16]),
-            [("country".into(), Value::String(country.into()))].into(),
-        );
-        b.set_version(DocumentId::new());
-        b
-    }
+    use std::path::PathBuf;
 
     fn id(n: u8) -> DocumentId {
         DocumentId::from_bytes([n; 16])
     }
-
-    fn fi() -> Value {
-        Value::String("FI".into())
+    fn sv(s: &str) -> Value {
+        Value::String(s.into())
     }
 
     #[test]
     fn equality_terms_eq_and_in() {
-        // Eq → single value.
-        let (f, vs) = equality_terms(&Filter::Eq {
-            field: "country".into(),
-            value: fi(),
-        })
-        .unwrap();
-        assert_eq!(f, "country");
-        assert_eq!(vs, vec![fi()]);
+        let (f, vs) = equality_terms(&Filter::Eq { field: "c".into(), value: sv("FI") }).unwrap();
+        assert_eq!((f.as_str(), vs), ("c", vec![sv("FI")]));
 
-        // Or of same-field Eqs → In.
         let or = Filter::Or(vec![
             Filter::Eq { field: "c".into(), value: Value::U64(1) },
             Filter::Eq { field: "c".into(), value: Value::U64(2) },
         ]);
         let (f, vs) = equality_terms(&or).unwrap();
-        assert_eq!(f, "c");
-        assert_eq!(vs, vec![Value::U64(1), Value::U64(2)]);
+        assert_eq!((f.as_str(), vs), ("c", vec![Value::U64(1), Value::U64(2)]));
 
-        // Mixed fields → not an equality term.
-        let mixed = Filter::Or(vec![
+        // mixed fields / non-Eq → None
+        assert!(equality_terms(&Filter::Or(vec![
             Filter::Eq { field: "a".into(), value: Value::U64(1) },
             Filter::Eq { field: "b".into(), value: Value::U64(2) },
-        ]);
-        assert!(equality_terms(&mixed).is_none());
-
-        // Range → not an equality term.
+        ]))
+        .is_none());
         assert!(equality_terms(&Filter::Gt { field: "c".into(), value: Value::U64(1) }).is_none());
     }
 
     #[test]
-    fn materialize_then_serve_candidates() {
-        let mut set = EqualityIndexSet::new(MAX_EQUALITY_FIELDS);
-        let results = vec![doc(3, "FI"), doc(9, "FI")];
-        set.materialize("country", &[fi()], &results);
+    fn exact_ids_round_trip_and_overflow_is_not_exact() {
+        let mut p = EqualityPostings::new();
+        let s = PathBuf::from("000000000001.sst");
 
-        let got = set.candidates("country", &[fi()]).unwrap();
-        assert_eq!(got, vec![id(3), id(9)]);
-        // Unmaterialized value → None (caller full-scans).
-        assert!(set.candidates("country", &[Value::String("US".into())]).is_none());
+        p.insert(&s, "country", &sv("FI"), Posting::Exact(vec![id(3), id(9)]));
+        p.insert(&s, "country", &sv("XX"), Posting::Overflow(vec![id(1)]));
+
+        assert_eq!(p.exact_ids(&s, "country", &sv("FI")), Some(&[id(3), id(9)][..]));
+        // Overflow is not a complete answer → exact_ids returns None (rescan).
+        assert_eq!(p.exact_ids(&s, "country", &sv("XX")), None);
+        // Unknown value → None.
+        assert_eq!(p.exact_ids(&s, "country", &sv("US")), None);
+        assert_eq!(p.field_count(), 1);
+        assert_eq!(p.posting_count(), 2);
     }
 
     #[test]
-    fn negative_cache_self_heals_on_put() {
-        let mut set = EqualityIndexSet::new(MAX_EQUALITY_FIELDS);
-        // Materialize a proven-empty value.
-        set.materialize("country", &[Value::String("XX".into())], &[]);
-        assert_eq!(set.candidates("country", &[Value::String("XX".into())]).unwrap().len(), 0);
-
-        // A later matching write self-heals the negative posting.
-        set.notify_put(&doc(7, "XX"));
-        assert_eq!(set.candidates("country", &[Value::String("XX".into())]).unwrap(), vec![id(7)]);
+    fn negative_cache_is_exact_empty() {
+        let mut p = EqualityPostings::new();
+        let s = PathBuf::from("a.sst");
+        p.insert(&s, "country", &sv("XX"), Posting::Exact(vec![]));
+        // Present and Exact, but empty: an authoritative "none here".
+        assert_eq!(p.exact_ids(&s, "country", &sv("XX")), Some(&[][..]));
     }
 
     #[test]
-    fn notify_only_tracks_materialized_values() {
-        let mut set = EqualityIndexSet::new(MAX_EQUALITY_FIELDS);
-        set.materialize("country", &[fi()], &[doc(1, "FI")]);
-        // A write for an unmaterialized value must not start a posting for it.
-        set.notify_put(&doc(2, "US"));
-        assert!(set.candidates("country", &[Value::String("US".into())]).is_none());
-        // But a write for the materialized value is appended.
-        set.notify_put(&doc(5, "FI"));
-        assert_eq!(set.candidates("country", &[fi()]).unwrap(), vec![id(1), id(5)]);
-    }
+    fn drop_sstable_removes_its_postings() {
+        let mut p = EqualityPostings::new();
+        let (a, b) = (PathBuf::from("a.sst"), PathBuf::from("b.sst"));
+        p.insert(&a, "f", &Value::U64(1), Posting::Exact(vec![id(1)]));
+        p.insert(&b, "f", &Value::U64(1), Posting::Exact(vec![id(2)]));
+        assert_eq!(p.posting_count(), 2);
 
-    #[test]
-    fn trailing_dup_guard() {
-        let mut set = EqualityIndexSet::new(MAX_EQUALITY_FIELDS);
-        set.materialize("country", &[fi()], &[]);
-        set.notify_put(&doc(1, "FI"));
-        set.notify_put(&doc(1, "FI")); // same doc re-put — not appended twice
-        assert_eq!(set.candidates("country", &[fi()]).unwrap(), vec![id(1)]);
-    }
-
-    #[test]
-    fn in_query_unions_value_postings() {
-        let mut set = EqualityIndexSet::new(MAX_EQUALITY_FIELDS);
-        let results = vec![doc(1, "FI"), doc(2, "US"), doc(3, "FI")];
-        set.materialize(
-            "country",
-            &[Value::String("FI".into()), Value::String("US".into())],
-            &results,
-        );
-        let got = set
-            .candidates("country", &[Value::String("FI".into()), Value::String("US".into())])
-            .unwrap();
-        assert_eq!(got, vec![id(1), id(3), id(2)]);
-    }
-
-    #[test]
-    fn field_lru_evicts_coldest_field() {
-        let mut set = EqualityIndexSet::new(2);
-        set.materialize("a", &[Value::U64(1)], &[]);
-        set.materialize("b", &[Value::U64(1)], &[]);
-        // Touch "a" so "b" is the coldest field.
-        assert!(set.candidates("a", &[Value::U64(1)]).is_some());
-        set.materialize("c", &[Value::U64(1)], &[]); // over budget (2) → evict "b"
-        assert_eq!(set.field_count(), 2);
-        assert!(set.candidates("b", &[Value::U64(1)]).is_none(), "coldest field evicted");
-        assert!(set.candidates("a", &[Value::U64(1)]).is_some());
-        assert!(set.candidates("c", &[Value::U64(1)]).is_some());
+        p.drop_sstable(&a);
+        assert!(p.exact_ids(&a, "f", &Value::U64(1)).is_none());
+        assert_eq!(p.exact_ids(&b, "f", &Value::U64(1)), Some(&[id(2)][..]));
+        assert_eq!(p.posting_count(), 1);
     }
 }

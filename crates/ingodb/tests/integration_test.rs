@@ -595,17 +595,22 @@ fn test_query_stats_low_selectivity_detection() {
         ])).unwrap();
     }
 
-    // A single full scan over 100 docs returns only ~10 (category = "cat0").
-    // The full scan's measured stats expose it as a low-selectivity candidate.
-    // (Repeats would be served from the reactive unsorted block, so the real
-    // selectivity signal comes from this first full scan.)
+    // A single full scan over 100 docs returns only ~10 (seq < 10). The full
+    // scan's measured stats expose it as a low-selectivity candidate. (Repeats
+    // would be served from the reactive unsorted block, so the real selectivity
+    // signal comes from this first full scan.)
+    //
+    // NB: an `Eq` filter would *not* surface here — it's served by the equality
+    // index from the first query (built on read), so it reports scanned≈returned
+    // rather than a low-selectivity full scan. We use a range filter, which still
+    // full-scans before promoting a range index.
     engine.scan(
-        Some(&Filter::Eq { field: "category".into(), value: Value::String("cat0".into()) }),
+        Some(&Filter::Lt { field: "seq".into(), value: Value::U64(10) }),
         None, None, None,
     ).unwrap();
 
     // Detect index candidates — selectivity=0.1 (10 returned / 100 scanned)
     let candidates = engine.query_stats().low_selectivity(0.15, 1);
     assert!(!candidates.is_empty(), "should detect low-selectivity pattern");
-    assert!(candidates[0].0.filter_fields.contains(&"category".into()));
+    assert!(candidates[0].0.filter_fields.contains(&"seq".into()));
 }

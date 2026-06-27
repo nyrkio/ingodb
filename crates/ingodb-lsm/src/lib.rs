@@ -273,10 +273,12 @@ pub struct LsmEngine {
     unsorted_hits: AtomicU64,
     /// Count of scans served from a sorted (secondary/partial) index.
     sorted_hits: AtomicU64,
-    /// Lazy equality (Eq/In) index: per-field inverted posting lists of `_id`s,
-    /// verified against the main collection at read time. Its own field-LRU budget.
-    equality_indexes: Mutex<equality::EqualityIndexSet>,
-    /// Count of scans served from the equality index (observability / tests).
+    /// Lazy equality (Eq/In) index: per-SSTable inverted postings of `_id`s,
+    /// built on read, verified against the main collection. Dropped per SSTable
+    /// at compaction. See `docs/equality-index.md`.
+    equality_postings: Mutex<equality::EqualityPostings>,
+    /// Count of Eq/In scans served warm (entirely from cached `Exact` postings,
+    /// no SSTable rescan) — observability / tests.
     equality_hits: AtomicU64,
     /// Newly built indexes awaiting persistence (collection_name not known here — Database handles it)
     pending_index_metadata: Mutex<Vec<IndexMetadata>>,
@@ -463,9 +465,7 @@ impl LsmEngine {
             unsorted_dir,
             unsorted_hits: AtomicU64::new(0),
             sorted_hits: AtomicU64::new(0),
-            equality_indexes: Mutex::new(equality::EqualityIndexSet::new(
-                equality::MAX_EQUALITY_FIELDS,
-            )),
+            equality_postings: Mutex::new(equality::EqualityPostings::new()),
             equality_hits: AtomicU64::new(0),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
@@ -545,7 +545,6 @@ impl LsmEngine {
                 }
             }
             self.notify_unsorted_put(&blob);
-            self.notify_equality_put(&blob);
             memtable.insert(blob);
         }
         let should_flush = memtable.should_flush();
@@ -627,7 +626,6 @@ impl LsmEngine {
                         idx.notify_put(&blob);
                     }
                     self.notify_unsorted_put(&blob);
-                    self.notify_equality_put(&blob);
                     memtable.insert(blob);
                 }
             }
@@ -843,7 +841,6 @@ impl LsmEngine {
                     idx.notify_put(&blob);
                 }
                 self.notify_unsorted_put(&blob);
-                self.notify_equality_put(&blob);
                 memtable.insert(blob);
             }
         }
@@ -894,7 +891,6 @@ impl LsmEngine {
         }
         for blob in blobs.iter() {
             self.notify_unsorted_put(blob);
-            self.notify_equality_put(blob);
         }
 
         // Memtable: one lock, all inserts
@@ -1439,6 +1435,7 @@ impl LsmEngine {
             let mut sstables = self.sstables.write();
             for path in inputs {
                 sstables.retain(|s| s.path() != path);
+                self.equality_postings.lock().drop_sstable(path);
                 std::fs::remove_file(path).ok();
             }
             return Ok(());
@@ -1459,10 +1456,13 @@ impl LsmEngine {
         self.compaction_stats.sstables_read.fetch_add(num_inputs, Ordering::Relaxed);
         self.compaction_stats.sstables_written.fetch_add(1, Ordering::Relaxed);
 
-        // Swap old SSTables for new one
+        // Swap old SSTables for new one. The merged output starts with no
+        // equality postings — they rebuild lazily on the next read (Phase B
+        // stepping stone; Phase C will rebuild/refresh them during the merge).
         let mut sstables = self.sstables.write();
         for path in inputs {
             sstables.retain(|s| s.path() != path);
+            self.equality_postings.lock().drop_sstable(path);
             std::fs::remove_file(path).ok();
         }
         sstables.push(new_reader);
@@ -1657,16 +1657,6 @@ impl LsmEngine {
         for idx in indexes.values() {
             idx.notify_put(blob);
         }
-    }
-
-    /// Append a write to the equality index (additive, materialized-values-only).
-    /// Cheap no-op when no equality indexes exist.
-    fn notify_equality_put(&self, blob: &IBlob) {
-        let mut set = self.equality_indexes.lock();
-        if set.is_empty() {
-            return;
-        }
-        set.notify_put(blob);
     }
 
     /// Materialize a scan's matching subset as a new unsorted block on `field`,
@@ -2025,14 +2015,16 @@ impl LsmEngine {
         Some(Ok(results))
     }
 
-    /// Try to serve an `Eq` / `In` filter from the equality index.
+    /// Serve an `Eq` / `In` filter from the per-SSTable equality postings,
+    /// building them lazily on read. Returns `None` only when the filter isn't an
+    /// equality term (→ the caller's other paths / full scan handle it).
     ///
-    /// Returns `None` (→ full scan, which then materializes the postings) when
-    /// the filter isn't an equality term, the field is untracked, or any
-    /// requested value is unmaterialized. On a hit, resolves each candidate `_id`
-    /// against the main collection at `snapshot` and re-checks the predicate, so
-    /// stale postings (updated/deleted docs) and MVCC are handled by the verify
-    /// step — the posting list itself is version-agnostic.
+    /// For each SSTable: reuse a cached `Exact` posting, else scan that (immutable)
+    /// SSTable once for the value, contribute *all* its matches, and cache the
+    /// result (`Exact`, or `Overflow` for non-selective values — which are
+    /// re-scanned next time rather than trusted). Then live-scan the memtable
+    /// (mutable, never indexed) and verify every candidate against the primary via
+    /// `get_at` — so cross-level MVCC and stale postings are resolved at read time.
     fn scan_with_equality_index(
         &self,
         filter: &Filter,
@@ -2041,23 +2033,48 @@ impl LsmEngine {
     ) -> Option<Result<Vec<IBlob>, LsmError>> {
         let (field, values) = equality::equality_terms(filter)?;
 
-        let candidate_ids = {
-            let mut set = self.equality_indexes.lock();
-            set.candidates(&field, &values)?
-        };
+        // Phase 1: gather candidate ids from per-SSTable postings (build on read).
+        // `warm` stays true only if every (sstable, value) was a cached Exact hit.
+        let mut candidate_ids: Vec<DocumentId> = Vec::new();
+        let mut warm = true;
+        {
+            let sstables = self.sstables.read();
+            for sst in sstables.iter() {
+                let path = sst.path();
+                for v in &values {
+                    let cached: Option<Vec<DocumentId>> = self
+                        .equality_postings
+                        .lock()
+                        .exact_ids(path, &field, v)
+                        .map(<[DocumentId]>::to_vec);
+                    match cached {
+                        Some(ids) => candidate_ids.extend(ids),
+                        None => {
+                            warm = false;
+                            let (ids, posting) = match self.scan_sstable_for_value(sst, &field, v) {
+                                Ok(x) => x,
+                                Err(e) => return Some(Err(e)),
+                            };
+                            self.equality_postings.lock().insert(path, &field, v, posting);
+                            candidate_ids.extend(ids);
+                        }
+                    }
+                }
+            }
+        }
 
-        self.equality_hits.fetch_add(1, Ordering::Relaxed);
+        if warm {
+            self.equality_hits.fetch_add(1, Ordering::Relaxed);
+        }
 
+        // Phase 2: verify candidates against the primary (resolves cross-level
+        // MVCC + staleness), then live-scan the memtables for un-indexed writes.
         let mut results = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for id in candidate_ids {
             match self.get_at(&id, snapshot) {
                 Ok(Some(blob)) => {
-                    if blob.is_deleted() {
-                        continue;
-                    }
-                    // Verify against the authoritative doc: drops stale positives.
-                    if !filter.matches(&|f| blob.get_field(f)) {
+                    if blob.is_deleted() || !filter.matches(&|f| blob.get_field(f)) {
                         continue;
                     }
                     if seen.insert(*blob.id()) {
@@ -2069,9 +2086,13 @@ impl LsmEngine {
             }
         }
 
-        // Merge fresh memtable docs the postings may not have caught yet (RYW
-        // race / writes between materialization and now). Bounded by memtable size.
-        for (_, blob) in self.memtable.read().iter() {
+        // Memtable + immutable memtables hold writes not yet flushed to any
+        // SSTable (so not in any posting); scan them live. Bounded by memtable size.
+        let mut live: Vec<IBlob> = self.memtable.read().iter().map(|(_, b)| b).collect();
+        for mt in self.immutable_memtables.lock().iter() {
+            live.extend(mt.iter().map(|(_, b)| b));
+        }
+        for blob in live {
             if blob.is_deleted() || blob.version() > snapshot {
                 continue;
             }
@@ -2084,6 +2105,29 @@ impl LsmEngine {
             results.truncate(lim);
         }
         Some(Ok(results))
+    }
+
+    /// Exhaustively scan one immutable SSTable for `field == value`, returning
+    /// every matching distinct `_id` (the full answer contribution) and the
+    /// `Posting` to cache (`Exact`, or `Overflow` when the value is non-selective
+    /// per R/K). Tombstones and non-matching versions are naturally excluded.
+    fn scan_sstable_for_value(
+        &self,
+        sst: &SSTableReader,
+        field: &str,
+        value: &Value,
+    ) -> Result<(Vec<DocumentId>, equality::Posting), LsmError> {
+        let entries = sst.iter()?;
+        let rows = entries.len();
+        let mut ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, blob) in entries {
+            if blob.get_field(field).as_ref() == Some(value) && seen.insert(*blob.id()) {
+                ids.push(*blob.id());
+            }
+        }
+        let posting = equality::Posting::from_exhaustive(ids.clone(), rows);
+        Ok((ids, posting))
     }
 
     /// Try to serve a filter-only scan from a single covering unsorted block.
@@ -2270,9 +2314,9 @@ impl LsmEngine {
         self.equality_hits.load(Ordering::Relaxed)
     }
 
-    /// Number of fields currently tracked by the equality index.
+    /// Number of distinct fields with at least one equality posting.
     pub fn equality_field_count(&self) -> usize {
-        self.equality_indexes.lock().field_count()
+        self.equality_postings.lock().field_count()
     }
 
     /// Total number of unsorted blocks across all columns.
@@ -2380,32 +2424,16 @@ impl LsmEngine {
                 }
             }
         }
-        // Try secondary index for filter-only scans (no sort required)
+        // Try indexes for filter-only scans (no sort required). Range indexes
+        // first — an `Eq` reads an existing covering range index but never
+        // populates one — then the equality index builds/serves Eq/In on read.
         if sort.is_none() {
             if let Some(filter) = filter {
-                // Equality (Eq/In) is served by the dedicated equality index.
-                if let Some(result) = self.scan_with_equality_index(filter, limit, snapshot) {
-                    let mut results = result?;
-                    if let Some(fields) = project {
-                        results = results.into_iter().map(|blob| blob.project(fields)).collect();
-                    }
-                    let docs_returned = results.len() as u64;
-                    timer.set_docs_scanned(docs_returned);
-                    self.query_stats.record(timer.finish(docs_returned));
-                    return Ok(results);
-                }
-                if let Some(result) = self.scan_with_filter_index(filter, limit, snapshot) {
-                    let mut results = result?;
-                    if let Some(fields) = project {
-                        results = results.into_iter().map(|blob| blob.project(fields)).collect();
-                    }
-                    let docs_returned = results.len() as u64;
-                    timer.set_docs_scanned(docs_returned);
-                    self.query_stats.record(timer.finish(docs_returned));
-                    return Ok(results);
-                }
-                // No sorted index covered it — try a covering unsorted block.
-                if let Some(result) = self.scan_with_unsorted_index(filter, limit, snapshot) {
+                let via = self
+                    .scan_with_filter_index(filter, limit, snapshot)
+                    .or_else(|| self.scan_with_unsorted_index(filter, limit, snapshot))
+                    .or_else(|| self.scan_with_equality_index(filter, limit, snapshot));
+                if let Some(result) = via {
                     let mut results = result?;
                     if let Some(fields) = project {
                         results = results.into_iter().map(|blob| blob.project(fields)).collect();
@@ -2464,46 +2492,37 @@ impl LsmEngine {
             results.push(blob);
         }
 
-        // Reactive: materialize this filter's result subset. We are here only
-        // because no sorted index and no covering block served the query, so
-        // `results` is the full matching subset over `filter`.
+        // Reactive: materialize this *range* filter's result subset. We are here
+        // only because no index served the query, so `results` is the full
+        // matching subset over `filter`. `Eq`/`In` are handled by the equality
+        // index (built on read above) and deliberately do not appear here — they
+        // never populate range indexes.
         if *snapshot == DocumentId::max() && sort.is_none() {
             if let Some(f) = filter {
-                let matching = results.len() as u64;
-                // Materialize when the result is at most half the collection
-                // (which already implies it's a proper subset).
-                let small_enough = (matching as f64)
-                    <= unsorted::UNSORTED_MATERIALIZE_MAX_FRACTION * docs_scanned as f64;
-
-                if let Some((field, values)) = equality::equality_terms(f) {
-                    // Eq / In → equality index. These no longer promote sorted or
-                    // unsorted *range* indexes; the result is materialized here.
+                let field = match f {
+                    Filter::Gt { field, .. }
+                    | Filter::Lt { field, .. }
+                    | Filter::Range { field, .. } => Some(field.clone()),
+                    _ => None,
+                };
+                if let Some(field) = field {
+                    let matching = results.len() as u64;
+                    // Materialize when the result is at most half the collection
+                    // (which already implies it's a proper subset).
+                    let small_enough = (matching as f64)
+                        <= unsorted::UNSORTED_MATERIALIZE_MAX_FRACTION * docs_scanned as f64;
+                    // Trivially-sorted results (empty → negative cache, or a
+                    // single row) go straight to a sorted partial index;
+                    // everything else becomes an unsorted block whose field-sort
+                    // is deferred to compaction.
+                    let already_sorted = matching <= 1;
                     if small_enough {
-                        self.equality_indexes
-                            .lock()
-                            .materialize(&field, &values, &results);
-                    }
-                } else {
-                    let field = match f {
-                        Filter::Gt { field, .. }
-                        | Filter::Lt { field, .. }
-                        | Filter::Range { field, .. } => Some(field.clone()),
-                        _ => None,
-                    };
-                    if let Some(field) = field {
-                        // Trivially-sorted results (empty → negative cache, or a
-                        // single row) go straight to a sorted partial index;
-                        // everything else becomes an unsorted block whose
-                        // field-sort is deferred to compaction.
-                        let already_sorted = matching <= 1;
-                        if small_enough {
-                            if already_sorted {
-                                let mut to_spill = results.clone();
-                                let _ = self.spill_to_partial_index(&[field.clone()], Some(f.clone()), &mut to_spill);
-                                self.enforce_combined_range_budget(&field);
-                            } else {
-                                self.materialize_unsorted_block(&field, f.clone(), &results);
-                            }
+                        if already_sorted {
+                            let mut to_spill = results.clone();
+                            let _ = self.spill_to_partial_index(&[field.clone()], Some(f.clone()), &mut to_spill);
+                            self.enforce_combined_range_budget(&field);
+                        } else {
+                            self.materialize_unsorted_block(&field, f.clone(), &results);
                         }
                     }
                 }
@@ -4495,6 +4514,72 @@ mod tests {
         // with MVCC version filtering, so it still sees the pre-update x=5 values.
         let via_snapshot = snap.scan(Some(&eq_x(5)), None, None, None).unwrap();
         assert_eq!(via_snapshot.len(), 10, "snapshot sees pre-update values");
+    }
+
+    #[test]
+    fn test_equality_unions_across_sstables() {
+        let (engine, _dir) = unsorted_engine();
+        // Two SSTables, each with 10 docs of x=7 (10 ≤ K, so each posting is Exact).
+        for i in 0..10u64 {
+            engine.put(doc_x(i, 7)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        for i in 10..20u64 {
+            engine.put(doc_x(i, 7)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        assert!(engine.sstable_count() >= 2, "two SSTables");
+
+        // Eq(7) unions both SSTables' per-SSTable postings → 20 docs.
+        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 20);
+        // Second scan is warm: every (SSTable, value) is a cached Exact hit.
+        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 20);
+        assert_eq!(engine.equality_hits(), 1, "second scan warm from Exact postings");
+    }
+
+    #[test]
+    fn test_equality_correct_across_compaction() {
+        // Low threshold so flushes compact; inline (no background thread).
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 2,
+            scaling_parameter: 0,
+            compaction_threads: 1,
+            max_ranges_per_field: 500,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
+        };
+        let engine = LsmEngine::open(config).unwrap();
+
+        for i in 0..10u64 {
+            engine.put(doc_x(i, 7)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        for i in 10..20u64 {
+            engine.put(doc_x(i, 7)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        engine.maybe_compact().unwrap();
+
+        // Build postings over the current SSTables.
+        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 20);
+
+        // More data + compaction: postings for the merged-away SSTables are
+        // dropped, then rebuilt on the next read.
+        for i in 20..30u64 {
+            engine.put(doc_x(i, 7)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        engine.maybe_compact().unwrap();
+
+        // Still correct after the drop/rebuild cycle.
+        assert_eq!(
+            engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(),
+            30,
+            "Eq correct after compaction dropped and rebuilt per-SSTable postings"
+        );
     }
 
     #[test]

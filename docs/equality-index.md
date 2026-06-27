@@ -143,9 +143,15 @@ build guard. The redesign:
 - **A. ✅ DONE** (`equality.rs::Posting` enum — `Exact`/`Overflow`/`Partial`, R/K
   build rules, `satisfies` serve rule, 7 unit tests; pure, `#[allow(dead_code)]`
   until wired). Coexists with v0 in the same file.
-- **B.** Per-SSTable read-built postings + serve path + verify-on-read; remove v0
-  write-side maintenance. Simplest compaction handling: drop a posting when its
-  SSTable is compacted (rebuild on next read).
+- **B. ✅ DONE.** Per-SSTable read-built postings (`EqualityPostings`, keyed by
+  SSTable path) + build-on-read serve path + verify-on-read; v0's `notify_put`
+  removed. Eq/In routed *after* the range indexes (read, don't populate). Postings
+  dropped per SSTable at compaction, rebuilt on next read. `equality_hits` counts
+  warm serves (all `Exact`, no rescan). Tests: multi-SSTable union, correctness
+  across compaction, + the 5 behavior tests carried over green. Deferred to C:
+  `Partial`/early-stop and LIMIT-from-`Overflow`-sample (built, `allow(dead_code)`);
+  per-SSTable scan once per value for `In` (currently once per value); field-LRU
+  budget (postings currently bounded only by live SSTables × queried values).
 - **C.** Compaction refresh (rebuild postings from merged output) + redundancy
   drop (sorted full-range index) + LRU drop.
 - **D.** Re-run ClickBench; confirm UserID still fast, CounterID `LIMIT k` now
