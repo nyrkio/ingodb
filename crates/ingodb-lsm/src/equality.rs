@@ -35,9 +35,11 @@ pub const EQUALITY_R: f64 = 0.20;
 /// Sample/overflow retention **K**: ids kept for an incomplete posting.
 pub const EQUALITY_K: usize = 16;
 
-/// Default field-LRU budget: at most this many distinct fields are tracked at
-/// once. Its own budget, separate from the range indexes' `max_ranges_per_field`.
-pub const MAX_EQUALITY_FIELDS: usize = 64;
+/// RAM budget (bytes) for resident postings before the field-LRU starts evicting
+/// the coldest field *from RAM* (postings stay on disk in their sidecar and
+/// reload on next access). A real capacity, not an arbitrary count. The primary
+/// GC is still compaction; this only caps the in-memory working set. Tunable.
+pub const EQUALITY_RAM_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Encode a [`Value`] to its canonical byte key. `Value` is only `PartialEq`
 /// (an `F64` variant rules out `Eq`/`Hash`/`Ord`), so we key posting lists by
@@ -182,7 +184,8 @@ pub struct EqualityPostings {
     /// Per-field recency (logical clock). Touched on every Eq/In query.
     field_used: HashMap<String, u64>,
     clock: u64,
-    max_fields: usize,
+    /// RAM budget (bytes); eviction kicks in above this.
+    max_bytes: usize,
     /// SSTables whose RAM postings have un-flushed changes (debounced sidecar
     /// writes — see the engine's flush points).
     dirty: HashSet<PathBuf>,
@@ -192,12 +195,12 @@ pub struct EqualityPostings {
 }
 
 impl EqualityPostings {
-    pub fn new(max_fields: usize) -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         EqualityPostings {
             by_sstable: HashMap::new(),
             field_used: HashMap::new(),
             clock: 0,
-            max_fields,
+            max_bytes,
             dirty: HashSet::new(),
             loaded: HashSet::new(),
         }
@@ -240,16 +243,49 @@ impl EqualityPostings {
         self.field_used.insert(field.to_string(), self.clock);
     }
 
-    /// Evict the globally least-recently-used field(s) until within budget.
+    /// Rough RAM footprint of the resident postings (ids dominate; the rest is
+    /// map/key overhead). Used only to decide eviction, so an estimate is fine.
+    pub fn estimated_bytes(&self) -> usize {
+        let mut total = 0;
+        for per_field in self.by_sstable.values() {
+            for (field, per_vkey) in per_field {
+                total += field.len() + 32;
+                for (vkey, posting) in per_vkey {
+                    total += vkey.len() + posting.ids().len() * 16 + 48;
+                }
+            }
+        }
+        total
+    }
+
+    /// Is the resident set over its RAM budget? (Engine flushes dirty sidecars
+    /// before evicting, so eviction never loses un-persisted postings.)
+    pub fn needs_eviction(&self) -> bool {
+        self.estimated_bytes() > self.max_bytes
+    }
+
+    /// Shrink the RAM budget — to force eviction in tests.
+    #[cfg(test)]
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+    }
+
+    /// Evict the single globally least-recently-used field; returns its name.
+    fn evict_coldest_field(&mut self) -> Option<String> {
+        let victim = self
+            .fields()
+            .into_iter()
+            .min_by_key(|f| self.field_used.get(f).copied().unwrap_or(0))?;
+        self.drop_field(&victim);
+        Some(victim)
+    }
+
+    /// Evict the coldest fields from RAM until within the byte budget. Evicted
+    /// postings remain on disk (sidecar) and reload on next access.
     pub fn enforce_budget(&mut self) {
-        while self.field_count() > self.max_fields {
-            let victim = self
-                .fields()
-                .into_iter()
-                .min_by_key(|f| self.field_used.get(f).copied().unwrap_or(0));
-            match victim {
-                Some(f) => self.drop_field(&f),
-                None => break,
+        while self.estimated_bytes() > self.max_bytes {
+            if self.evict_coldest_field().is_none() {
+                break;
             }
         }
     }
@@ -301,12 +337,21 @@ impl EqualityPostings {
 
     /// Drop a whole field's postings across all SSTables (used by LRU eviction,
     /// and when a sorted full-range index makes the field's Eq postings redundant).
+    /// SSTables that held the field are un-marked `loaded` so a later query
+    /// reloads them from their sidecar (where the field still lives) rather than
+    /// treating the RAM miss as "never built → scan".
     pub fn drop_field(&mut self, field: &str) {
-        for per_field in self.by_sstable.values_mut() {
-            per_field.remove(field);
+        let mut affected = Vec::new();
+        for (sst, per_field) in self.by_sstable.iter_mut() {
+            if per_field.remove(field).is_some() {
+                affected.push(sst.clone());
+            }
         }
         self.by_sstable.retain(|_, per_field| !per_field.is_empty());
         self.field_used.remove(field);
+        for sst in affected {
+            self.loaded.remove(&sst);
+        }
     }
 
     /// Distinct fields with at least one posting.
@@ -516,7 +561,7 @@ mod postings_tests {
 
     #[test]
     fn exact_ids_round_trip_and_overflow_is_not_exact() {
-        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
+        let mut p = EqualityPostings::new(EQUALITY_RAM_BUDGET_BYTES);
         let s = PathBuf::from("000000000001.sst");
 
         p.insert(&s, "country", &sv("FI"), Posting::Exact(vec![id(3), id(9)]));
@@ -533,7 +578,7 @@ mod postings_tests {
 
     #[test]
     fn negative_cache_is_exact_empty() {
-        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
+        let mut p = EqualityPostings::new(EQUALITY_RAM_BUDGET_BYTES);
         let s = PathBuf::from("a.sst");
         p.insert(&s, "country", &sv("XX"), Posting::Exact(vec![]));
         // Present and Exact, but empty: an authoritative "none here".
@@ -542,7 +587,7 @@ mod postings_tests {
 
     #[test]
     fn drop_sstable_removes_its_postings() {
-        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
+        let mut p = EqualityPostings::new(EQUALITY_RAM_BUDGET_BYTES);
         let (a, b) = (PathBuf::from("a.sst"), PathBuf::from("b.sst"));
         p.insert(&a, "f", &Value::U64(1), Posting::Exact(vec![id(1)]));
         p.insert(&b, "f", &Value::U64(1), Posting::Exact(vec![id(2)]));
@@ -556,7 +601,7 @@ mod postings_tests {
 
     #[test]
     fn tracked_keys_unions_across_sstables_and_insert_raw_round_trips() {
-        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
+        let mut p = EqualityPostings::new(EQUALITY_RAM_BUDGET_BYTES);
         let (a, b) = (PathBuf::from("a.sst"), PathBuf::from("b.sst"));
         p.insert(&a, "country", &sv("FI"), Posting::Exact(vec![id(1)]));
         p.insert(&a, "country", &sv("US"), Posting::Exact(vec![]));
@@ -577,7 +622,7 @@ mod postings_tests {
 
     #[test]
     fn sidecar_serialization_round_trips() {
-        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
+        let mut p = EqualityPostings::new(EQUALITY_RAM_BUDGET_BYTES);
         let s = PathBuf::from("000000000001.sst");
         p.insert(&s, "country", &sv("FI"), Posting::Exact(vec![id(3), id(9)]));
         p.insert(&s, "country", &sv("XX"), Posting::Exact(vec![])); // negative
@@ -602,7 +647,7 @@ mod postings_tests {
 
     #[test]
     fn field_lru_evicts_globally_coldest_field() {
-        let mut p = EqualityPostings::new(2);
+        let mut p = EqualityPostings::new(usize::MAX); // budget irrelevant to victim choice
         let s = PathBuf::from("a.sst");
         let one = Value::U64(1);
 
@@ -610,15 +655,30 @@ mod postings_tests {
         p.insert(&s, "a", &one, Posting::Exact(vec![id(1)]));
         p.touch_field("b");
         p.insert(&s, "b", &one, Posting::Exact(vec![id(2)]));
-        // Re-touch "a" so "b" is now the coldest field.
+        // Re-touch "a" so "b" is now the coldest field (order a,b,a,c → b oldest).
         p.touch_field("a");
         p.touch_field("c");
         p.insert(&s, "c", &one, Posting::Exact(vec![id(3)]));
 
-        p.enforce_budget(); // 3 fields > budget 2 → evict coldest ("b")
+        assert_eq!(p.evict_coldest_field().as_deref(), Some("b"), "coldest field chosen");
         assert_eq!(p.field_count(), 2);
         assert!(p.get(&s, "a", &one).is_some());
         assert!(p.get(&s, "c", &one).is_some());
-        assert!(p.get(&s, "b", &one).is_none(), "coldest field evicted as a unit");
+        assert!(p.get(&s, "b", &one).is_none());
+    }
+
+    #[test]
+    fn enforce_budget_evicts_until_under_byte_cap() {
+        // Budget that holds well under the three fields' posting bytes.
+        let mut p = EqualityPostings::new(120);
+        let s = PathBuf::from("a.sst");
+        for (i, f) in ["a", "b", "c"].iter().enumerate() {
+            p.touch_field(f);
+            p.insert(&s, f, &Value::U64(i as u64), Posting::Exact(vec![id(i as u8)]));
+        }
+        assert!(p.estimated_bytes() > 120);
+        p.enforce_budget();
+        assert!(p.estimated_bytes() <= 120, "evicted down to the byte budget");
+        assert!(p.needs_eviction() == false);
     }
 }

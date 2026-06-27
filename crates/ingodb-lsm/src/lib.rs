@@ -466,7 +466,7 @@ impl LsmEngine {
             unsorted_hits: AtomicU64::new(0),
             sorted_hits: AtomicU64::new(0),
             equality_postings: Mutex::new(equality::EqualityPostings::new(
-                equality::MAX_EQUALITY_FIELDS,
+                equality::EQUALITY_RAM_BUDGET_BYTES,
             )),
             equality_hits: AtomicU64::new(0),
             pending_index_metadata: Mutex::new(Vec::new()),
@@ -1517,8 +1517,10 @@ impl LsmEngine {
         // warm across compaction instead of cold-starting them.
         self.rebuild_equality_postings(&output_path, &merged, tracked_eq);
 
-        // Persist the output's (and any other dirty) sidecars now.
+        // Persist the output's (and any other dirty) sidecars now, then keep the
+        // resident set within its RAM budget.
         self.flush_equality_sidecars();
+        self.enforce_equality_budget();
 
         Ok(())
     }
@@ -2134,8 +2136,8 @@ impl LsmEngine {
         }
 
         if !warm {
-            // Built new postings this query — keep the field budget bounded.
-            self.equality_postings.lock().enforce_budget();
+            // Built new postings this query — keep the RAM working set bounded.
+            self.enforce_equality_budget();
         }
 
         // Phase 2: verify candidates against the primary (resolves cross-level
@@ -2272,7 +2274,8 @@ impl LsmEngine {
                 postings.insert_raw(output, field, vk, equality::Posting::from_exhaustive(ids, rows));
             }
         }
-        postings.enforce_budget();
+        // Budget enforcement happens after the post-compaction sidecar flush
+        // (it needs to flush dirty first), not while holding this lock.
     }
 
     /// Sidecar path for an SSTable's equality postings (`<id>.eq` beside `<id>.sst`).
@@ -2320,6 +2323,18 @@ impl LsmEngine {
             Some(map) => postings.load_into(sst, map),
             None => postings.mark_loaded(sst),
         }
+    }
+
+    /// Bound the resident postings to their RAM budget. A rare backstop: only when
+    /// over budget, flush dirty sidecars first (so eviction can't lose un-persisted
+    /// postings), then evict the coldest fields from RAM — they reload from their
+    /// sidecars on next access.
+    fn enforce_equality_budget(&self) {
+        if !self.equality_postings.lock().needs_eviction() {
+            return;
+        }
+        self.flush_equality_sidecars();
+        self.equality_postings.lock().enforce_budget();
     }
 
     /// Try to serve a filter-only scan from a single covering unsorted block.
@@ -4813,6 +4828,28 @@ mod tests {
         assert_eq!(engine.scan(Some(&eq_x(25)), None, None, None).unwrap().len(), 1);
         assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0,
             "absent value → negative posting, no match");
+    }
+
+    #[test]
+    fn test_equality_capacity_eviction_reloads_from_sidecar() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..20u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        // Force eviction on any build by shrinking the RAM budget to ~nothing.
+        engine.equality_postings.lock().set_max_bytes(1);
+
+        // First query builds x=5; the post-build budget check then flushes its
+        // sidecar and evicts it from RAM.
+        assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.equality_posting_count(), 0, "evicted from RAM after build");
+
+        // Next query reloads x=5 from its sidecar (not a rebuild scan) and serves
+        // it warm — capacity eviction is non-destructive because postings persist.
+        let hits0 = engine.equality_hits();
+        assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.equality_hits(), hits0 + 1, "reloaded from sidecar, served warm");
     }
 
     #[test]

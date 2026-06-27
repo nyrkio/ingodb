@@ -138,13 +138,17 @@ postings (`field → value → Posting`; small — `_id` lists, Overflow capped 
 ## Budget / LRU
 
 Field-granularity LRU recency, separate budget from the range indexes. The
-primary GC is compaction (postings die with their SSTables); on top of that the
-LRU evicts the globally-coldest field **against a memory capacity** (not an
-arbitrary field/posting count) — and because postings are persisted, eviction
-just drops them from RAM; a later query reloads from the sidecar. (Capacity-based
-eviction: Phase D follow-on. The earlier field-*count* cap was a v0 vestige —
-collections rarely have that many fields, and it didn't bound the dimension that
-costs memory.)
+primary GC is compaction (postings die with their SSTables); on top of that, when
+the resident set exceeds a **memory capacity** (`EQUALITY_RAM_BUDGET_BYTES` —
+bytes, a real resource, not an arbitrary count), the LRU evicts the
+globally-coldest *field* from RAM. Because postings are persisted, eviction is
+non-destructive: the engine flushes dirty sidecars first, then drops the field
+from RAM, and a later query **reloads it from the sidecar** instead of rebuilding.
+
+This is a rare backstop — postings are meant to grow with the data (indexing every
+value of a large collection *is* the point); the cap only guards the in-memory
+working set against OOM. (The earlier field-*count* cap was a v0 vestige: it
+rarely fired and bounded the wrong dimension.)
 
 ## Migration from v0 (in-memory, landed 2026-06-27)
 

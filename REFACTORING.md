@@ -39,13 +39,16 @@ Each index attempt in `scan_at` (equality, sorted-filter, unsorted) repeats the
 same project → `set_docs_scanned` → `record` → return boilerplate. A small helper
 (`fn finish_index_scan(results, project, timer)`) would remove the copy-paste.
 
-## 5. (observed) `MAX_EQUALITY_FIELDS` bounds the wrong dimension
+## 5. ~~`MAX_EQUALITY_FIELDS` bounds the wrong dimension~~ — DONE
 
-`equality.rs`'s field-LRU caps the number of distinct *fields* (64). It's a vestige
-of the v0 in-memory design: in the per-SSTable model it rarely fires (collections
-rarely have 64+ queried fields), doesn't bound the dimension that costs memory
-(values × postings — a hot high-cardinality field accumulates postings the
-field-LRU never evicts), and compaction is already the primary GC. Decision
-pending (Henrik): either drop the field-count cap and lean on compaction GC, or
-keep the field-granularity eviction but trigger it on `posting_count()` / bytes.
-Either way, document the limit.
+Resolved in Phase D: the field-count cap is replaced by a memory-byte capacity
+(`EQUALITY_RAM_BUDGET_BYTES`) with field-granularity LRU eviction, and postings
+now persist to disk so eviction reloads instead of rebuilding.
+
+## 6. (observed) Equality RAM budget should be configurable
+
+`EQUALITY_RAM_BUDGET_BYTES` is a module const. It should be an `LsmConfig` field
+(blocked on refactor #1, the `..Default::default()` cleanup). Also: orphaned `.eq`
+sidecars from a crash mid-compaction are never cleaned (harmless leak — SSTable
+ids are monotonic so they're never re-read); a one-time sweep at `open()` would
+tidy them.
