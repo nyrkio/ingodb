@@ -155,11 +155,22 @@ build guard. The redesign:
   `Partial`/early-stop and LIMIT-from-`Overflow`-sample (built, `allow(dead_code)`);
   per-SSTable scan once per value for `In` (currently once per value); field-LRU
   budget (postings currently bounded only by live SSTables × queried values).
-- **C. (in progress)** Compaction **refresh ✅ DONE** — `rebuild_equality_postings`
-  carries each input SSTable's tracked `(field, value)` postings forward onto the
-  merged output, recomputed exactly from the merged rows (Exact/Overflow/negative,
-  no cold read). Replaces Phase B's drop-on-compact. Remaining C: redundancy drop
-  (a sorted full-range index subsumes a column's Eq postings), field-LRU budget,
-  and the `Partial`/LIMIT-from-`Overflow`-sample fast path.
+- **C. ✅ DONE.**
+  - **Compaction refresh** — `rebuild_equality_postings` carries each input
+    SSTable's tracked `(field, value)` postings forward onto the merged output,
+    recomputed exactly from the merged rows (Exact/Overflow/negative, no cold
+    read). Replaces Phase B's drop-on-compact.
+  - **Redundancy drop** — after compaction, `drop_redundant_equality_postings`
+    drops a field's postings once a sorted full-range index covers it (the index
+    answers Eq directly and is routed first, so the postings would never rebuild).
+  - **Field-LRU budget** — per-field recency clock + `MAX_EQUALITY_FIELDS` cap;
+    the globally coldest field is evicted as a unit.
+  - **LIMIT-from-`Overflow`-sample** — a `LIMIT n` query on a non-selective value
+    is served from the cached K-sized sample when ≥ n candidates survive
+    verification (early-stopping at n), instead of declining to a full scan.
+  - *Deferred:* early-stop **build** (constructing `Partial` by stopping a scan at
+    the LIMIT) needs a streaming SSTable iterator; `Posting::Partial` /
+    `from_stopped_early` / `satisfies` are the scaffolding for it (the serve path
+    already handles `Partial` like `Overflow`).
 - **D.** Re-run ClickBench; confirm UserID still fast, CounterID `LIMIT k` now
   served from overflow, exhaustive CounterID still scans.

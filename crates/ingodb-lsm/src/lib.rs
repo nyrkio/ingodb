@@ -2080,6 +2080,10 @@ impl LsmEngine {
         // `warm` stays true only if every (sstable, value) was a cached hit.
         let mut candidate_ids: Vec<DocumentId> = Vec::new();
         let mut warm = true;
+        // Set when any consulted posting is a non-exhaustive sample
+        // (`Overflow`/`Partial`): the answer is then only trustworthy up to a LIMIT
+        // that the verified candidates already satisfy.
+        let mut incomplete = false;
         {
             let sstables = self.sstables.read();
             for sst in sstables.iter() {
@@ -2101,28 +2105,40 @@ impl LsmEngine {
                     match posting {
                         // Selective: absence is authoritative, candidates are few.
                         equality::Posting::Exact(ids) => candidate_ids.extend(ids),
-                        // Non-selective in this SSTable: decline — a sequential
-                        // full scan beats verifying this many candidates.
-                        equality::Posting::Overflow(_) | equality::Posting::Partial(_) => {
-                            return None;
+                        // Non-selective / incomplete in this SSTable. Without a
+                        // LIMIT, a sequential full scan beats verifying this many
+                        // candidates — decline. With a LIMIT we can try to satisfy
+                        // it from the K-sized sample (checked after verification).
+                        equality::Posting::Overflow(sample) | equality::Posting::Partial(sample) => {
+                            if limit.is_none() {
+                                return None;
+                            }
+                            incomplete = true;
+                            candidate_ids.extend(sample);
                         }
                     }
                 }
             }
         }
 
-        if warm {
-            self.equality_hits.fetch_add(1, Ordering::Relaxed);
-        } else {
+        if !warm {
             // Built new postings this query — keep the field budget bounded.
             self.equality_postings.lock().enforce_budget();
         }
 
         // Phase 2: verify candidates against the primary (resolves cross-level
         // MVCC + staleness), then live-scan the memtables for un-indexed writes.
+        // `enough` lets a LIMIT query stop as soon as it has its rows — which is
+        // what makes serving a non-selective value's LIMIT cheap (verify ~n ids,
+        // not the whole sample).
+        let enough = |results: &Vec<IBlob>| limit.is_some_and(|n| results.len() >= n);
+
         let mut results = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for id in candidate_ids {
+            if enough(&results) {
+                break;
+            }
             match self.get_at(&id, snapshot) {
                 Ok(Some(blob)) => {
                     if blob.is_deleted() || !filter.matches(&|f| blob.get_field(f)) {
@@ -2139,21 +2155,35 @@ impl LsmEngine {
 
         // Memtable + immutable memtables hold writes not yet flushed to any
         // SSTable (so not in any posting); scan them live. Bounded by memtable size.
-        let mut live: Vec<IBlob> = self.memtable.read().iter().map(|(_, b)| b).collect();
-        for mt in self.immutable_memtables.lock().iter() {
-            live.extend(mt.iter().map(|(_, b)| b));
-        }
-        for blob in live {
-            if blob.is_deleted() || blob.version() > snapshot {
-                continue;
+        if !enough(&results) {
+            let mut live: Vec<IBlob> = self.memtable.read().iter().map(|(_, b)| b).collect();
+            for mt in self.immutable_memtables.lock().iter() {
+                live.extend(mt.iter().map(|(_, b)| b));
             }
-            if filter.matches(&|f| blob.get_field(f)) && seen.insert(*blob.id()) {
-                results.push(blob);
+            for blob in live {
+                if enough(&results) {
+                    break;
+                }
+                if blob.is_deleted() || blob.version() > snapshot {
+                    continue;
+                }
+                if filter.matches(&|f| blob.get_field(f)) && seen.insert(*blob.id()) {
+                    results.push(blob);
+                }
             }
         }
 
+        if incomplete && !enough(&results) {
+            // We only saw K-sized samples of a non-selective value and couldn't
+            // confirm enough matches for the LIMIT — decline so the full scan
+            // finds the rest. (A complete/Exact answer never reaches here.)
+            return None;
+        }
         if let Some(lim) = limit {
             results.truncate(lim);
+        }
+        if warm {
+            self.equality_hits.fetch_add(1, Ordering::Relaxed);
         }
         Some(Ok(results))
     }
@@ -4627,6 +4657,31 @@ mod tests {
         // with MVCC version filtering, so it still sees the pre-update x=5 values.
         let via_snapshot = snap.scan(Some(&eq_x(5)), None, None, None).unwrap();
         assert_eq!(via_snapshot.len(), 10, "snapshot sees pre-update values");
+    }
+
+    #[test]
+    fn test_equality_limit_served_from_overflow_sample() {
+        let (engine, _dir) = unsorted_engine();
+        // 100 docs all x=7 → x=7 is 100% of the SSTable → Overflow (non-selective).
+        for i in 0..100u64 {
+            engine.put(doc_x(i, 7)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // No LIMIT → non-selective Eq declines to a full scan, returns all 100.
+        // (This also builds and caches the Overflow posting.)
+        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 100);
+        assert_eq!(engine.equality_hits(), 0, "no-limit Overflow query declined, not served");
+
+        // LIMIT 10 → served from the cached K-sized Overflow sample, no full scan.
+        let r = engine.scan(Some(&eq_x(7)), None, None, Some(10)).unwrap();
+        assert_eq!(r.len(), 10);
+        assert!(r.iter().all(|b| matches!(b.get("x"), Some(Value::U64(7)))));
+        assert_eq!(engine.equality_hits(), 1, "LIMIT served warm from the Overflow sample");
+
+        // A LIMIT larger than the sample can confirm still works (more survive
+        // than the limit asks for, here 16 ≥ 12), served from the sample.
+        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, Some(12)).unwrap().len(), 12);
     }
 
     #[test]
