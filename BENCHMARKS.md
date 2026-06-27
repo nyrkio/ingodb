@@ -6,6 +6,43 @@ Run with: `cargo run --release --example benchmark`
 
 ---
 
+## 2026-06-27 — Equality index rebuilt LSM-native (Phases B + C)
+
+The equality index from earlier today was redesigned from the in-memory,
+write-maintained v0 to an **LSM-native** structure (`docs/equality-index.md`):
+per-SSTable postings of `_id` references, built lazily on read, carried forward
+across compaction, with **no write-side maintenance** (immutable SSTables make
+read-build correct; writes only touch the memtable, which is always live-scanned).
+
+Same setup: 200,000 rows of real `hits_0`, `--release`, `max_ranges_per_field=50`.
+Illustrative, not a score.
+
+| Query | Cold | Warm (med) | Speedup | Served by |
+|---|---:|---:|---:|---|
+| `UserID = <id>` — point Eq (2 rows) | 604 ms | **25.3 µs** | **~23,900×** | per-SSTable `Exact` postings |
+| `CounterID = <dominant>` (99.99%) | 572 ms | 547 ms | 1.0× | full scan — `Overflow` declines (non-selective) |
+| `RegionID = x ORDER BY EventTime DESC LIMIT 10` | 1.19 s | 61 ms | 19.5× | sorted partial |
+| `EventTime ∈ [lo,hi)` (~10%) | 667 ms | 350 ms | 1.9× | unsorted block → sorted partial |
+
+`AdvEngineID > 0` 6.4×, containment 177 ms, writes ~11k/s, warm `AdvEngineID>0`
+flat across 10k inserts (107 → 119 ms). Drift: 70 distinct `UserID` Eq → 1
+equality field, zero range-index churn. No regression vs the v0 numbers below.
+
+What the redesign adds over v0 (none of it visible as a single-query speedup, but
+all exercised by tests):
+- **No write-path cost** — `notify_put` removed; writes don't touch the index.
+- **Warm across compaction** — postings rebuilt onto the merged SSTable from the
+  merged rows (no cold re-read).
+- **`Eq(v) LIMIT n` on a non-selective value** served from the cached 16-id
+  `Overflow` sample instead of a full scan (the exhaustive `Eq(v)` still scans).
+- **Redundancy drop** — a column's Eq postings are dropped once a sorted
+  full-range index covers it; **field-LRU** bounds tracked fields.
+
+Caveat: warm point-Eq has run-to-run variance (~25–49 µs across runs) — the cost
+of iterating each SSTable's postings vs v0's single global lookup.
+
+---
+
 ## 2026-06-27 — Lazy equality (Eq/In) index added; ClickBench re-run
 
 New reactive index: a **lazy equality index** for `Eq` / `In` predicates (the

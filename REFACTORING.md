@@ -38,3 +38,14 @@ another line × four. Consider a single `notify_indexes(&blob)` choke point.
 Each index attempt in `scan_at` (equality, sorted-filter, unsorted) repeats the
 same project → `set_docs_scanned` → `record` → return boilerplate. A small helper
 (`fn finish_index_scan(results, project, timer)`) would remove the copy-paste.
+
+## 5. (observed) `MAX_EQUALITY_FIELDS` bounds the wrong dimension
+
+`equality.rs`'s field-LRU caps the number of distinct *fields* (64). It's a vestige
+of the v0 in-memory design: in the per-SSTable model it rarely fires (collections
+rarely have 64+ queried fields), doesn't bound the dimension that costs memory
+(values × postings — a hot high-cardinality field accumulates postings the
+field-LRU never evicts), and compaction is already the primary GC. Decision
+pending (Henrik): either drop the field-count cap and lean on compaction GC, or
+keep the field-granularity eviction but trigger it on `posting_count()` / bytes.
+Either way, document the limit.
