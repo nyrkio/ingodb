@@ -120,11 +120,31 @@ Postings follow the data:
    index subsumes Eq.)
 3. **Drop** postings the field-granularity LRU marks cold.
 
+## Persistence (Phase D)
+
+Postings persist to disk so the index survives restart and isn't RAM-bound. Each
+`<id>.sst` gets a sibling `<id>.eq` **sidecar** holding that SSTable's serialized
+postings (`field → value → Posting`; small — `_id` lists, Overflow capped at K).
+
+- **Write — debounced.** A build/rebuild marks the SSTable dirty; dirty sidecars
+  are written (temp-file + rename, crash-safe) at flush / compaction / clean
+  shutdown — never on the read path. A crash loses only un-flushed read-built
+  postings, which rebuild on next read (correctness preserved, warmth lost).
+- **Read — lazy load.** A RAM miss on an SSTable not yet loaded this session reads
+  its sidecar (warm restart) before falling back to a scan.
+- **Lifecycle.** Compaction's rebuild writes the merged output's sidecar and
+  deletes the inputs'; `drop_sstable` removes the sidecar.
+
 ## Budget / LRU
 
-Field-granularity LRU, separate budget from the range indexes
-(`MAX_EQUALITY_FIELDS`). Touching any value marks the field used; eviction drops a
-whole field's postings. No per-value or per-version recency.
+Field-granularity LRU recency, separate budget from the range indexes. The
+primary GC is compaction (postings die with their SSTables); on top of that the
+LRU evicts the globally-coldest field **against a memory capacity** (not an
+arbitrary field/posting count) — and because postings are persisted, eviction
+just drops them from RAM; a later query reloads from the sidecar. (Capacity-based
+eviction: Phase D follow-on. The earlier field-*count* cap was a v0 vestige —
+collections rarely have that many fields, and it didn't bound the dimension that
+costs memory.)
 
 ## Migration from v0 (in-memory, landed 2026-06-27)
 

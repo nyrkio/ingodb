@@ -16,6 +16,11 @@
 //! Reads resolve each candidate `_id` against the primary via `get_at(id,
 //! snapshot)` and re-check the predicate — so cross-level MVCC and any staleness
 //! fall out of the verify step; the posting itself is version-agnostic.
+//!
+//! Postings **persist to disk** in a per-SSTable `.eq` sidecar (see
+//! `docs/equality-index.md`): written debounced at flush/compaction/shutdown,
+//! lazily reloaded on read for a warm restart. The engine owns the file I/O; this
+//! module is the in-RAM structure plus (de)serialization and dirty/loaded state.
 
 use ingodb_blob::{DocumentId, Value};
 use ingodb_query::Filter;
@@ -178,6 +183,12 @@ pub struct EqualityPostings {
     field_used: HashMap<String, u64>,
     clock: u64,
     max_fields: usize,
+    /// SSTables whose RAM postings have un-flushed changes (debounced sidecar
+    /// writes — see the engine's flush points).
+    dirty: HashSet<PathBuf>,
+    /// SSTables whose on-disk sidecar has been read into RAM (or confirmed
+    /// absent). A RAM miss on a *loaded* SSTable means "never built → scan".
+    loaded: HashSet<PathBuf>,
 }
 
 impl EqualityPostings {
@@ -187,7 +198,39 @@ impl EqualityPostings {
             field_used: HashMap::new(),
             clock: 0,
             max_fields,
+            dirty: HashSet::new(),
+            loaded: HashSet::new(),
         }
+    }
+
+    /// Has this SSTable's sidecar been loaded into RAM this session?
+    pub fn is_loaded(&self, sstable: &Path) -> bool {
+        self.loaded.contains(sstable)
+    }
+
+    /// Mark an SSTable's sidecar as read (even if absent/empty), so future RAM
+    /// misses on it go straight to a scan instead of re-reading disk.
+    pub fn mark_loaded(&mut self, sstable: &Path) {
+        self.loaded.insert(sstable.to_path_buf());
+    }
+
+    /// Merge a decoded sidecar map into RAM, keeping any already-resident (and
+    /// possibly dirtier) postings. Marks the SSTable loaded; does **not** mark it
+    /// dirty (loaded data already matches disk).
+    pub fn load_into(&mut self, sstable: &Path, map: HashMap<String, HashMap<Vec<u8>, Posting>>) {
+        let dst = self.by_sstable.entry(sstable.to_path_buf()).or_default();
+        for (field, per_vkey) in map {
+            let f = dst.entry(field).or_default();
+            for (vkey, posting) in per_vkey {
+                f.entry(vkey).or_insert(posting);
+            }
+        }
+        self.loaded.insert(sstable.to_path_buf());
+    }
+
+    /// Drain the set of SSTables with un-flushed posting changes.
+    pub fn take_dirty(&mut self) -> Vec<PathBuf> {
+        self.dirty.drain().collect()
     }
 
     /// Mark `field` most-recently-used (called on every Eq/In query for it, warm
@@ -231,6 +274,7 @@ impl EqualityPostings {
             .entry(field.to_string())
             .or_default()
             .insert(vkey, posting);
+        self.dirty.insert(sstable.to_path_buf());
     }
 
     /// Union of tracked `field → {value keys}` across the given SSTables — the
@@ -247,9 +291,12 @@ impl EqualityPostings {
         out
     }
 
-    /// Drop every posting for an SSTable being compacted away.
+    /// Drop every posting for an SSTable being compacted away (the engine deletes
+    /// the sidecar file).
     pub fn drop_sstable(&mut self, sstable: &Path) {
         self.by_sstable.remove(sstable);
+        self.dirty.remove(sstable);
+        self.loaded.remove(sstable);
     }
 
     /// Drop a whole field's postings across all SSTables (used by LRU eviction,
@@ -290,6 +337,87 @@ impl EqualityPostings {
             .map(|per_value| per_value.len())
             .sum()
     }
+
+    /// Serialize one SSTable's postings to its on-disk sidecar bytes, or `None`
+    /// if that SSTable has no postings.
+    pub fn serialize_sstable(&self, sstable: &Path) -> Option<Vec<u8>> {
+        self.by_sstable.get(sstable).map(encode_postings)
+    }
+}
+
+const SIDECAR_MAGIC: &[u8; 4] = b"IEQ1";
+
+/// Serialize one SSTable's `field → value → Posting` map to sidecar bytes.
+pub(crate) fn encode_postings(map: &HashMap<String, HashMap<Vec<u8>, Posting>>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(SIDECAR_MAGIC);
+    buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    for (field, per_vkey) in map {
+        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        buf.extend_from_slice(field.as_bytes());
+        buf.extend_from_slice(&(per_vkey.len() as u32).to_le_bytes());
+        for (vkey, posting) in per_vkey {
+            buf.extend_from_slice(&(vkey.len() as u32).to_le_bytes());
+            buf.extend_from_slice(vkey);
+            let (tag, ids) = match posting {
+                Posting::Exact(ids) => (0u8, ids),
+                Posting::Overflow(ids) => (1u8, ids),
+                Posting::Partial(ids) => (2u8, ids),
+            };
+            buf.push(tag);
+            buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            for id in ids {
+                buf.extend_from_slice(id.as_bytes());
+            }
+        }
+    }
+    buf
+}
+
+/// Parse sidecar bytes back into a posting map. `None` on any malformation —
+/// the caller treats a corrupt/old sidecar as "rebuild on read".
+pub(crate) fn decode_postings(bytes: &[u8]) -> Option<HashMap<String, HashMap<Vec<u8>, Posting>>> {
+    fn take<'a>(b: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
+        let s = b.get(*p..p.checked_add(n)?)?;
+        *p += n;
+        Some(s)
+    }
+    fn u32_(b: &[u8], p: &mut usize) -> Option<usize> {
+        Some(u32::from_le_bytes(take(b, p, 4)?.try_into().ok()?) as usize)
+    }
+
+    let mut p = 0usize;
+    if take(bytes, &mut p, 4)? != SIDECAR_MAGIC {
+        return None;
+    }
+    let nfields = u32_(bytes, &mut p)?;
+    let mut map = HashMap::with_capacity(nfields);
+    for _ in 0..nfields {
+        let flen = u32_(bytes, &mut p)?;
+        let field = std::str::from_utf8(take(bytes, &mut p, flen)?).ok()?.to_string();
+        let nvals = u32_(bytes, &mut p)?;
+        let mut per_vkey = HashMap::with_capacity(nvals);
+        for _ in 0..nvals {
+            let klen = u32_(bytes, &mut p)?;
+            let vkey = take(bytes, &mut p, klen)?.to_vec();
+            let tag = *take(bytes, &mut p, 1)?.first()?;
+            let nids = u32_(bytes, &mut p)?;
+            let mut idv = Vec::with_capacity(nids);
+            for _ in 0..nids {
+                let idb: [u8; 16] = take(bytes, &mut p, 16)?.try_into().ok()?;
+                idv.push(DocumentId::from_bytes(idb));
+            }
+            let posting = match tag {
+                0 => Posting::Exact(idv),
+                1 => Posting::Overflow(idv),
+                2 => Posting::Partial(idv),
+                _ => return None,
+            };
+            per_vkey.insert(vkey, posting);
+        }
+        map.insert(field, per_vkey);
+    }
+    Some(map)
 }
 
 #[cfg(test)]
@@ -445,6 +573,31 @@ mod postings_tests {
         let out = PathBuf::from("merged.sst");
         p.insert_raw(&out, "country", value_key(&sv("FI")), Posting::Exact(vec![id(1), id(2)]));
         assert_eq!(p.get(&out, "country", &sv("FI")), Some(&Posting::Exact(vec![id(1), id(2)])));
+    }
+
+    #[test]
+    fn sidecar_serialization_round_trips() {
+        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
+        let s = PathBuf::from("000000000001.sst");
+        p.insert(&s, "country", &sv("FI"), Posting::Exact(vec![id(3), id(9)]));
+        p.insert(&s, "country", &sv("XX"), Posting::Exact(vec![])); // negative
+        p.insert(&s, "country", &sv("US"), Posting::Overflow(vec![id(1), id(2)]));
+        p.insert(&s, "age", &Value::U64(30), Posting::Partial(vec![id(5)]));
+
+        let bytes = p.serialize_sstable(&s).unwrap();
+        let map = decode_postings(&bytes).unwrap();
+
+        // Same shape and contents, every variant preserved.
+        assert_eq!(map.len(), 2); // country, age
+        assert_eq!(map["country"].len(), 3);
+        assert_eq!(map["country"][&value_key(&sv("FI"))], Posting::Exact(vec![id(3), id(9)]));
+        assert_eq!(map["country"][&value_key(&sv("XX"))], Posting::Exact(vec![]));
+        assert_eq!(map["country"][&value_key(&sv("US"))], Posting::Overflow(vec![id(1), id(2)]));
+        assert_eq!(map["age"][&value_key(&Value::U64(30))], Posting::Partial(vec![id(5)]));
+
+        // Garbage / wrong magic → None, not a panic.
+        assert!(decode_postings(b"nope").is_none());
+        assert!(decode_postings(&bytes[..bytes.len() - 3]).is_none(), "truncated → None");
     }
 
     #[test]

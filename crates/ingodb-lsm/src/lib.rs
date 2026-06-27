@@ -1086,6 +1086,9 @@ impl LsmEngine {
             *self.wal.lock() = Wal::open(&wal_path)?;
         }
 
+        // Persist any read-built equality postings (debounced sidecar write).
+        self.flush_equality_sidecars();
+
         // Trigger compaction (inline only — background coordinator handles its own)
         if self.compaction_thread.lock().is_none() {
             self.maybe_compact()?;
@@ -1470,6 +1473,7 @@ impl LsmEngine {
             for path in inputs {
                 sstables.retain(|s| s.path() != path);
                 self.equality_postings.lock().drop_sstable(path);
+                std::fs::remove_file(Self::eq_sidecar_path(path)).ok();
                 std::fs::remove_file(path).ok();
             }
             return Ok(());
@@ -1512,6 +1516,9 @@ impl LsmEngine {
         // from the merged rows (free — we already have them). Keeps warm indexes
         // warm across compaction instead of cold-starting them.
         self.rebuild_equality_postings(&output_path, &merged, tracked_eq);
+
+        // Persist the output's (and any other dirty) sidecars now.
+        self.flush_equality_sidecars();
 
         Ok(())
     }
@@ -2089,7 +2096,12 @@ impl LsmEngine {
             for sst in sstables.iter() {
                 let path = sst.path();
                 for v in &values {
-                    let cached = self.equality_postings.lock().get(path, &field, v).cloned();
+                    let mut cached = self.equality_postings.lock().get(path, &field, v).cloned();
+                    if cached.is_none() {
+                        // Maybe persisted from a prior session but not yet loaded.
+                        self.ensure_equality_loaded(path);
+                        cached = self.equality_postings.lock().get(path, &field, v).cloned();
+                    }
                     let posting = match cached {
                         Some(p) => p,
                         None => {
@@ -2261,6 +2273,53 @@ impl LsmEngine {
             }
         }
         postings.enforce_budget();
+    }
+
+    /// Sidecar path for an SSTable's equality postings (`<id>.eq` beside `<id>.sst`).
+    fn eq_sidecar_path(sst: &Path) -> PathBuf {
+        sst.with_extension("eq")
+    }
+
+    /// Persist every SSTable with un-flushed equality postings to its sidecar.
+    /// Debounced: called at flush / compaction / shutdown, never on the read path.
+    /// Written via temp-file + rename so a crash mid-write can't corrupt a sidecar.
+    fn flush_equality_sidecars(&self) {
+        let dirty = self.equality_postings.lock().take_dirty();
+        for sst in dirty {
+            let bytes = self.equality_postings.lock().serialize_sstable(&sst);
+            let path = Self::eq_sidecar_path(&sst);
+            match bytes {
+                Some(b) => {
+                    let tmp = path.with_extension("eqtmp");
+                    if std::fs::write(&tmp, &b).is_ok() {
+                        std::fs::rename(&tmp, &path).ok();
+                    }
+                }
+                // No postings left for this SSTable — remove a stale sidecar.
+                None => {
+                    std::fs::remove_file(&path).ok();
+                }
+            }
+        }
+    }
+
+    /// Lazily read an SSTable's sidecar into RAM the first time it's needed this
+    /// session (warm restart). A miss after loading means "never built → scan".
+    fn ensure_equality_loaded(&self, sst: &Path) {
+        if self.equality_postings.lock().is_loaded(sst) {
+            return;
+        }
+        let decoded = std::fs::read(Self::eq_sidecar_path(sst))
+            .ok()
+            .and_then(|b| equality::decode_postings(&b));
+        let mut postings = self.equality_postings.lock();
+        if postings.is_loaded(sst) {
+            return; // another reader won the race
+        }
+        match decoded {
+            Some(map) => postings.load_into(sst, map),
+            None => postings.mark_loaded(sst),
+        }
     }
 
     /// Try to serve a filter-only scan from a single covering unsorted block.
@@ -2829,6 +2888,10 @@ impl LsmEngine {
 
 impl Drop for LsmEngine {
     fn drop(&mut self) {
+        // Persist any read-built equality postings before shutting down, so a
+        // clean restart is warm even for a read-only session.
+        self.flush_equality_sidecars();
+
         // Signal the background compaction thread to stop
         self.compaction_signal.stop.store(true, Ordering::SeqCst);
         self.compaction_signal.notify.notify_one();
@@ -4750,6 +4813,44 @@ mod tests {
         assert_eq!(engine.scan(Some(&eq_x(25)), None, None, None).unwrap().len(), 1);
         assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0,
             "absent value → negative posting, no match");
+    }
+
+    #[test]
+    fn test_equality_postings_persist_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size: 1024 * 1024,
+            block_size: 512,
+            compaction_threshold: 1000, // no auto-compaction
+            scaling_parameter: 0,
+            compaction_threads: 1,
+            max_ranges_per_field: 500,
+            adaptive_w: false, adaptive_w_cooldown_secs: 1, adaptive_w_max_step: 2, adaptive_w_min: -8, adaptive_w_max: 8, min_consistency: Consistency::default(), commit_wait_usec: 0, commit_wait_count: 0, commit_busy_mode: false,
+        };
+
+        {
+            let engine = LsmEngine::open(config.clone()).unwrap();
+            for i in 0..20u64 {
+                engine.put(doc_x(i, i)).unwrap();
+            }
+            engine.flush_memtable().unwrap();
+            // Build an Exact posting for x=5 and a negative for x=99.
+            assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 1);
+            assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0);
+            assert!(engine.equality_posting_count() > 0);
+            // engine dropped here → flush_equality_sidecars writes the sidecars.
+        }
+
+        // Reopen: postings are on disk, not yet in RAM (lazy).
+        let engine = LsmEngine::open(config).unwrap();
+        let hits0 = engine.equality_hits();
+
+        // A query loads the sidecar and serves warm — no rebuild scan.
+        assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.equality_hits(), hits0 + 1, "warm from the persisted sidecar after restart");
+        // The negative cache survived too.
+        assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0);
     }
 
     #[test]
