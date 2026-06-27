@@ -78,6 +78,9 @@ or `Overflow`.
 2. For each SSTable S, consult its posting for V:
    - `Exact` → exhaustive contribution (verify ids).
    - `Overflow` → K candidates; serve `LIMIT ≤ survivors`, else scan S.
+     **(Phase B: declines the whole query → sequential full scan, since
+     verifying a non-selective value's candidates is slower than scanning. The
+     LIMIT-from-sample fast path is Phase C.)**
    - `Partial` → k candidates; if more needed, scan S (refines the posting).
    - no posting yet → an existing range index covering V (sorted partial /
      unsorted block / full sorted index) may serve it; otherwise scan S, building
