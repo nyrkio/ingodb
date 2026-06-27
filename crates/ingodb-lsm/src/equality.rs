@@ -30,6 +30,10 @@ pub const EQUALITY_R: f64 = 0.20;
 /// Sample/overflow retention **K**: ids kept for an incomplete posting.
 pub const EQUALITY_K: usize = 16;
 
+/// Default field-LRU budget: at most this many distinct fields are tracked at
+/// once. Its own budget, separate from the range indexes' `max_ranges_per_field`.
+pub const MAX_EQUALITY_FIELDS: usize = 64;
+
 /// Encode a [`Value`] to its canonical byte key. `Value` is only `PartialEq`
 /// (an `F64` variant rules out `Eq`/`Hash`/`Ord`), so we key posting lists by
 /// the value's wire encoding — which is canonical per variant and therefore
@@ -163,14 +167,48 @@ impl Posting {
 /// Per-SSTable equality postings: `sstable path → field → value → Posting`.
 /// Each posting is exact and stable for its (immutable) SSTable until that
 /// SSTable is compacted away, when [`Self::drop_sstable`] removes it.
-#[derive(Default)]
+///
+/// Bounded by a **field-granularity LRU**: at most `max_fields` distinct fields
+/// are tracked; querying a field marks it most-recently-used, and when the budget
+/// is exceeded the globally coldest field's postings are evicted as a unit (every
+/// value, every SSTable). Separate budget from the range indexes.
 pub struct EqualityPostings {
     by_sstable: HashMap<PathBuf, HashMap<String, HashMap<Vec<u8>, Posting>>>,
+    /// Per-field recency (logical clock). Touched on every Eq/In query.
+    field_used: HashMap<String, u64>,
+    clock: u64,
+    max_fields: usize,
 }
 
 impl EqualityPostings {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(max_fields: usize) -> Self {
+        EqualityPostings {
+            by_sstable: HashMap::new(),
+            field_used: HashMap::new(),
+            clock: 0,
+            max_fields,
+        }
+    }
+
+    /// Mark `field` most-recently-used (called on every Eq/In query for it, warm
+    /// or cold) so a frequently-queried field is never the eviction victim.
+    pub fn touch_field(&mut self, field: &str) {
+        self.clock += 1;
+        self.field_used.insert(field.to_string(), self.clock);
+    }
+
+    /// Evict the globally least-recently-used field(s) until within budget.
+    pub fn enforce_budget(&mut self) {
+        while self.field_count() > self.max_fields {
+            let victim = self
+                .fields()
+                .into_iter()
+                .min_by_key(|f| self.field_used.get(f).copied().unwrap_or(0));
+            match victim {
+                Some(f) => self.drop_field(&f),
+                None => break,
+            }
+        }
     }
 
     /// The cached posting for `(sstable, field, value)`, if any.
@@ -214,13 +252,14 @@ impl EqualityPostings {
         self.by_sstable.remove(sstable);
     }
 
-    /// Drop a whole field's postings across all SSTables (used when a sorted
-    /// full-range index makes the field's Eq postings redundant).
+    /// Drop a whole field's postings across all SSTables (used by LRU eviction,
+    /// and when a sorted full-range index makes the field's Eq postings redundant).
     pub fn drop_field(&mut self, field: &str) {
         for per_field in self.by_sstable.values_mut() {
             per_field.remove(field);
         }
         self.by_sstable.retain(|_, per_field| !per_field.is_empty());
+        self.field_used.remove(field);
     }
 
     /// Distinct fields with at least one posting.
@@ -349,7 +388,7 @@ mod postings_tests {
 
     #[test]
     fn exact_ids_round_trip_and_overflow_is_not_exact() {
-        let mut p = EqualityPostings::new();
+        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
         let s = PathBuf::from("000000000001.sst");
 
         p.insert(&s, "country", &sv("FI"), Posting::Exact(vec![id(3), id(9)]));
@@ -366,7 +405,7 @@ mod postings_tests {
 
     #[test]
     fn negative_cache_is_exact_empty() {
-        let mut p = EqualityPostings::new();
+        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
         let s = PathBuf::from("a.sst");
         p.insert(&s, "country", &sv("XX"), Posting::Exact(vec![]));
         // Present and Exact, but empty: an authoritative "none here".
@@ -375,7 +414,7 @@ mod postings_tests {
 
     #[test]
     fn drop_sstable_removes_its_postings() {
-        let mut p = EqualityPostings::new();
+        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
         let (a, b) = (PathBuf::from("a.sst"), PathBuf::from("b.sst"));
         p.insert(&a, "f", &Value::U64(1), Posting::Exact(vec![id(1)]));
         p.insert(&b, "f", &Value::U64(1), Posting::Exact(vec![id(2)]));
@@ -389,7 +428,7 @@ mod postings_tests {
 
     #[test]
     fn tracked_keys_unions_across_sstables_and_insert_raw_round_trips() {
-        let mut p = EqualityPostings::new();
+        let mut p = EqualityPostings::new(MAX_EQUALITY_FIELDS);
         let (a, b) = (PathBuf::from("a.sst"), PathBuf::from("b.sst"));
         p.insert(&a, "country", &sv("FI"), Posting::Exact(vec![id(1)]));
         p.insert(&a, "country", &sv("US"), Posting::Exact(vec![]));
@@ -406,5 +445,27 @@ mod postings_tests {
         let out = PathBuf::from("merged.sst");
         p.insert_raw(&out, "country", value_key(&sv("FI")), Posting::Exact(vec![id(1), id(2)]));
         assert_eq!(p.get(&out, "country", &sv("FI")), Some(&Posting::Exact(vec![id(1), id(2)])));
+    }
+
+    #[test]
+    fn field_lru_evicts_globally_coldest_field() {
+        let mut p = EqualityPostings::new(2);
+        let s = PathBuf::from("a.sst");
+        let one = Value::U64(1);
+
+        p.touch_field("a");
+        p.insert(&s, "a", &one, Posting::Exact(vec![id(1)]));
+        p.touch_field("b");
+        p.insert(&s, "b", &one, Posting::Exact(vec![id(2)]));
+        // Re-touch "a" so "b" is now the coldest field.
+        p.touch_field("a");
+        p.touch_field("c");
+        p.insert(&s, "c", &one, Posting::Exact(vec![id(3)]));
+
+        p.enforce_budget(); // 3 fields > budget 2 → evict coldest ("b")
+        assert_eq!(p.field_count(), 2);
+        assert!(p.get(&s, "a", &one).is_some());
+        assert!(p.get(&s, "c", &one).is_some());
+        assert!(p.get(&s, "b", &one).is_none(), "coldest field evicted as a unit");
     }
 }

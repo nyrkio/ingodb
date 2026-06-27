@@ -465,7 +465,9 @@ impl LsmEngine {
             unsorted_dir,
             unsorted_hits: AtomicU64::new(0),
             sorted_hits: AtomicU64::new(0),
-            equality_postings: Mutex::new(equality::EqualityPostings::new()),
+            equality_postings: Mutex::new(equality::EqualityPostings::new(
+                equality::MAX_EQUALITY_FIELDS,
+            )),
             equality_hits: AtomicU64::new(0),
             pending_index_metadata: Mutex::new(Vec::new()),
             active_snapshots: Mutex::new(BTreeSet::new()),
@@ -2072,6 +2074,7 @@ impl LsmEngine {
         snapshot: &DocumentId,
     ) -> Option<Result<Vec<IBlob>, LsmError>> {
         let (field, values) = equality::equality_terms(filter)?;
+        self.equality_postings.lock().touch_field(&field); // field-LRU recency
 
         // Phase 1: gather candidate ids from per-SSTable postings (build on read).
         // `warm` stays true only if every (sstable, value) was a cached hit.
@@ -2110,6 +2113,9 @@ impl LsmEngine {
 
         if warm {
             self.equality_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Built new postings this query — keep the field budget bounded.
+            self.equality_postings.lock().enforce_budget();
         }
 
         // Phase 2: verify candidates against the primary (resolves cross-level
@@ -2224,6 +2230,7 @@ impl LsmEngine {
                 postings.insert_raw(output, field, vk, equality::Posting::from_exhaustive(ids, rows));
             }
         }
+        postings.enforce_budget();
     }
 
     /// Try to serve a filter-only scan from a single covering unsorted block.
