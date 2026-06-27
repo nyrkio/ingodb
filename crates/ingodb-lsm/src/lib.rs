@@ -1125,7 +1125,39 @@ impl LsmEngine {
         // Compact secondary indexes if needed
         self.maybe_compact_indexes()?;
 
+        // Drop equality postings made redundant by a sorted full-range index.
+        self.drop_redundant_equality_postings();
+
         Ok(())
+    }
+
+    /// Drop a field's equality postings once a sorted full-range index covers it:
+    /// that index answers `Eq(field=v)` directly (and, routed first, intercepts
+    /// the query before the equality index), so the postings are dead weight and
+    /// would never be rebuilt. The top of the promotion ladder.
+    fn drop_redundant_equality_postings(&self) {
+        let fields = self.equality_postings.lock().fields();
+        if fields.is_empty() {
+            return;
+        }
+        let redundant: Vec<String> = {
+            let indexes = self.secondary_indexes.lock();
+            fields
+                .into_iter()
+                .filter(|f| {
+                    indexes
+                        .iter()
+                        .any(|i| i.range.is_none() && i.fields == [f.clone()])
+                })
+                .collect()
+        };
+        if redundant.is_empty() {
+            return;
+        }
+        let mut postings = self.equality_postings.lock();
+        for f in redundant {
+            postings.drop_field(&f);
+        }
     }
 
     /// Promote unsorted blocks into sorted partial indexes at compaction:
@@ -4656,6 +4688,36 @@ mod tests {
         assert_eq!(engine.scan(Some(&eq_x(25)), None, None, None).unwrap().len(), 1);
         assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0,
             "absent value → negative posting, no match");
+    }
+
+    #[test]
+    fn test_equality_postings_dropped_when_full_sorted_index_covers() {
+        let (engine, _dir) = unsorted_engine();
+        for i in 0..20u64 {
+            engine.put(doc_x(i, i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Build Eq postings on x.
+        engine.scan(Some(&eq_x(5)), None, None, None).unwrap();
+        assert!(engine.equality_posting_count() > 0, "Eq postings built on x");
+
+        // A no-filter sort scan on x builds a sorted *full-range* index on x.
+        let sort = [SortField { field: "x".into(), direction: SortDirection::Ascending }];
+        engine.scan(None, Some(&sort), None, None).unwrap();
+        assert!(
+            engine.secondary_indexes.lock().iter().any(|i| i.range.is_none() && i.fields == ["x"]),
+            "full-range sorted index on x exists"
+        );
+
+        // The redundancy drop (runs at compaction) removes x's now-dead postings.
+        engine.drop_redundant_equality_postings();
+        assert_eq!(engine.equality_posting_count(), 0, "x Eq postings dropped — sorted index covers Eq");
+
+        // Eq(x=5) is now served by the sorted index, still correct, and does not
+        // rebuild equality postings (range index is routed first).
+        assert_eq!(engine.scan(Some(&eq_x(5)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.equality_posting_count(), 0, "not rebuilt — served by the sorted index");
     }
 
     #[test]

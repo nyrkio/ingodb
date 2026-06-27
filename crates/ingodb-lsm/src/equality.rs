@@ -214,6 +214,24 @@ impl EqualityPostings {
         self.by_sstable.remove(sstable);
     }
 
+    /// Drop a whole field's postings across all SSTables (used when a sorted
+    /// full-range index makes the field's Eq postings redundant).
+    pub fn drop_field(&mut self, field: &str) {
+        for per_field in self.by_sstable.values_mut() {
+            per_field.remove(field);
+        }
+        self.by_sstable.retain(|_, per_field| !per_field.is_empty());
+    }
+
+    /// Distinct fields with at least one posting.
+    pub fn fields(&self) -> Vec<String> {
+        let mut fields = HashSet::new();
+        for per_field in self.by_sstable.values() {
+            fields.extend(per_field.keys().cloned());
+        }
+        fields.into_iter().collect()
+    }
+
     /// Distinct fields with at least one posting (observability / tests).
     pub fn field_count(&self) -> usize {
         let mut fields = HashSet::new();
