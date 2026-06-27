@@ -173,19 +173,9 @@ impl EqualityPostings {
         Self::default()
     }
 
-    /// Cached *Exact* ids for `(sstable, field, value)`: a complete answer for
-    /// that SSTable needing no rescan. `None` for a missing or non-`Exact`
-    /// (`Overflow`/`Partial`) posting — the caller rescans the SSTable.
-    pub fn exact_ids(&self, sstable: &Path, field: &str, value: &Value) -> Option<&[DocumentId]> {
-        match self
-            .by_sstable
-            .get(sstable)?
-            .get(field)?
-            .get(&value_key(value))?
-        {
-            Posting::Exact(ids) => Some(ids),
-            _ => None,
-        }
+    /// The cached posting for `(sstable, field, value)`, if any.
+    pub fn get(&self, sstable: &Path, field: &str, value: &Value) -> Option<&Posting> {
+        self.by_sstable.get(sstable)?.get(field)?.get(&value_key(value))
     }
 
     /// Record the posting for `(sstable, field, value)`.
@@ -327,11 +317,11 @@ mod postings_tests {
         p.insert(&s, "country", &sv("FI"), Posting::Exact(vec![id(3), id(9)]));
         p.insert(&s, "country", &sv("XX"), Posting::Overflow(vec![id(1)]));
 
-        assert_eq!(p.exact_ids(&s, "country", &sv("FI")), Some(&[id(3), id(9)][..]));
-        // Overflow is not a complete answer → exact_ids returns None (rescan).
-        assert_eq!(p.exact_ids(&s, "country", &sv("XX")), None);
+        assert_eq!(p.get(&s, "country", &sv("FI")), Some(&Posting::Exact(vec![id(3), id(9)])));
+        // Overflow is present but not a complete answer.
+        assert!(p.get(&s, "country", &sv("XX")).unwrap().is_overflow());
         // Unknown value → None.
-        assert_eq!(p.exact_ids(&s, "country", &sv("US")), None);
+        assert_eq!(p.get(&s, "country", &sv("US")), None);
         assert_eq!(p.field_count(), 1);
         assert_eq!(p.posting_count(), 2);
     }
@@ -342,7 +332,7 @@ mod postings_tests {
         let s = PathBuf::from("a.sst");
         p.insert(&s, "country", &sv("XX"), Posting::Exact(vec![]));
         // Present and Exact, but empty: an authoritative "none here".
-        assert_eq!(p.exact_ids(&s, "country", &sv("XX")), Some(&[][..]));
+        assert_eq!(p.get(&s, "country", &sv("XX")), Some(&Posting::Exact(vec![])));
     }
 
     #[test]
@@ -354,8 +344,8 @@ mod postings_tests {
         assert_eq!(p.posting_count(), 2);
 
         p.drop_sstable(&a);
-        assert!(p.exact_ids(&a, "f", &Value::U64(1)).is_none());
-        assert_eq!(p.exact_ids(&b, "f", &Value::U64(1)), Some(&[id(2)][..]));
+        assert!(p.get(&a, "f", &Value::U64(1)).is_none());
+        assert_eq!(p.get(&b, "f", &Value::U64(1)), Some(&Posting::Exact(vec![id(2)])));
         assert_eq!(p.posting_count(), 1);
     }
 }

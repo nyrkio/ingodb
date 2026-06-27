@@ -2016,15 +2016,15 @@ impl LsmEngine {
     }
 
     /// Serve an `Eq` / `In` filter from the per-SSTable equality postings,
-    /// building them lazily on read. Returns `None` only when the filter isn't an
-    /// equality term (→ the caller's other paths / full scan handle it).
+    /// building them lazily on read.
     ///
-    /// For each SSTable: reuse a cached `Exact` posting, else scan that (immutable)
-    /// SSTable once for the value, contribute *all* its matches, and cache the
-    /// result (`Exact`, or `Overflow` for non-selective values — which are
-    /// re-scanned next time rather than trusted). Then live-scan the memtable
-    /// (mutable, never indexed) and verify every candidate against the primary via
-    /// `get_at` — so cross-level MVCC and stale postings are resolved at read time.
+    /// Returns `None` to decline (→ the caller full-scans) either when the filter
+    /// isn't an equality term, or when a value is **non-selective** in some
+    /// SSTable (an `Overflow` posting): verifying its many candidates one-by-one
+    /// would be slower than a sequential scan, so we leave it to the full-scan
+    /// path. Selective values are served from `Exact` postings: contribute their
+    /// ids, live-scan the memtable for un-indexed writes, then verify every
+    /// candidate via `get_at` (resolving cross-level MVCC + staleness).
     fn scan_with_equality_index(
         &self,
         filter: &Filter,
@@ -2034,7 +2034,7 @@ impl LsmEngine {
         let (field, values) = equality::equality_terms(filter)?;
 
         // Phase 1: gather candidate ids from per-SSTable postings (build on read).
-        // `warm` stays true only if every (sstable, value) was a cached Exact hit.
+        // `warm` stays true only if every (sstable, value) was a cached hit.
         let mut candidate_ids: Vec<DocumentId> = Vec::new();
         let mut warm = true;
         {
@@ -2042,21 +2042,26 @@ impl LsmEngine {
             for sst in sstables.iter() {
                 let path = sst.path();
                 for v in &values {
-                    let cached: Option<Vec<DocumentId>> = self
-                        .equality_postings
-                        .lock()
-                        .exact_ids(path, &field, v)
-                        .map(<[DocumentId]>::to_vec);
-                    match cached {
-                        Some(ids) => candidate_ids.extend(ids),
+                    let cached = self.equality_postings.lock().get(path, &field, v).cloned();
+                    let posting = match cached {
+                        Some(p) => p,
                         None => {
                             warm = false;
-                            let (ids, posting) = match self.scan_sstable_for_value(sst, &field, v) {
-                                Ok(x) => x,
+                            let posting = match self.scan_sstable_for_value(sst, &field, v) {
+                                Ok(p) => p,
                                 Err(e) => return Some(Err(e)),
                             };
-                            self.equality_postings.lock().insert(path, &field, v, posting);
-                            candidate_ids.extend(ids);
+                            self.equality_postings.lock().insert(path, &field, v, posting.clone());
+                            posting
+                        }
+                    };
+                    match posting {
+                        // Selective: absence is authoritative, candidates are few.
+                        equality::Posting::Exact(ids) => candidate_ids.extend(ids),
+                        // Non-selective in this SSTable: decline — a sequential
+                        // full scan beats verifying this many candidates.
+                        equality::Posting::Overflow(_) | equality::Posting::Partial(_) => {
+                            return None;
                         }
                     }
                 }
@@ -2107,16 +2112,16 @@ impl LsmEngine {
         Some(Ok(results))
     }
 
-    /// Exhaustively scan one immutable SSTable for `field == value`, returning
-    /// every matching distinct `_id` (the full answer contribution) and the
-    /// `Posting` to cache (`Exact`, or `Overflow` when the value is non-selective
-    /// per R/K). Tombstones and non-matching versions are naturally excluded.
+    /// Exhaustively scan one immutable SSTable for `field == value`, returning the
+    /// `Posting` to cache: `Exact` (its ids are the complete match set for this
+    /// SSTable) or `Overflow` when the value is non-selective per R/K. Tombstones
+    /// and non-matching versions are naturally excluded.
     fn scan_sstable_for_value(
         &self,
         sst: &SSTableReader,
         field: &str,
         value: &Value,
-    ) -> Result<(Vec<DocumentId>, equality::Posting), LsmError> {
+    ) -> Result<equality::Posting, LsmError> {
         let entries = sst.iter()?;
         let rows = entries.len();
         let mut ids = Vec::new();
@@ -2126,8 +2131,7 @@ impl LsmEngine {
                 ids.push(*blob.id());
             }
         }
-        let posting = equality::Posting::from_exhaustive(ids.clone(), rows);
-        Ok((ids, posting))
+        Ok(equality::Posting::from_exhaustive(ids, rows))
     }
 
     /// Try to serve a filter-only scan from a single covering unsorted block.
@@ -4454,21 +4458,26 @@ mod tests {
     #[test]
     fn test_equality_verify_drops_stale_after_update() {
         let (engine, _dir) = unsorted_engine();
-        for i in 0..20u64 {
-            engine.put(doc_x(i, 7)).unwrap(); // all x=7
+        // 12 docs x=7 among 60 → selective (≤ K), so the posting is Exact and the
+        // query is served by the equality index (exercising verify-on-read).
+        for i in 0..12u64 {
+            engine.put(doc_x(i, 7)).unwrap();
+        }
+        for i in 12..60u64 {
+            engine.put(doc_x(i, i)).unwrap(); // distinct other values
         }
         engine.flush_memtable().unwrap();
 
-        // Materialize the posting for x=7 (20 ids).
-        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 20);
+        // Build the Exact posting for x=7 (12 ids).
+        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 12);
 
         // Update one doc's x away from 7 (same _id, new version).
         engine.put(doc_x(5, 99)).unwrap();
 
         // The posting still lists id 5, but verifying against the latest doc
-        // (now x=99) drops it. 19 survive — no stale positive leaks through.
+        // (now x=99) drops it. 11 survive — no stale positive leaks through.
         let r = engine.scan(Some(&eq_x(7)), None, None, None).unwrap();
-        assert_eq!(r.len(), 19, "updated doc dropped by verify-on-read");
+        assert_eq!(r.len(), 11, "updated doc dropped by verify-on-read");
     }
 
     #[test]
@@ -4553,33 +4562,35 @@ mod tests {
         };
         let engine = LsmEngine::open(config).unwrap();
 
+        // Distinct x values → selective Eq served by Exact postings (so the
+        // rebuild-on-read after compaction is actually exercised, not declined).
         for i in 0..10u64 {
-            engine.put(doc_x(i, 7)).unwrap();
+            engine.put(doc_x(i, i)).unwrap();
         }
         engine.flush_memtable().unwrap();
         for i in 10..20u64 {
-            engine.put(doc_x(i, 7)).unwrap();
+            engine.put(doc_x(i, i)).unwrap();
         }
         engine.flush_memtable().unwrap();
         engine.maybe_compact().unwrap();
 
-        // Build postings over the current SSTables.
-        assert_eq!(engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(), 20);
+        // Build Exact postings over the current SSTables.
+        assert_eq!(engine.scan(Some(&eq_x(15)), None, None, None).unwrap().len(), 1);
 
         // More data + compaction: postings for the merged-away SSTables are
         // dropped, then rebuilt on the next read.
         for i in 20..30u64 {
-            engine.put(doc_x(i, 7)).unwrap();
+            engine.put(doc_x(i, i)).unwrap();
         }
         engine.flush_memtable().unwrap();
         engine.maybe_compact().unwrap();
 
-        // Still correct after the drop/rebuild cycle.
-        assert_eq!(
-            engine.scan(Some(&eq_x(7)), None, None, None).unwrap().len(),
-            30,
-            "Eq correct after compaction dropped and rebuilt per-SSTable postings"
-        );
+        // Still correct after the drop/rebuild cycle — values from before and
+        // after the compaction both resolve.
+        assert_eq!(engine.scan(Some(&eq_x(15)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.scan(Some(&eq_x(25)), None, None, None).unwrap().len(), 1);
+        assert_eq!(engine.scan(Some(&eq_x(99)), None, None, None).unwrap().len(), 0,
+            "absent value → negative posting, no match");
     }
 
     #[test]
